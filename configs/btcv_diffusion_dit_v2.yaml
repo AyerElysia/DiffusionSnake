@@ -7,7 +7,7 @@ network: 'ro_34'
 task: 'snake'
 model_dir: "data/model/btcv_diffusion_dit_v2"
 
-gpus: [0]
+gpus: [5]
 resume: false
 
 # ===== 训练配置 =====
@@ -22,7 +22,7 @@ train:
     lr: 5e-5
     milestones: (80, 120)
     gamma: 0.5
-    batch_size: 64
+    batch_size: 32
     gradient_accumulation_steps: 1
     gradient_clip: 1.0
     weight_decay: 0.01
