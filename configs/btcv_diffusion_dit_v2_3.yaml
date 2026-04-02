@@ -7,7 +7,7 @@ network: 'ro_34'
 task: 'snake'
 model_dir: "data/model/btcv_diffusion_dit_v2_3"
 
-gpus: [3]
+gpus: [2]
 resume: false
 
 # ===== 训练配置 =====

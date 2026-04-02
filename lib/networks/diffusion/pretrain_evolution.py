@@ -11,6 +11,7 @@ import json
 from .snake_denoiser import SnakeDenoiser
 from .dit_denoiser import DiTDenoiser
 from .dit_denoiser_v2 import DiTDenoiserV2
+from .dit_denoiser_v2_2 import DiTDenoiserV2_2
 import lib.utils.snake.snake_gcn_utils as snake_gcn_utils
 from lib.utils.snake import snake_config, snake_decode
 from lib.config import cfg as global_cfg
@@ -36,6 +37,9 @@ class DiffusionEvolution(nn.Module):
         use_dit_v2: bool = False,         # 新增：是否使用 DiT V2 (全面升级版)
         use_dit_v2_1: bool = False,       # 新增：是否使用 DiT V2.1 (CNN Anchor Pooling 版)
         use_dit_v2_2: bool = False,       # 新增：是否使用 DiT V2.2 (MM-DiT Patchify 版)
+        use_dit_v2_3: bool = False,       # 新增：是否使用 DiT V2.3
+        use_flow_matching: bool = False,  # 新增：是否使用 Flow Matching
+        flow_ode_steps: int = 10,         # Flow Matching ODE 步数
         dit_num_layers: int = 6,
         dit_num_heads: int = 8,
         dit_state_dim: int = 256,
@@ -238,8 +242,8 @@ class DiffusionEvolution(nn.Module):
         adj = snake_gcn_utils.get_adj_ind(snake_config.adj_num, i_it_py.size(1), i_it_py.device)
         
         # 3. 通过去噪器预测噪声
-        if isinstance(self.denoiser, (DiTDenoiser, DiTDenoiserV2)):
-            # DiT V1/V2 需要全图特征 + 采样特征
+        if isinstance(self.denoiser, (DiTDenoiser, DiTDenoiserV2, DiTDenoiserV2_2)):
+            # DiT V1/V2/V2.2 需要全图特征 + 采样特征
             eps_pred, L = self.denoiser(cnn_feature, gcn_feat, x_t, t, adj, polys=i_it_py, py_ind=py_ind)
         else:
             # 原有的 GCN Denoiser
