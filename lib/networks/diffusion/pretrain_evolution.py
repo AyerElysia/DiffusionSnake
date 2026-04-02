@@ -225,7 +225,7 @@ class DiffusionEvolution(nn.Module):
         # 3. 通过去噪器预测噪声
         if isinstance(self.denoiser, (DiTDenoiser, DiTDenoiserV2)):
             # DiT V1/V2 需要全图特征 + 采样特征
-            eps_pred, L = self.denoiser(cnn_feature, gcn_feat, x_t, t, adj, polys=i_it_py)
+            eps_pred, L = self.denoiser(cnn_feature, gcn_feat, x_t, t, adj, polys=i_it_py, py_ind=py_ind)
         else:
             # 原有的 GCN Denoiser
             eps_pred, L = self.denoiser(gcn_feat, c_it_py, x_t, t, adj, polys=i_it_py)

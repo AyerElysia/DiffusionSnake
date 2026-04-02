@@ -113,16 +113,18 @@ class DiTDenoiserV2(nn.Module):
         t: torch.Tensor,
         adj: torch.Tensor = None,
         polys=None,
+        py_ind: torch.Tensor = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """Forward pass — interface identical to V1 DiTDenoiser.
 
         Args:
-            cnn_feature:  (N, 64, H, W)  — Full P2 feature map
+            cnn_feature:  (B, 64, H, W)  — Full P2 feature map
             sampled_feat: (N, 64, P)      — Sampled features at point locations
             x_t:          (N, P, 2)       — Noisy displacement/contour
             t:            (N,)            — Timesteps
             adj:          Unused (kept for interface compatibility)
             polys:        Unused (kept for interface compatibility)
+            py_ind:       (N,)           — Maps each contour to its image index in batch
 
         Returns:
             eps_pred: (N, P, 2) — Predicted noise (or velocity)
@@ -134,7 +136,16 @@ class DiTDenoiserV2(nn.Module):
         t_emb = self.time_emb_net(t)  # (N, state_dim)
 
         # 2. Multi-Scale Visual Context [M1]
-        global_ctx = self.global_compressor(cnn_feature)  # (N, 256, state_dim)
+        global_ctx = self.global_compressor(cnn_feature)  # (B, 256, state_dim)
+        
+        # Expand global_ctx from Image batch (B) to Contour batch (N)
+        if py_ind is not None:
+            global_ctx = global_ctx[py_ind]  # (N, 256, state_dim)
+        elif global_ctx.shape[0] != N:
+            if global_ctx.shape[0] == 1:
+                global_ctx = global_ctx.expand(N, -1, -1)
+            else:
+                raise ValueError(f"Batch dimension mismatch: global_ctx={global_ctx.shape[0]}, N={N}")
         local_ctx = self.local_proj(
             sampled_feat.transpose(1, 2)
         )  # (N, P, state_dim)
