@@ -28,6 +28,7 @@ from .dit_blocks_v2 import (
     SeparatePointEmbedding,
     DiTBlockV2,
     FinalLayer,
+    SpatialAnchorCompressor,
 )
 
 
@@ -57,6 +58,7 @@ class DiTDenoiserV2(nn.Module):
         num_heads: int = 8,
         time_dim: int = 256,
         num_points: int = 128,
+        use_v2_1: bool = False,
     ):
         super().__init__()
         self.state_dim = state_dim
@@ -72,12 +74,20 @@ class DiTDenoiserV2(nn.Module):
         )
 
         # === 2. Multi-Scale Visual Encoder [M1] ===
-        # Global path: Perceiver compression → shape-level semantics
-        self.global_compressor = PerceiverCompressor(
-            in_dim=feature_dim,
-            out_dim=state_dim,
-            num_queries=256,
-        )
+        # Global path: Perceiver (V2) or SpatialAnchor (V2.1) → shape-level semantics
+        if use_v2_1:
+            self.global_compressor = SpatialAnchorCompressor(
+                in_dim=feature_dim,
+                out_dim=state_dim,
+                anchor_size=16,
+            )
+        else:
+            self.global_compressor = PerceiverCompressor(
+                in_dim=feature_dim,
+                out_dim=state_dim,
+                num_queries=256,
+            )
+            
         # Local path: project sampled features → boundary-level details
         self.local_proj = nn.Sequential(
             nn.Linear(feature_dim, state_dim),

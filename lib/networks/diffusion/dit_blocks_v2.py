@@ -135,6 +135,64 @@ class CyclicRoPE1D(nn.Module):
 
 
 # ---------------------------------------------------------------------------
+# SpatialAnchorCompressor (V2.1) — CNN + Adaptive Pooling + 2D Absolute PE
+# ---------------------------------------------------------------------------
+class SpatialAnchorCompressor(nn.Module):
+    """
+    Space-aware global feature compressor for DiT v2.1.
+    Replaces Perceiver with a fully convolutional processor plus
+    AdaptiveAvgPool2d to enforce a 16x16 anchor grid, followed by
+    explicit 2D absolute positional embedding.
+    
+    Transforms [B, 64, H, W] -> [B, 256, 16, 16] -> [B, 256(tokens), 256(dim)]
+    """
+    def __init__(self, in_dim: int = 64, out_dim: int = 256, anchor_size: int = 16):
+        super().__init__()
+        self.anchor_size = anchor_size
+        
+        # 1. Feature processing + downsampling to out_dim
+        self.feature_extractor = nn.Sequential(
+            nn.Conv2d(in_dim, 128, kernel_size=3, padding=1, bias=False),
+            nn.BatchNorm2d(128),
+            nn.SiLU(),
+            nn.Conv2d(128, out_dim, kernel_size=3, padding=1, bias=False),
+            nn.BatchNorm2d(out_dim),
+            nn.SiLU()
+        )
+        
+        # 2. Adaptive pool ensures exact (anchor_size x anchor_size) regardless of input res
+        self.pool = nn.AdaptiveAvgPool2d((anchor_size, anchor_size))
+        
+        # 3. 2D Positional Embedding for the spatial anchors (256 tokens)
+        self.pos_embed = nn.Parameter(torch.zeros(1, anchor_size * anchor_size, out_dim))
+        nn.init.normal_(self.pos_embed, std=0.02)
+        
+        self.norm = nn.LayerNorm(out_dim)
+
+    def forward(self, image_feat: torch.Tensor) -> torch.Tensor:
+        """
+        Args:
+            image_feat: [B, 64, H, W]
+        Returns:
+            compressed: [B, 256, out_dim]
+        """
+        # CNN extraction
+        x = self.feature_extractor(image_feat) # [B, out_dim, H, W]
+        # Pool to fix anchor size
+        x = self.pool(x) # [B, out_dim, 16, 16]
+        
+        # Flatten spatial dimensions
+        x = x.flatten(2).transpose(1, 2) # [B, 256, out_dim]
+        
+        # Add absolute spatial coordinates
+        x = x + self.pos_embed
+        
+        # Final norm
+        return self.norm(x)
+
+
+
+# ---------------------------------------------------------------------------
 # SeparatePointEmbedding — Avoids coord info being drowned by features
 # ---------------------------------------------------------------------------
 class SeparatePointEmbedding(nn.Module):

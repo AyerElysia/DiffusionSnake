@@ -47,6 +47,7 @@ cfg.diffusion_disp_norm = False
 cfg.diffusion_disp_stats = ''
 cfg.use_dit_denoiser = False
 cfg.use_dit_v2 = False
+cfg.use_dit_v2_1 = False
 cfg.dit_num_layers = 6
 cfg.dit_num_heads = 8
 cfg.dit_state_dim = 256
