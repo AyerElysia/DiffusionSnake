@@ -4,6 +4,7 @@ from .pretrain_evolution import DiffusionEvolution
 from .grpo_evolution import GRPOEvolution
 from .dit_denoiser import DiTDenoiser
 from .dit_denoiser_v2 import DiTDenoiserV2
+from .dit_denoiser_v2_2 import DiTDenoiserV2_2
 
 _network_factory = {
     'ro': get_ro

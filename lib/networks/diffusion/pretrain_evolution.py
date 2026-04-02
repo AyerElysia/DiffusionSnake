@@ -35,6 +35,7 @@ class DiffusionEvolution(nn.Module):
         use_dit_denoiser: bool = False,
         use_dit_v2: bool = False,         # 新增：是否使用 DiT V2 (全面升级版)
         use_dit_v2_1: bool = False,       # 新增：是否使用 DiT V2.1 (CNN Anchor Pooling 版)
+        use_dit_v2_2: bool = False,       # 新增：是否使用 DiT V2.2 (MM-DiT Patchify 版)
         dit_num_layers: int = 6,
         dit_num_heads: int = 8,
         dit_state_dim: int = 256,
@@ -46,8 +47,19 @@ class DiffusionEvolution(nn.Module):
         self.loss_weight = loss_weight
         self.loss_type = loss_type
 
-        # 去噪器选择：DiT V2 > DiT V1 > GCN
-        if use_dit_v2 or use_dit_v2_1:
+        # 去噪器选择
+        if use_dit_v2_2:
+            from .dit_denoiser_v2_2 import DiTDenoiserV2_2
+            print(f"[DiffusionEvolution] Using DiT Denoiser V2.2 (MM-DiT Patchify) "
+                  f"(layers={dit_num_layers}, heads={dit_num_heads}, dim={dit_state_dim})")
+            self.denoiser = DiTDenoiserV2_2(
+                state_dim=dit_state_dim,
+                feature_dim=feature_dim,
+                num_layers=dit_num_layers,
+                num_heads=dit_num_heads,
+                num_points=num_points,
+            )
+        elif use_dit_v2 or use_dit_v2_1:
             ver = "V2.1 (Anchor Pool)" if use_dit_v2_1 else "V2"
             print(f"[DiffusionEvolution] Using DiT Denoiser {ver} "
                   f"(layers={dit_num_layers}, heads={dit_num_heads}, dim={dit_state_dim})")
