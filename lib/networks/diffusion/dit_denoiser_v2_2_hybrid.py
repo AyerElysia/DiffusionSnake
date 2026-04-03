@@ -3,12 +3,15 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from .dit_blocks_v2 import (
-    PatchifyEmbedding, 
     SeparatePointEmbedding, 
-    JointDiTBlock, 
-    FinalLayer, 
+    FinalLayer
+)
+from .dit_blocks_v2_2 import (
+    PatchifyEmbedding,
+    JointDiTBlock,
     TimestepEmbedder
 )
+
 
 class DiTDenoiserV2_2Hybrid(nn.Module):
     """
