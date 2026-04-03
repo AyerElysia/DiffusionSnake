@@ -57,11 +57,33 @@ DiT V2.1 是针对 V2.0 (Perceiver) 的关键演进版本。V2.0 使用的 Perce
 2. **位置感官**：对比 V2.0 的纯黑盒 Perceiver，V2.1 的 Token 序列与图像空间是一一对应的。
 3. **注入逻辑**：Transformer 层内，轮廓点作为 Query，全局锚点作为 Key/Value 进行 Cross-Attention，定位全局结构。
 
-## 5. 配置参数 (Config)
-```yaml
-use_dit_v2_1: true
-use_dit_v2: true  # 保持兼容
-dit_num_layers: 6
-dit_num_heads: 8
-dit_state_dim: 256
+## 7. 详细架构拓扑 (Detailed Architecture)
+
+```text
+       ┌──────────┐        ┌──────────┐        ┌──────────┐
+       │ 图像分支  │        │ 轮廓分支  │        │ 时间步 t │
+       └────┬─────┘        └────┬─────┘        └────┬─────┘
+            │                   │                   │
+     Spatial Anchor Pool   Point Embedding        t_emb
+     (16x16 Grid Token)    (Separate Coord)       [256]
+     [B, 256, 256]         [N, 128, 256]            │
+            │                   │                   │
+            │           ┌───────┴───────┐           │
+            ▼           ▼               ▼           ▼
+      ┏━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┓
+      ┃           DiT V2.1 Backbone (6 Blocks)        ┃
+      ┣━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┫
+      ┃  Layer 0: x ←[Cross-Attn]→ Global (16x16锚点) ┃
+      ┃  Layer 1: x ←[Cross-Attn]→ Local  (局部边点)  ┃
+      ┃  Layer 2: x ←[Cross-Attn]→ Global (16x16锚点) ┃
+      ┃  Layer 3: x ←[Cross-Attn]→ Local  (局部边点)  ┃
+      ┃  Layer 4: x ←[Cross-Attn]→ Global (16x16锚点) ┃
+      ┃  Layer 5: x ←[Cross-Attn]→ Local  (局部边点)  ┃
+      ┗━━━━━━━━━━━━━━━━━━━━━┳━━━━━━━━━━━━━━━━━━━━━━━━━┛
+                            ┃
+                    Final Projection
+                            ▼
+                Predicted Contour Delta (Δx)
 ```
+
+

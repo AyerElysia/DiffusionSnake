@@ -1,33 +1,36 @@
-# DiT V2 配置文件 — BTCV 数据集
-# 基于 DiT V2 全面升级: RMSNorm + QK-Norm + SwiGLU + CyclicRoPE + 9-param adaLN
+# DiT 测试配置 - 单卡、低学习率、独立输出目录
+# 用于验证学习率是否过大
 
 # ===== 模型配置 =====
 model: 'sbd'
 network: 'ro_34'
 task: 'snake'
-model_dir: "data/model/btcv_diffusion_dit_v2_1"
+model_dir: "data/model/btcv_diffusion_dit_lr_test"
 
-gpus: [4]
-resume: false
+gpus: [1]          # 只用 1 张卡
+resume: false      # 从头开始
 
 # ===== 训练配置 =====
 train_or_test: train
 
 train:
+    # 基础配置
     dataset: 'BtcvTrain'
     data_path: '/home/medteam/Zhrch/Datasets/BTCV/btcv_png_new_snake'
     per_contour: false
 
+    # 训练超参数（保守设置）
     optim: 'adamw'
-    lr: 5e-5
+    lr: 5e-6                    # 降低学习率：5e-5 -> 1e-5
     milestones: (80, 120)
     gamma: 0.5
-    batch_size: 64
-    gradient_accumulation_steps: 1
-    gradient_clip: 1.0
+    batch_size: 64              # 降低 batch size：64 -> 16 (单卡)
+    gradient_accumulation_steps: 1  # 梯度累积，等效 batch_size = 16 * 4 = 64
+    gradient_clip: 0.5          # 更激进的梯度裁剪：1.0 -> 0.5
     weight_decay: 0.01
-    warmup_steps: 1000
+    warmup_steps: 500           # 减少 warmup：1000 -> 500
 
+    # 训练设置
     epoch: 1000
     num_workers: 4
     save_ep: 10
@@ -59,9 +62,8 @@ diffusion_loss_type: 'adaptive'
 diffusion_disp_norm: true
 diffusion_disp_stats: "data/stats/btcv_disp_stats.json"
 
-# ===== DiT V2 去噪器配置 =====
-use_dit_denoiser: false   # V1 关闭
-use_dit_v2_1: true          # V2 启用
+# ===== DiT 去噪器配置 =====
+use_dit_denoiser: true
 dit_num_layers: 6
 dit_num_heads: 8
 dit_state_dim: 256
@@ -69,7 +71,7 @@ dit_state_dim: 256
 # ===== GRPO 配置 =====
 use_grpo: false
 
-# ===== 其他 =====
+# ===== 其他配置 =====
 heads: {'ct_hm': 9, 'wh': 2}
 segm_or_bbox: 'segm'
 use_diffusion_trainer: true

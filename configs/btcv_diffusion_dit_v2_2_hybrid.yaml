@@ -5,9 +5,9 @@
 model: 'sbd'
 network: 'ro_34'
 task: 'snake'
-model_dir: "data/model/btcv_diffusion_dit_v2_1"
+model_dir: "data/model/btcv_diffusion_dit_v2_2_hybrid"
 
-gpus: [4]
+gpus: [3]
 resume: false
 
 # ===== 训练配置 =====
@@ -22,7 +22,7 @@ train:
     lr: 5e-5
     milestones: (80, 120)
     gamma: 0.5
-    batch_size: 64
+    batch_size: 32
     gradient_accumulation_steps: 1
     gradient_clip: 1.0
     weight_decay: 0.01
@@ -61,7 +61,9 @@ diffusion_disp_stats: "data/stats/btcv_disp_stats.json"
 
 # ===== DiT V2 去噪器配置 =====
 use_dit_denoiser: false   # V1 关闭
-use_dit_v2_1: true          # V2 启用
+use_dit_v2_1: false
+use_dit_v2_2: true
+use_hybrid: true          # V2 启用
 dit_num_layers: 6
 dit_num_heads: 8
 dit_state_dim: 256

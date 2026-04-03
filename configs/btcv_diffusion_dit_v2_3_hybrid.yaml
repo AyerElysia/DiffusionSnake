@@ -5,9 +5,9 @@
 model: 'sbd'
 network: 'ro_34'
 task: 'snake'
-model_dir: "data/model/btcv_diffusion_dit_v2_1"
+model_dir: "data/model/btcv_diffusion_dit_v2_3_hybrid"
 
-gpus: [4]
+gpus: [2]
 resume: false
 
 # ===== 训练配置 =====
@@ -22,7 +22,7 @@ train:
     lr: 5e-5
     milestones: (80, 120)
     gamma: 0.5
-    batch_size: 64
+    batch_size: 32
     gradient_accumulation_steps: 1
     gradient_clip: 1.0
     weight_decay: 0.01
@@ -61,7 +61,12 @@ diffusion_disp_stats: "data/stats/btcv_disp_stats.json"
 
 # ===== DiT V2 去噪器配置 =====
 use_dit_denoiser: false   # V1 关闭
-use_dit_v2_1: true          # V2 启用
+use_dit_v2_1: false
+use_dit_v2_2: false          
+use_dit_v2_3: true
+use_hybrid: true           # Flow Matching MM-DiT 启用
+use_flow_matching: true      # 核心开关: 使用 Flow Matching (Rectified Flow)
+flow_ode_steps: 10           # ODE Solver 推理步数
 dit_num_layers: 6
 dit_num_heads: 8
 dit_state_dim: 256

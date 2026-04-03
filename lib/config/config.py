@@ -52,6 +52,7 @@ cfg.use_dit_v2_2 = False
 cfg.use_dit_v2_3 = False
 cfg.use_flow_matching = False
 cfg.flow_ode_steps = 10
+cfg.use_hybrid = False
 cfg.dit_num_layers = 6
 cfg.dit_num_heads = 8
 cfg.dit_state_dim = 256

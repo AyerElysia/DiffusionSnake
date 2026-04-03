@@ -36,15 +36,26 @@ class FlowMatchingEvolution(nn.Module):
         self.ode_steps = ode_steps
 
         # V2.3 启用专属去噪网络
-        print(f"[FlowMatchingEvolution] Using DiT Flow Network V2.3 "
-              f"(layers={dit_num_layers}, heads={dit_num_heads}, dim={dit_state_dim})")
-        self.denoiser = DiTFlowMatchingV2_3(
-            state_dim=dit_state_dim,
-            feature_dim=feature_dim,
-            num_layers=dit_num_layers,
-            num_heads=dit_num_heads,
-            num_points=num_points,
-        )
+        if getattr(global_cfg, 'use_hybrid', False):
+            from .dit_denoiser_v2_3_hybrid import DiTFlowMatchingHybrid
+            print(f"[FlowMatchingEvolution] Using HYBRID Flow Network V2.3 (Odd-Even Injection)")
+            self.denoiser = DiTFlowMatchingHybrid(
+                state_dim=dit_state_dim,
+                feature_dim=feature_dim,
+                num_layers=dit_num_layers,
+                num_heads=dit_num_heads,
+                num_points=num_points,
+            )
+        else:
+            from .dit_denoiser_v2_3 import DiTFlowMatchingV2_3
+            print(f"[FlowMatchingEvolution] Using DiT Flow Network V2.3 (MM-DiT Join)")
+            self.denoiser = DiTFlowMatchingV2_3(
+                state_dim=dit_state_dim,
+                feature_dim=feature_dim,
+                num_layers=dit_num_layers,
+                num_heads=dit_num_heads,
+                num_points=num_points,
+            )
 
         # CMAM 先验参数保留 (以防外部调用)
         self.compute_L = True

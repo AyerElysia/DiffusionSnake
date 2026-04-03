@@ -46,8 +46,34 @@ X_0 ──► Vt_0 ──► X_0.1 ──► Vt_0.1 ──► ... ──► X_1.
 ## 5. 配置参数 (Config)
 ```yaml
 use_dit_v2_3: true
-use_flow_matching: true
-flow_ode_steps: 10   # 默认 10 步欧拉推理
-dit_num_layers: 6
-dit_num_heads: 8
+## 6. 详细架构拓扑 (Detailed Architecture)
+
+```text
+       ┌──────────┐        ┌──────────┐        ┌──────────┐
+       │ 图像场景  │        │ 初始状态  │        │ 归一化 t │
+       └────┬─────┘        └────┬─────┘        └────┬─────┘
+            │                   │                   │
+      Patchify (8x8)      Gaussian Noise          t_emb
+     (Dynamic Context)    x0~N(0, 1)              [256]
+     [N, 256, 256]        [N, 128, 256]             │
+            │                   │                   │
+            └─────────┐ ┌───────┘                   │
+                      ▼ ▼                           ▼
+      ┏━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┓
+      ┃        DiT V2.3 Flow-Matching Backbone        ┃
+      ┣━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┫
+      ┃  MM-DiT Encoder [Joint Attention Loop]        ┃
+      ┃  - Calculating Rectified Flow Vector Field.   ┃
+      ┗━━━━━━━━━━━━━━━━━━━━━┳━━━━━━━━━━━━━━━━━━━━━━━━━┛
+                            ┃
+                 Predict Velocity Field (Vt)
+                            ▼
+      ┏━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┓
+      ┃    ODE Solver Loop (10 Euler-Steps)           ┃
+      ┃    X_{t+dt} = X_{t} + V_{t} * dt              ┃
+      ┗━━━━━━━━━━━━━━━━━━━━━┳━━━━━━━━━━━━━━━━━━━━━━━━━┛
+                            ▼
+                Target Contour (X1) at t=1.0
 ```
+
+

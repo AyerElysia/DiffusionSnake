@@ -63,18 +63,18 @@ class DiTDenoiserV2_2(nn.Module):
 
     def forward(
         self,
-        x_t: torch.Tensor,         # [B, 128, 2]
-        t: torch.Tensor,           # [B]
-        cnn_feature: torch.Tensor, # [B, 64, 128, 128]
-        py_ind=None,               # Batch/pyramid alignment tracking
-        sampled_feat=None,         # [B, 64, 128]
+        cnn_feature: torch.Tensor,
+        sampled_feat: torch.Tensor,
+        x_t: torch.Tensor,
+        t: torch.Tensor,
+        adj: torch.Tensor = None,
+        polys=None,
+        py_ind: torch.Tensor = None,
     ):
         """
         Forward pass for Joint MM-DiT.
+        Matches V1/V2 signature for training compatibility.
         """
-        if sampled_feat is None:
-            raise ValueError("V2.2 requires per-point sampled_feat for Modality 1.")
-
         # Batch Alignment
         if py_ind is not None and cnn_feature.shape[0] != x_t.shape[0]:
             cnn_feature = cnn_feature[py_ind]
@@ -92,4 +92,5 @@ class DiTDenoiserV2_2(nn.Module):
 
         # 4. Discard Image Modality, project Contour Modality to displacement
         out = self.final_layer(x_c, t_emb)
-        return out
+        L = torch.zeros(1, device=x_t.device, dtype=x_t.dtype)
+        return out, L

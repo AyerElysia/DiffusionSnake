@@ -1,33 +1,36 @@
-# DiT V2 配置文件 — BTCV 数据集
-# 基于 DiT V2 全面升级: RMSNorm + QK-Norm + SwiGLU + CyclicRoPE + 9-param adaLN
+# DiT 配置文件 - 精简版
+# 目标：只保留实际使用的参数
 
 # ===== 模型配置 =====
 model: 'sbd'
 network: 'ro_34'
 task: 'snake'
-model_dir: "data/model/btcv_diffusion_dit_v2_1"
+model_dir: "data/model/btcv_diffusion_dit"
 
-gpus: [4]
-resume: false
+gpus: [2, 5]
+resume: false  # 不从 checkpoint 恢复（首次训练 DiT）
 
 # ===== 训练配置 =====
 train_or_test: train
 
 train:
+    # 基础配置
     dataset: 'BtcvTrain'
     data_path: '/home/medteam/Zhrch/Datasets/BTCV/btcv_png_new_snake'
-    per_contour: false
+    per_contour: false          # false=按图像(720样本), true=按轮廓(3988样本)
 
+    # 训练超参数
     optim: 'adamw'
-    lr: 5e-5
-    milestones: (80, 120)
-    gamma: 0.5
+    lr: 5e-5                    # 学习率
+    milestones: (80, 120)       # 学习率衰减节点
+    gamma: 0.5                  # 衰减系数
     batch_size: 64
     gradient_accumulation_steps: 1
     gradient_clip: 1.0
     weight_decay: 0.01
     warmup_steps: 1000
 
+    # 训练设置
     epoch: 1000
     num_workers: 4
     save_ep: 10
@@ -39,13 +42,13 @@ test:
     img_path: '/home/medteam/Zhrch/Datasets/BTCV/btcv_png_test_new_snake'
     epoch: -1
 
-# ===== 检测配置 =====
+# ===== 检测配置 (推理时使用) =====
 use_nms_for_snake: true
 det_conf_thresh: 0.01
 det_iou_thresh: 0.45
 det_max_det: 100
 per_class_nms: true
-use_gt_det: false
+use_gt_det: false              # 消融实验：是否使用 GT 检测框
 
 # ===== 损失权重 =====
 loss_scales: {det: 0, ex: 1.0, py: 1.2}
@@ -59,17 +62,20 @@ diffusion_loss_type: 'adaptive'
 diffusion_disp_norm: true
 diffusion_disp_stats: "data/stats/btcv_disp_stats.json"
 
-# ===== DiT V2 去噪器配置 =====
-use_dit_denoiser: false   # V1 关闭
-use_dit_v2_1: true          # V2 启用
+# ===== DiT 去噪器配置 =====
+use_dit_denoiser: true
 dit_num_layers: 6
 dit_num_heads: 8
 dit_state_dim: 256
 
-# ===== GRPO 配置 =====
+# ===== GRPO 配置 (当前不用) =====
 use_grpo: false
+grpo_first_contour_only: true
+grpo_window_size: 1
+grpo_window_range: [15, 20]
 
-# ===== 其他 =====
+# ===== 其他配置 =====
 heads: {'ct_hm': 9, 'wh': 2}
 segm_or_bbox: 'segm'
 use_diffusion_trainer: true
+resume: true

@@ -1,0 +1,70 @@
+model: 'sbd'
+network: 'ro_34'
+task: 'snake'
+resume: false
+gpus: [7]
+multistage: False
+add_darnet: 0
+train_or_test: train
+random_num: 0
+
+use_grpo: false
+grpo_first_contour_only: true
+grpo_window_size: 1
+grpo_window_range: [15, 20]
+
+model_dir: "data/model/processed1232_diffusion"
+yolo_pretrained: ""
+load_yolo_pretrained: false
+freeze_snake: False
+freeze_yolo: False
+
+train:
+    beta: 0
+    clip_range: 0.001
+    adv_clip_max: 5.0
+
+    per_contour: false
+
+    optim: 'adamw'
+    lr: 1e-4
+    milestones: (80, 120)
+    gamma: 0.5
+    batch_size: 32
+    dataset: 'Proc1232Train'
+    num_workers: 4
+    epoch: 300
+    data_path: '/home/medteam/Zhrch/Data_processed/1232processed'
+    save_ep: 10
+
+loss_scales: {det: 0, ex: 1.0, py: 1.2}
+
+test:
+    dataset: 'Proc1232Val'
+    batch_size: 1
+    img_path: '/home/medteam/Zhrch/Data_processed/1232processed'
+    epoch: -1
+
+use_nms_for_snake: true
+
+det_conf_thresh: 0.01
+det_iou_thresh: 0.45
+det_max_det: 100
+per_class_nms: true
+
+use_gt_det: false
+
+use_diffusion_evolution: true
+diffusion_timesteps: 1000
+use_ddim_inference: true
+diffusion_loss_weight: 1.0
+diffusion_loss_type: 'adaptive'
+
+diffusion_disp_norm: true
+diffusion_disp_stats: "data/stats/processed1232_disp_stats.json"
+
+# 1232processed masks have class indices up to 51, plus background => 52
+heads: {'ct_hm':52, 'wh': 2}
+segm_or_bbox: 'segm'
+
+use_diffusion_trainer: true
