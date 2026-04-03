@@ -50,6 +50,7 @@ cfg.use_dit_v2 = False
 cfg.use_dit_v2_1 = False
 cfg.use_dit_v2_2 = False
 cfg.use_dit_v2_3 = False
+cfg.use_dit_v3 = False
 cfg.use_flow_matching = False
 cfg.flow_ode_steps = 10
 cfg.use_hybrid = False
