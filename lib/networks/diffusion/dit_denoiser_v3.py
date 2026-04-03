@@ -91,7 +91,12 @@ class DiTDenoiserV3(nn.Module):
         N, P, _ = x_t.shape
         t_emb = self.time_emb_net(t)
 
+        # Ensure cnn_feature is 4D [Batch, Channels, H, W]
+        if cnn_feature.dim() == 3:
+            cnn_feature = cnn_feature.unsqueeze(0)
+
         global_ctx = self.global_compressor(cnn_feature)
+
         if py_ind is not None:
             global_ctx = global_ctx[py_ind]
         elif global_ctx.shape[0] != N:

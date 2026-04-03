@@ -265,12 +265,19 @@ class DiffusionEvolution(nn.Module):
         adj = snake_gcn_utils.get_adj_ind(snake_config.adj_num, i_it_py.size(1), i_it_py.device)
         
         # 3. 通过去噪器预测噪声
-        if isinstance(self.denoiser, (DiTDenoiser, DiTDenoiserV2, DiTDenoiserV2_2)):
-            # DiT V1/V2/V2.2 需要全图特征 + 采样特征
+        from .dit_denoiser import DiTDenoiser
+        from .dit_denoiser_v2 import DiTDenoiserV2
+        from .dit_denoiser_v2_2 import DiTDenoiserV2_2
+        from .dit_denoiser_v3 import DiTDenoiserV3
+        from .dit_denoiser_v2_2_hybrid import DiTDenoiserV2_2Hybrid
+
+        if isinstance(self.denoiser, (DiTDenoiser, DiTDenoiserV2, DiTDenoiserV2_2, DiTDenoiserV2_2Hybrid, DiTDenoiserV3)):
+            # DiT V1/V2/V3 系列需要全图特征 + 采样特征
             eps_pred, L = self.denoiser(cnn_feature, gcn_feat, x_t, t, adj, polys=i_it_py, py_ind=py_ind)
         else:
             # 原有的 GCN Denoiser
             eps_pred, L = self.denoiser(gcn_feat, c_it_py, x_t, t, adj, polys=i_it_py)
+
 
         return eps_pred, L
 

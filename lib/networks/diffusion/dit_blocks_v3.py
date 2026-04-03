@@ -62,6 +62,14 @@ class DiTBlockV3(nn.Module):
         # SwiGLU FFN
         self.mlp = SwiGLU(dim=dim, dropout=dropout)
 
+        # Local Topology Enhancer: Circular Depth-wise Conv (K=3)
+        # Bridges the gap between Global Attention and Local Geometry.
+        self.local_smooth = nn.Conv1d(
+            dim, dim, kernel_size=3, padding=1, 
+            groups=dim, padding_mode='circular', bias=False
+        )
+
+
         # adaLN-Zero: 9 parameters
         # (shift_ca, scale_ca, gate_ca, shift_sa, scale_sa, gate_sa, shift_ff, scale_ff, gate_ff)
         self.adaLN_modulation = nn.Sequential(
@@ -120,8 +128,11 @@ class DiTBlockV3(nn.Module):
         x_sa = modulate(self.norm2(x), shift_sa, scale_sa)
         x = x + gate_sa.unsqueeze(1) * self._self_attention(x_sa)
 
-        # 3. Non-linear mapping
+        # 3. Local Smoothing & Non-linear mapping
         x_ff = modulate(self.norm3(x), shift_ff, scale_ff)
-        x = x + gate_ff.unsqueeze(1) * self.mlp(x_ff)
+        # Apply circular convolution to ensure topological continuity
+        x_ff_smooth = self.local_smooth(x_ff.transpose(1, 2)).transpose(1, 2)
+        x = x + gate_ff.unsqueeze(1) * self.mlp(x_ff_smooth)
+
 
         return x
