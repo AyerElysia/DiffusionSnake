@@ -204,40 +204,31 @@ def get_init(box):
 
 
 def get_octagon(ex):
-    # ex shape: [..., 4, 2] -> Expected order: Top, Left, Bottom, Right
-    # Official DeepSnake: extend each extreme point to a segment of 1/4 edge length.
-    
-    # 1. Calculate bounding box of extreme points to get w, h
-    x_min = ex[..., :, 0].min(dim=-1)[0]
-    x_max = ex[..., :, 0].max(dim=-1)[0]
-    y_min = ex[..., :, 1].min(dim=-1)[0]
-    y_max = ex[..., :, 1].max(dim=-1)[0]
-    w = x_max - x_min
-    h = y_max - y_min
-    
-    # 2. Extract extreme points: 0:Top, 1:Left, 2:Bottom, 3:Right
-    t = ex[..., 0, :]
-    l = ex[..., 1, :]
-    b = ex[..., 2, :]
-    r = ex[..., 3, :]
-    
-    x_ext = w / 8.0
-    y_ext = h / 8.0
-    
-    # 3. Construct 8 points in strict clockwise order:
-    # Top-segment (p1, p2), Right-segment (p3, p4), Bottom-segment (p5, p6), Left-segment (p7, p8)
-    p1 = torch.stack([t[..., 0] - x_ext, t[..., 1]], dim=-1) # Top-Left
-    p2 = torch.stack([t[..., 0] + x_ext, t[..., 1]], dim=-1) # Top-Right
-    p3 = torch.stack([r[..., 0], r[..., 1] - y_ext], dim=-1) # Right-Top
-    p4 = torch.stack([r[..., 0], r[..., 1] + y_ext], dim=-1) # Right-Bottom
-    p5 = torch.stack([b[..., 0] + x_ext, b[..., 1]], dim=-1) # Bottom-Right
-    p6 = torch.stack([b[..., 0] - x_ext, b[..., 1]], dim=-1) # Bottom-Left
-    p7 = torch.stack([l[..., 0], l[..., 1] + y_ext], dim=-1) # Left-Bottom
-    p8 = torch.stack([l[..., 0], l[..., 1] - y_ext], dim=-1) # Left-Top
-    
-    # 4. Concatenate points along the vertex dimension
-    octagon = torch.stack([p1, p2, p3, p4, p5, p6, p7, p8], dim=-2)
-    return octagon
+    # ex shape: [..., 4, 2] in Top, Left, Bottom, Right order.
+    # Match the canonical DeepSnake implementation used by dataset construction.
+    w = ex[..., 3, 0] - ex[..., 1, 0]
+    h = ex[..., 2, 1] - ex[..., 0, 1]
+    t = ex[..., 0, 1]
+    l = ex[..., 1, 0]
+    b = ex[..., 2, 1]
+    r = ex[..., 3, 0]
+    x = 8.0
+
+    octagon = [
+        ex[..., 0, 0], ex[..., 0, 1],
+        torch.maximum(ex[..., 0, 0] - w / x, l), ex[..., 0, 1],
+        ex[..., 1, 0], torch.maximum(ex[..., 1, 1] - h / x, t),
+        ex[..., 1, 0], ex[..., 1, 1],
+        ex[..., 1, 0], torch.minimum(ex[..., 1, 1] + h / x, b),
+        torch.maximum(ex[..., 2, 0] - w / x, l), ex[..., 2, 1],
+        ex[..., 2, 0], ex[..., 2, 1],
+        torch.minimum(ex[..., 2, 0] + w / x, r), ex[..., 2, 1],
+        ex[..., 3, 0], torch.minimum(ex[..., 3, 1] + h / x, b),
+        ex[..., 3, 0], ex[..., 3, 1],
+        ex[..., 3, 0], torch.maximum(ex[..., 3, 1] - h / x, t),
+        torch.minimum(ex[..., 0, 0] + w / x, r), ex[..., 0, 1],
+    ]
+    return torch.stack(octagon, dim=-1).view(*ex.shape[:-2], 12, 2)
 
 
 

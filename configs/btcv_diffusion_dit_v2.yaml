@@ -62,6 +62,7 @@ diffusion_disp_stats: "data/stats/btcv_disp_stats.json"
 # ===== DiT V2 去噪器配置 =====
 use_dit_denoiser: false   # V1 关闭
 use_dit_v2: true          # V2 启用
+use_dit_v3: true          # V3 启用 (激活八边形初始化)
 dit_num_layers: 6
 dit_num_heads: 8
 dit_state_dim: 256

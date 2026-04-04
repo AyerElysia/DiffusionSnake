@@ -13,7 +13,7 @@ from .dit_denoiser import DiTDenoiser
 from .dit_denoiser_v2 import DiTDenoiserV2
 from .dit_denoiser_v2_2 import DiTDenoiserV2_2
 import lib.utils.snake.snake_gcn_utils as snake_gcn_utils
-from lib.utils.snake import snake_config, snake_decode
+from lib.utils.snake import snake_config
 from lib.config import cfg as global_cfg
 
 class DiffusionEvolution(nn.Module):
@@ -314,21 +314,13 @@ class DiffusionEvolution(nn.Module):
                     'i_gt_py': init['i_gt_py']
                 })
 
-                # 2) 构建训练用 init 轮廓（从 GT 4 点外接矩形直接上采样到 P 点）
+                # 2) 直接复用数据构造阶段生成的真实 init 轮廓
                 device = cnn_feature.device
-                i_gt_4py = init['i_gt_4py'].to(device)
+                i_init_train_py = init['i_it_py'].to(device)
+                c_init_train_py = init['c_it_py'].to(device)
                 i_gt_py = init['i_gt_py'].to(device)
                 i_gt_py_orig = i_gt_py.clone()
                 py_ind = init['py_ind']
-
-                x_min = i_gt_4py[..., 0].min(dim=1)[0]
-                y_min = i_gt_4py[..., 1].min(dim=1)[0]
-                x_max = i_gt_4py[..., 0].max(dim=1)[0]
-                y_max = i_gt_4py[..., 1].max(dim=1)[0]
-                gt_boxes = torch.stack([x_min, y_min, x_max, y_max], dim=1).unsqueeze(0)
-                gt_rect4 = snake_decode.get_box(gt_boxes)[0]
-                i_init_train_py = snake_gcn_utils.uniform_upsample(gt_rect4.unsqueeze(0), snake_config.poly_num)[0]
-                c_init_train_py = snake_gcn_utils.img_poly_to_can_poly(i_init_train_py)
 
                 # 仅保留 A1 路径，不构建 B/C 变体
                 h, w = cnn_feature.size(2), cnn_feature.size(3)

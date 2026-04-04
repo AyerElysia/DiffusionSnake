@@ -7,7 +7,7 @@ import numpy as np
 import copy
 from lib.config import cfg
 from lib.networks.YOLOV8.utils.loss import v8DetectionLoss
-from lib.utils.snake import snake_gcn_utils, snake_config, snake_decode
+from lib.utils.snake import snake_gcn_utils, snake_config
 from lib.train.rewards.region_reward import compute_region_reward
 from lib.networks.YOLOV8.utils.ops import non_max_suppression
 from lib.networks.diffusion.ddpm_with_logprob import ddpm_step_with_logprob
@@ -204,19 +204,10 @@ class DiffusionGRPONetworkWrapper(nn.Module):
         if use_grpo and (not self.freeze_snake):
             with torch.no_grad():
                 init = snake_gcn_utils.prepare_training(output, batch)
-            i_gt_4py = init['i_gt_4py']
             i_gt_py = init['i_gt_py']
             py_ind = init['py_ind']
-            x_min = i_gt_4py[..., 0].min(dim=1)[0]
-            y_min = i_gt_4py[..., 1].min(dim=1)[0]
-            x_max = i_gt_4py[..., 0].max(dim=1)[0]
-            y_max = i_gt_4py[..., 1].max(dim=1)[0]
-            gt_boxes = torch.stack([x_min, y_min, x_max, y_max], dim=1).unsqueeze(0)
-            gt_rect4 = snake_decode.get_box(gt_boxes)[0]
-            i_init_train_py = snake_gcn_utils.uniform_upsample(
-                gt_rect4.unsqueeze(0), snake_config.poly_num
-            )[0]
-            c_init_train_py = snake_gcn_utils.img_poly_to_can_poly(i_init_train_py)
+            i_init_train_py = init['i_it_py']
+            c_init_train_py = init['c_it_py']
 
             def _signed_area(poly: torch.Tensor) -> torch.Tensor:
                 x = poly[..., 0]

@@ -368,8 +368,8 @@ def main():
                 det_b[i, 2:4] = p_aff[1]
             det_aff = torch.from_numpy(det_b)
 
-        # init poly on feature map
-        rect4_all = snake_decode.get_box(detection[..., :4])  # [B, M, 4, 2]
+        # Use dynamic initialization (handles octagon if specified in config)
+        rect4_all = snake_decode.get_init(detection[..., :4])  # [B, M, V, 2]
         dr = float(snake_config.down_ratio)
         rect4_feat = rect4_all / dr
         det_score = detection[..., 4]
