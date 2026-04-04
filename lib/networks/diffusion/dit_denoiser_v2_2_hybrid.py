@@ -2,15 +2,16 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+from .dit_blocks import SinusoidalTimeEmbedding
 from .dit_blocks_v2 import (
     SeparatePointEmbedding, 
     FinalLayer
 )
 from .dit_blocks_v2_2 import (
     PatchifyEmbedding,
-    JointDiTBlock,
-    TimestepEmbedder
+    JointDiTBlock
 )
+
 
 
 class DiTDenoiserV2_2Hybrid(nn.Module):
@@ -57,12 +58,18 @@ class DiTDenoiserV2_2Hybrid(nn.Module):
         ])
         
         # 4. Conditioning & Output
-        self.t_embedder = TimestepEmbedder(state_dim)
-        self.final_layer = FinalLayer(state_dim, num_points)
+        self.t_embedder = nn.Sequential(
+            SinusoidalTimeEmbedding(dim=state_dim // 4),
+            nn.Linear(state_dim // 4, state_dim),
+            nn.SiLU(),
+            nn.Linear(state_dim, state_dim)
+        )
+        self.final_layer = FinalLayer(state_dim, out_dim=2) # match V2/V3 output signature
 
     def forward(self, cnn_feature, sampled_feat, x_t, t_scaled, adj, polys=None, py_ind=None):
         # Time conditioning
         t_emb = self.t_embedder(t_scaled)
+
         
         # Initial point tokens [N, 128, 256]
         x = self.point_embed(x_t, sampled_feat)

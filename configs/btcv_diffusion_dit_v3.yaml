@@ -19,7 +19,7 @@ train:
     per_contour: false
 
     optim: 'adamw'
-    lr: 5e-5
+    lr: 1e-5
     milestones: (80, 120)
     gamma: 0.5
     batch_size: 32
@@ -62,8 +62,10 @@ diffusion_disp_stats: "data/stats/btcv_disp_stats.json"
 # ===== DiT V3 去噪器配置 =====
 use_dit_denoiser: false   # V1 关闭
 use_dit_v2: false         # V2 关闭
+use_dit_v2_1: true        # V3 启用空间锚点池化 (必开，防止 48GB OOM)
 use_dit_v3: true          # V3 启用: 启用 Octagon 初始化 和 Point Self-Attention
 dit_num_layers: 6
+
 dit_num_heads: 8
 dit_state_dim: 256
 

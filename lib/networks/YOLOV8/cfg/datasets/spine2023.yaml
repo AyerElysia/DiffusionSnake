@@ -1,0 +1,47 @@
+# Train/val/test sets as 1) dir: path/to/imgs, 2) file: path/to/imgs.txt, or 3) list: [path/to/imgs1, path/to/imgs2, ..]
+path: A:\pycharm_projects\4-PEGNN\datasets_all  # dataset root dir
+images: images      # images dir
+annots: images/annots
+train: dataset3-train5.txt  # train images (relative to 'path')
+val:   dataset3-test5.txt      # val images (relative to 'path')
+test:  dataset3-test5.txt   # test images (optional)
+
+# Keypoints
+kpt_shape: [6, 2]  # number of keypoints, number of dims (2 for x,y or 3 for x,y,visible)
+flip_idx: [2, 1, 0, 5, 4, 3]
+
+# Classes
+names:
+  0: BG 
+  1: C1
+  2: C2
+  3: C3
+  4: C4
+  5: C5
+  6: C6
+  7: C7
+  8: T1
+  9: T2
+  10: T3
+  11: T4
+  12: T5
+  13: T6
+  14: T7
+  15: T8
+  16: T9
+  17: T10
+  18: T11
+  19: T12
+  20: L1
+  21: L2
+  22: L3
+  23: L4
+  24: L5
+  25: L6
+  26: S1
+  27: T13
+# names:
+#   0: Vertebrae
+  
+# Download script/URL (optional)
+download: 
