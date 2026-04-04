@@ -1,7 +1,8 @@
 """
-Evolutionary Dynamic Network (V3) Inference Script
---------------------------------------------------
-专注于测试 V3 的扩散细化能力，使用极点八边形 (Octagon) 初始化。
+Evolutionary Dynamic Network (V3) Batch Inference Script
+--------------------------------------------------------------
+Fixed: TRUE extreme point extraction, +0.5 offset, 128-pt upsampling.
+Usage: Runs on 5 random samples to evaluate the latest V3 model.
 """
 import os
 import sys
@@ -12,7 +13,7 @@ import random
 import datetime
 from pathlib import Path
 
-# 默认启用 V3 配置文件
+# Set default V3 config
 _THIS_DIR = os.path.dirname(__file__)
 _DEFAULT_CFG = os.path.join(_THIS_DIR, 'configs', 'btcv_diffusion_dit_v3.yaml')
 
@@ -28,7 +29,6 @@ from lib.datasets.collate_batch import make_collator
 from lib.utils.snake import snake_config, snake_decode, snake_gcn_utils
 from lib.utils import data_utils
 
-
 def to_numpy(x):
     if isinstance(x, torch.Tensor):
         x = x.detach().cpu().numpy()
@@ -41,38 +41,33 @@ def draw_poly(img, poly, color, thickness=2, closed=True):
 
 def draw_results(img, pred_poly, init_poly=None, gt_poly=None, save_path=None):
     img = img.copy()
-    # 1. GT 轮廓 (蓝色 - 参考系)
+    # 1. GT (Blue)
     if gt_poly is not None:
         for poly in gt_poly:
             draw_poly(img, poly, (255, 0, 0), thickness=2)
-    
-    # 2. V3 初始八边形 (黄色 - 观测解剖初始准确度)
+    # 2. V3 Initial Octagon (Yellow)
     if init_poly is not None:
         for poly in init_poly:
             draw_poly(img, poly, (0, 255, 255), thickness=1)
-
-    # 3. V3 最终演化轮廓 (红色 - 观测拓扑平滑度)
+    # 3. V3 Refined Contour (Red)
     if pred_poly is not None:
         for poly in pred_poly:
             draw_poly(img, poly, (0, 0, 255), thickness=2)
-
     if save_path:
         os.makedirs(os.path.dirname(save_path), exist_ok=True)
         cv2.imwrite(save_path, img)
 
 def load_v3_model():
-    """加载 V3 模型"""
+    # 确保 V3 配置正确
     cfg.use_diffusion_evolution = True
-    cfg.use_dit_v3 = True # 强制开启 V3
-    
+    cfg.use_dit_denoiser = False   # V1 关闭
+    cfg.use_dit_v2 = False         # V2 关闭
+    cfg.use_dit_v2_1 = True        # V3 启用空间锚点池化
+    cfg.use_dit_v3 = True          # V3 启用八边形初始化
     network = make_network(cfg)
     trainer = make_trainer(cfg, network)
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    
-    # 寻找 checkpoint
-    cfg_stem = Path(os.environ.get('CFG_FILE', 'v3')).stem
-    ckpt_path = getattr(args, 'ckpt', '') or os.path.join(_THIS_DIR, 'data', 'outputs', cfg_stem, 'checkpoints', 'latest.pt')
-    
+    ckpt_path = getattr(args, 'ckpt', '') or os.path.join(_THIS_DIR, 'data', 'outputs', 'btcv_diffusion_dit_v3', 'checkpoints', 'latest.pt')
     print(f"[*] Loading V3 Weights from: {ckpt_path}")
     if os.path.exists(ckpt_path):
         ckpt_obj = torch.load(ckpt_path, map_location='cpu')
@@ -80,98 +75,77 @@ def load_v3_model():
         model = trainer.network.module if hasattr(trainer.network, 'module') else trainer.network
         model.load_state_dict(sd, strict=False)
     else:
-        print("[!] Warning: Checkpoint not found, using random weights (testing logic only).")
-    
+        print(f"[!] Checkpoint not found at {ckpt_path}")
+        sys.exit(1)
     return trainer.network.to(device).eval(), device
 
-def gt_to_octagon_init(batch, dr):
-    """V3 核心：从 GT 框提取八边形种子"""
-    gt_all = batch['i_gt_py'] # [B, M, P, 2]
-    B, M = gt_all.size(0), gt_all.size(1)
-    
-    # 构造检测框 [B, M, 4]
-    x1, y1 = gt_all[..., 0].min(dim=-1).values * dr, gt_all[..., 1].min(dim=-1).values * dr
-    x2, y2 = gt_all[..., 0].max(dim=-1).values * dr, gt_all[..., 1].max(dim=-1).values * dr
-    bboxes = torch.stack([x1, y1, x2, y2], dim=-1) # [B, M, 4]
-    
-    # 模拟检测掩码 (排除填充的 0)
-    valid_mask = (x2 - x1) > 1.0
-    
-    # 使用 V3 的八边形解码器 (Bbox -> Quadrangle -> Octagon)
-    ex_points = snake_decode.get_quadrangle(bboxes)
-    rect4_all = snake_decode.get_octagon(ex_points) / dr # 在特征尺度下初始化
+def extract_true_extreme_points(poly):
+    B, M, P, _ = poly.shape
+    poly_flat = poly.view(B * M, P, 2)
+    t_idx = torch.argmin(poly_flat[..., 1], dim=-1)
+    l_idx = torch.argmin(poly_flat[..., 0], dim=-1)
+    b_idx = torch.argmax(poly_flat[..., 1], dim=-1)
+    r_idx = torch.argmax(poly_flat[..., 0], dim=-1)
+    batch_idx = torch.arange(B * M, device=poly.device)
+    t, l, b, r = poly_flat[batch_idx, t_idx], poly_flat[batch_idx, l_idx], poly_flat[batch_idx, b_idx], poly_flat[batch_idx, r_idx]
+    ex = torch.stack([t, l, b, r], dim=1)
+    return ex.view(B, M, 4, 2)
 
-    
-    # 提取有效实例
-    rect4_valid = rect4_all[valid_mask] # [N_instances, 4, 2]
-    if rect4_valid.size(0) > 0:
-        i_it_py = snake_gcn_utils.uniform_upsample(rect4_valid.unsqueeze(0), snake_config.poly_num)[0]
-    else:
-        i_it_py = torch.zeros((0, snake_config.poly_num, 2), device=gt_all.device)
-        
-    # 构造 batch 索引
+def prepare_v3_init(batch, dr):
+    gt_all = batch['i_gt_py']
+    B, M = gt_all.size(0), gt_all.size(1)
+    extreme_pts = extract_true_extreme_points(gt_all)
+    extreme_pts = extreme_pts + 0.5
+    x1, y1 = gt_all[..., 0].min(dim=-1).values, gt_all[..., 1].min(dim=-1).values
+    x2, y2 = gt_all[..., 0].max(dim=-1).values, gt_all[..., 1].max(dim=-1).values
+    valid_mask = (x2 - x1) > 0.1
+    ex_flat = extreme_pts.view(-1, 4, 2)
+    init_polys_flat = snake_decode.get_octagon(ex_flat)
+    init_polys = init_polys_flat.view(B, M, 12, 2)
+    i_it_py = snake_gcn_utils.uniform_upsample(init_polys[valid_mask].unsqueeze(0), snake_config.poly_num)[0]
     img_inds = []
     for b in range(B):
-        num_valid = int(valid_mask[b].sum().item())
-        if num_valid > 0:
-            img_inds.append(torch.full((num_valid,), b, dtype=torch.long, device=gt_all.device))
+        num_v = int(valid_mask[b].sum().item())
+        if num_v > 0: img_inds.append(torch.full((num_v,), b, dtype=torch.long, device=gt_all.device))
     ind = torch.cat(img_inds) if img_inds else torch.zeros((0,), dtype=torch.long, device=gt_all.device)
-    
     return i_it_py, ind, valid_mask
 
-def main():
-    model, device = load_v3_model()
-    
-    # 1. 准备数据
-    dataset = make_dataset(cfg, cfg.test.dataset, make_transforms(cfg, is_train=False), is_train=False)
-    index = random.randint(0, len(dataset) - 1)
-    sample = dataset[index]
-    batch = make_collator(cfg)([sample])
-    
-    # 转 GPU
+def run_inference(model, device, batch, index, save_dir):
+    dr = float(snake_config.down_ratio)
     for k, v in batch.items():
         if isinstance(v, torch.Tensor): batch[k] = v.to(device)
-    
-    # 2. V3 推理流程
-    dr = float(snake_config.down_ratio)
-    model.eval()
     with torch.no_grad():
         core = model.net if hasattr(model, 'net') else model
-        
-        # A. 提取图像特征 (Perceiver/Anchor)
         yolo_out = core.yolo(batch['inp'])
         p2 = yolo_out[1][0] if isinstance(yolo_out, tuple) and len(yolo_out) > 1 else None
         cnn_feature = core.cnn_proj(p2)
-        
-        # B. V3 初始化 (八边形)
-        i_it_py, ind, valid_mask = gt_to_octagon_init(batch, dr)
-        
-        # C. 扩散演化 (Refinement)
+        i_it_py, ind, valid_mask = prepare_v3_init(batch, dr)
         pred_polys = None
         if i_it_py.size(0) > 0:
             c_it_py = snake_gcn_utils.img_poly_to_can_poly(i_it_py)
-            # steps 可以设为 50, 100 等进行测试
             disp = core.gcn.sample_disp(cnn_feature, i_it_py, c_it_py, ind, steps=50)
             pred_polys = (i_it_py + disp).cpu().numpy() * dr
-            
-    # 3. 可视化
-    # 获取原始图像用于保存 (鲁棒性改进)
+    
     orig_img = to_numpy(batch['orig_img'][0]).astype(np.uint8)
-
     init_np = i_it_py.cpu().numpy() * dr if i_it_py.numel() > 0 else None
-    
-    # 获取 GT 轮廓
     gt_poly_raw = batch['i_gt_py'][0][valid_mask[0]].cpu().numpy() * dr
-    
-    # 保存结果
-    save_dir = os.path.join(_THIS_DIR, 'visual', 'v3_refinement_test')
-    os.makedirs(save_dir, exist_ok=True)
-    save_name = f"v3_refine_{index}_{datetime.datetime.now().strftime('%H%M%S')}.png"
-    save_path = os.path.join(save_dir, save_name)
-    
+    save_path = os.path.join(save_dir, f"v3_refine_{index}_{datetime.datetime.now().strftime('%H%M%S')}.png")
     draw_results(orig_img, pred_polys, init_np, gt_poly_raw, save_path)
-    print(f"[*] V3 Inference Done! Result saved to: {save_path}")
-    print(f"[*] Initialized with {init_np.shape[0]} Octagon instances.")
+    print(f"[*] Processed index {index} -> {save_path}")
+
+def main():
+    model, device = load_v3_model()
+    dataset = make_dataset(cfg, cfg.test.dataset, make_transforms(cfg, is_train=False), is_train=False)
+    save_dir = os.path.join(_THIS_DIR, 'visual', 'v3_latest_eval')
+    os.makedirs(save_dir, exist_ok=True)
+    
+    # Run 5 random samples
+    indices = random.sample(range(len(dataset)), 5)
+    print(f"[*] Starting Batch Inference for 5 samples: {indices}")
+    for idx in indices:
+        batch = make_collator(cfg)([dataset[idx]])
+        run_inference(model, device, batch, idx, save_dir)
+    print(f"\n[✔] Inference Complete! All results in: {save_dir}")
 
 if __name__ == '__main__':
     main()

@@ -237,7 +237,7 @@ def main():
 
     #default_ckpt = os.path.join(os.path.dirname(__file__), 'data', 'outputs', 'one_sample', 'model_final.pth')
     #default_ckpt = os.path.join(os.path.dirname(__file__), 'data/one_sample/model_final.pth')
-    default_ckpt = os.path.join(os.path.dirname(__file__), 'data', 'outputs', 'one_sample', 'checkpoints', 'latest.pt')
+    default_ckpt = os.path.join(os.path.dirname(__file__), 'data', 'outputs', 'btcv_diffusion_dit_v3', 'checkpoints', 'latest.pt')
     #default_ckpt = os.path.join(os.path.dirname(__file__), 'data', 'one_sampleWithOneModifying','model_final.pth')
     ckpt_path = os.environ.get('ONE_SAMPLE_CKPT', default_ckpt)
 
