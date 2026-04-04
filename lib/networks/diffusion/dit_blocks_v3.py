@@ -23,7 +23,7 @@ from .dit_blocks_v2 import (
 class DiTBlockV3(nn.Module):
     """
     Advanced DiT Block V3
-    Sequence: Cross-Attention (Find Edges) -> Self-Attention (Smooth & Coordinate) -> FFN
+    Sequence: Cross-Attention (Find Edges) -> Self-Attention (Smooth & Coordinate) -> Local Conv -> FFN
     """
     def __init__(
         self,
@@ -120,22 +120,18 @@ class DiTBlockV3(nn.Module):
          shift_sa, scale_sa, gate_sa,
          shift_ff, scale_ff, gate_ff) = mod.chunk(9, dim=1)
 
-        # 1. 沿用 V2 设计：Self-Attention -> Cross-Attention
-        # --- 1.1 Self-Attention (Coordinate Internally) ---
-        x_sa = modulate(self.norm2(x), shift_sa, scale_sa)
-        x = x + gate_sa.unsqueeze(1) * self._self_attention(x_sa)
-
-        # --- 1.2 Cross-Attention (Sense Image Boundaries) ---
+        # V3 Design: Cross-Attention first (locate boundaries), then Self-Attention (coordinate geometry)
+        # --- 1. Cross-Attention (Sense Image Boundaries) ---
         x_ca = modulate(self.norm1(x), shift_ca, scale_ca)
         x = x + gate_ca.unsqueeze(1) * self._cross_attention(x_ca, image_context)
 
-        # 2. 注入 V3 进化：Local Smoothing & SwiGLU FFN
+        # --- 2. Self-Attention (Coordinate Internally) ---
+        x_sa = modulate(self.norm2(x), shift_sa, scale_sa)
+        x = x + gate_sa.unsqueeze(1) * self._self_attention(x_sa)
+
+        # 3. Local Smoothing & SwiGLU FFN
         x_ff = modulate(self.norm3(x), shift_ff, scale_ff)
-        # 1D Circular Conv 确保局部拓扑不乱飞
         x_ff_smooth = self.local_smooth(x_ff.transpose(1, 2)).transpose(1, 2)
         x = x + gate_ff.unsqueeze(1) * self.mlp(x_ff_smooth)
 
         return x
-
-
-

@@ -7,7 +7,7 @@ import torch
 # 因此请通过 --cfg_file 或 CFG_FILE 指定你要用的数据集配置。
 from lib.config import cfg
 from lib.datasets import make_data_loader
-from lib.utils.snake import snake_decode, snake_gcn_utils, snake_config
+from lib.utils.snake import snake_gcn_utils
 
 
 @torch.no_grad()
@@ -29,28 +29,18 @@ def compute_disp_stats() -> dict:
     dy_max = -math.inf
 
     for batch in loader:
-        # prepare_training 会根据 ct_01 等信息筛掉无效样本，并构建 py_ind
         init = snake_gcn_utils.prepare_training({}, batch)
 
-        i_gt_4py = init['i_gt_4py']
         i_gt_py = init['i_gt_py']
+        i_init_train_py = init['i_it_py']
 
         if not isinstance(i_gt_py, torch.Tensor) or i_gt_py.numel() == 0:
             continue
 
         device = i_gt_py.device
-        i_gt_4py = i_gt_4py.to(device)
+        i_init_train_py = i_init_train_py.to(device)
 
-        # 与 DiffusionEvolution.forward 内一致：用 GT 的 4 点矩形生成 init 轮廓
-        x_min_t = i_gt_4py[..., 0].min(dim=1)[0]
-        y_min_t = i_gt_4py[..., 1].min(dim=1)[0]
-        x_max_t = i_gt_4py[..., 0].max(dim=1)[0]
-        y_max_t = i_gt_4py[..., 1].max(dim=1)[0]
-        gt_boxes = torch.stack([x_min_t, y_min_t, x_max_t, y_max_t], dim=1).unsqueeze(0)
-        gt_rect4 = snake_decode.get_box(gt_boxes)[0]
-        i_init_train_py = snake_gcn_utils.uniform_upsample(gt_rect4.unsqueeze(0), snake_config.poly_num)[0]
-
-        # 方向对齐 + 起点对齐（与训练一致）
+        # Orientation alignment + start-point alignment (must match training code)
         area_init = _signed_area(i_init_train_py)
         area_gt = _signed_area(i_gt_py)
         orient_mismatch = ((area_init >= 0) ^ (area_gt >= 0))
