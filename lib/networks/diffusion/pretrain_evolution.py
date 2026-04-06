@@ -56,7 +56,7 @@ class DiffusionEvolution(nn.Module):
         # 去噪器选择
         if getattr(global_cfg, 'use_dit_v3', False):
             from .dit_denoiser_v3 import DiTDenoiserV3
-            print(f"[DiffusionEvolution] Using DiT Denoiser V3 (Reversed Attention Flow) "
+            print(f"[DiffusionEvolution] Using DiT Denoiser V3 (Perceiver Semantics + Self->Cross Flow) "
                   f"(layers={dit_num_layers}, heads={dit_num_heads}, dim={dit_state_dim})")
             self.denoiser = DiTDenoiserV3(
                 state_dim=dit_state_dim,
@@ -64,7 +64,6 @@ class DiffusionEvolution(nn.Module):
                 num_layers=dit_num_layers,
                 num_heads=dit_num_heads,
                 num_points=num_points,
-                use_v2_1=use_dit_v2_1, # reuse the spatial anchor logic
             )
         elif use_dit_v2_2:
             if getattr(global_cfg, 'use_hybrid', False):
