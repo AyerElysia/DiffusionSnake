@@ -1,81 +1,110 @@
-# README: Diffusion Snake V3 (Evolutionary Dynamic Network)
+# Diffusion Snake V3 Series
 
-## 🧬 V3 架构图 (Architecture Overview)
+V3 系列包含两个版本，核心区别在于**全局语义提取方式**。
 
-```text
-================================================================================
-             DIFFUSION SNAKE V3 (EVOLUTIONARY DYNAMIC NETWORK)
-================================================================================
+---
 
-[STAGE 0: OCTAGON INITIALIZATION]
-       YOLO Bbox (x,y,w,h)
-              |
-      [Box Midpoints Extractor] ----> (Top, Left, Bottom, Right) Extreme Points
-              |
-      [Octagon Generator] ----------> 128 Circular Seed Points (Anatomy-Aware)
-              |
-              v
-[STAGE 1: CONDITIONING & EMBEDDING]
-      (Timestep t)       (CNN Image P2)      (Initial Points x_t)
-           |                   |                     |
-    [adaLN-Zero MLP]    [Global Perceiver]    [Point Embedding]
-           |             [Local Sampling]      (Coord + Feat)
-           |                   |                     |
-           v                   v                     v
-================================================================================
-[STAGE 2: DIT BLOCK V3 x N (CORE EVOLUTION LOOP)]
---------------------------------------------------------------------------------
-           |                   |                     |
-           +-------------------|-------------------->| (Input x)
-           |                   |                     |
-    [1. adaLN Modulation] <----+                     |
-           |                                         |
-           +---- [CROSS-ATTENTION: FIND EDGES] <-----+
-           |      (Points attend to Image Context)    |
-           |                   |                     |
-           v                   v                     |
-    [2. adaLN Modulation] <----+                     | (Residual Link)
-           |                                         |
-           +---- [SELF-ATTENTION: COORDINATE] <------+
-           |      (128x128 Topological Match)        |
-           |             (QK-Norm + RoPE)            |
-           |                   |                     |
-           v                   v                     |
-    [3. adaLN Modulation] <----+                     | (Residual Link)
-           |                                         |
-           +---- [LOCAL-SMOOTH: 1D CONV k=3] <-------+
-           |      (Circ. Padding for Topology)       |
-           |                   |                     |
-           +---- [SwiGLU FFN: NON-LINEAR MAP] <------+
-           |                                         |
-           v                                         v
---------------------------------------------------------------------------------
-================================================================================
-              |
-      [FINAL adaLN HEAD] ------> Predicted Velocity Field (v_t)
-              |
-              v
-      [ODE SOLVER / DDIM] -----> Refined Anatomical Contour
-================================================================================
+## 版本对比
+
+| 版本 | 全局语义提取 | README |
+|------|-------------|--------|
+| **V3.0** | Perceiver (256 learnable queries) | [README_V3_DENOISER.md](./README_V3_DENOISER.md) |
+| **V3.1** | Patchify (ViT-style, 16×16 patches) | [README_V3_1_DENOISER.md](./README_V3_1_DENOISER.md) |
+
+---
+
+## 共同架构
+
+### Block 结构 (两者相同)
+
+```
+Self-Attention → Cross-Attention → SwiGLU FFN
 ```
 
-## 💎 V3 核心进化路径 (Key Evolutions)
+### 执行流程
 
-1. **Reversed Attention Flow (反向注意力流)**:
-   - 从 V2 的 `Self -> Cross` 进化为 `Cross -> Self`。
-   - **意义**: 遵循“外部定位 -> 内部协同 -> 非线性映射”的鲁棒几何逻辑。显著提高复杂遮挡边缘下的贴合能力。
+```
+1. Time Embedding: Sinusoidal → MLP
+2. Global Context: Perceiver 或 Patchify
+3. Local Context: sampled_feat → Linear projection
+4. Point Embedding: Separate (coord + feature)
+5. DiT Blocks × 6: Alternating global/local context
+6. Output: FinalLayer (adaLN + Linear)
+```
 
-2. **1D Circular Convolutional Smoother (拓扑平滑体)**:
-   - 在 FFN 之前引入 $K=3$ 的循环深度卷积。
-   - **意义**: 强行拉近相邻点的特征距离，从物理层面上杜绝了“单点乱飞”现象，让生成的轮廓如丝般顺滑。
+### 关键组件
 
-3. **Anatomical Octagon Init (解剖学八边形初始化)**:
-   - 摒弃方正的矩形种子，基于极值点生成的八边形种子更符合器官解剖轮廓。
-   - **收支**: 演化距离缩短 ~40%，大幅降低显存和采样步数压力。
+| 组件 | 实现 |
+|------|------|
+| Normalization | RMSNorm |
+| Attention | QK-Norm + Scaled Dot-Product |
+| Position Encoding | CyclicRoPE (Self-Attn only) |
+| FFN | SwiGLU |
+| Conditioning | adaLN-Zero (9 params) |
 
-## ⚙️ 配置说明 (How to run)
-在 `configs/` YAML 中，启用以下开关即可激活完整 V3 系列动力：
+---
+
+## 全局语义提取对比
+
+### V3.0: PerceiverCompressor
+
+```python
+# 256 个可学习 queries，无位置编码
+queries = nn.Embedding(256, 256)
+
+# Cross-Attention: queries attend to image
+compressed = cross_attn(query=queries, key=image, value=image)
+```
+
+**特点**:
+- ✅ Queries 自动学习关注不同区域
+- ✅ 无需预设空间结构
+- ❌ 无显式位置信息
+- ❌ 需要 cross-attention 计算
+
+### V3.1: PatchifyEmbedding
+
+```python
+# 非重叠卷积提取 patches
+patches = Conv2d(64, 256, kernel_size=8, stride=8)(image)  # 128×128 → 16×16
+
+# 添加 2D 位置编码
+tokens = patches + pos_embed
+```
+
+**特点**:
+- ✅ 显式空间位置编码
+- ✅ 类似 ViT，易理解
+- ✅ 无 cross-attention，显存更低
+- ❌ 需要固定输入分辨率
+
+---
+
+## 配置选择
+
 ```yaml
-use_dit_v3: true           # 开启 V3 去噪器
-use_dit_v2_1: true         # 推荐开启 (空间锚点池化，极致省显存)
+# V3.0 (Perceiver)
+use_dit_v3: true
+
+# V3.1 (Patchify) - 推荐
+use_dit_v3_1: true
 ```
+
+---
+
+## 选择建议
+
+| 场景 | 推荐版本 |
+|------|---------|
+| 固定分辨率输入 | V3.1 |
+| 需要显式空间信息 | V3.1 |
+| 可变分辨率输入 | V3.0 |
+| 显存受限 | V3.1 |
+| 希望架构接近 ViT | V3.1 |
+
+---
+
+## 详细文档
+
+- **V3.0 (Perceiver)**: [README_V3_DENOISER.md](./README_V3_DENOISER.md)
+- **V3.1 (Patchify)**: [README_V3_1_DENOISER.md](./README_V3_1_DENOISER.md)

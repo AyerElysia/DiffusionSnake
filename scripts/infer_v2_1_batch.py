@@ -1,9 +1,8 @@
 import sys, os; sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '../')))
 """
-Evolutionary Dynamic Network (V3) Batch Inference Script
+DiT V2.1 (Anchor Pool) Batch Inference Script
 --------------------------------------------------------------
-Fixed: TRUE extreme point extraction, +0.5 offset, 128-pt upsampling.
-Usage: Runs on 5 random samples to evaluate the latest V3 model.
+Usage: Run inference on V2.1 model for comparison.
 """
 import os
 import sys
@@ -14,10 +13,9 @@ import random
 import datetime
 from pathlib import Path
 
-# Set default V3.1 config
-_THIS_DIR = os.path.dirname(__file__)
-_ROOT_DIR = os.path.abspath(os.path.join(_THIS_DIR, '..'))
-_DEFAULT_CFG = os.path.join(_ROOT_DIR, 'configs', 'btcv_diffusion_dit_v3_1.yaml')
+# Load V2.1 Config (same as V2 but with V2.1 flags)
+_THIS_DIR = os.path.dirname(os.path.abspath(__file__))
+_DEFAULT_CFG = os.path.join(_THIS_DIR, 'configs', 'btcv_diffusion_dit_v2.yaml')
 
 if not os.environ.get('CFG_FILE'):
     os.environ['CFG_FILE'] = _DEFAULT_CFG
@@ -47,11 +45,11 @@ def draw_results(img, pred_poly, init_poly=None, gt_poly=None, save_path=None):
     if gt_poly is not None:
         for poly in gt_poly:
             draw_poly(img, poly, (255, 0, 0), thickness=2)
-    # 2. V3 Initial Octagon (Yellow)
+    # 2. Initial (Yellow)
     if init_poly is not None:
         for poly in init_poly:
             draw_poly(img, poly, (0, 255, 255), thickness=1)
-    # 3. V3 Refined Contour (Red)
+    # 3. Refined (Red)
     if pred_poly is not None:
         for poly in pred_poly:
             draw_poly(img, poly, (0, 0, 255), thickness=2)
@@ -59,24 +57,27 @@ def draw_results(img, pred_poly, init_poly=None, gt_poly=None, save_path=None):
         os.makedirs(os.path.dirname(save_path), exist_ok=True)
         cv2.imwrite(save_path, img)
 
-def load_v3_model():
-    # 确保 V3.1 配置正确 (由配置文件驱动)
+def load_v2_1_model():
+    # Force V2.1 settings
+    cfg.use_diffusion_evolution = True
+    cfg.use_dit_denoiser = False
+    cfg.use_dit_v2_1 = True
+    cfg.use_dit_v2_2 = False
+    cfg.use_dit_v3 = False # FORCE V3 OFF
+    
     network = make_network(cfg)
     trainer = make_trainer(cfg, network)
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     
-    # 路径修正：指向根目录下的 data 文件夹
-    ckpt_path = getattr(args, 'ckpt', '') or os.path.join(_ROOT_DIR, 'data', 'outputs', 'btcv_diffusion_dit_v3_1', 'checkpoints', 'latest.pt')
-    print(f"[*] Loading V3.1 Weights from: {ckpt_path}")
+    # Auto-locate checkpoint
+    ckpt_path = os.path.join(_THIS_DIR, 'data', 'outputs', 'btcv_diffusion_dit_v2_1', 'checkpoints', 'latest.pt')
+    
+    print(f"[*] Loading V2.1 Weights from: {ckpt_path}")
     if os.path.exists(ckpt_path):
         ckpt_obj = torch.load(ckpt_path, map_location='cpu')
         sd = ckpt_obj.get('state_dict') or ckpt_obj.get('model') or ckpt_obj.get('net') or ckpt_obj
-        # Remap legacy keys (keep net. prefix for NetworkWrapper)
-        from lib.networks.diffusion.pretrain_evolution import remap_legacy_state_dict
-        sd = remap_legacy_state_dict(sd)
-        wrapper = trainer.network.module if hasattr(trainer.network, 'module') else trainer.network
-        info = wrapper.load_state_dict(sd, strict=False)
-        print(f"[✔] Loaded: missing={len(info.missing_keys)}, unexpected={len(info.unexpected_keys)}")
+        model = trainer.network.module if hasattr(trainer.network, 'module') else trainer.network
+        model.load_state_dict(sd, strict=False)
     else:
         print(f"[!] Checkpoint not found at {ckpt_path}")
         sys.exit(1)
@@ -90,67 +91,52 @@ def extract_true_extreme_points(poly):
     b_idx = torch.argmax(poly_flat[..., 1], dim=-1)
     r_idx = torch.argmax(poly_flat[..., 0], dim=-1)
     batch_idx = torch.arange(B * M, device=poly.device)
-    t, l, b, r = poly_flat[batch_idx, t_idx], poly_flat[batch_idx, l_idx], poly_flat[batch_idx, b_idx], poly_flat[batch_idx, r_idx]
-    ex = torch.stack([t, l, b, r], dim=1)
+    ex = torch.stack([poly_flat[batch_idx, t_idx], poly_flat[batch_idx, l_idx], 
+                      poly_flat[batch_idx, b_idx], poly_flat[batch_idx, r_idx]], dim=1)
     return ex.view(B, M, 4, 2)
-
-def prepare_v3_init(batch, dr):
-    gt_all = batch['i_gt_py']
-    B, M = gt_all.size(0), gt_all.size(1)
-    extreme_pts = extract_true_extreme_points(gt_all)
-    extreme_pts = extreme_pts + 0.5
-    x1, y1 = gt_all[..., 0].min(dim=-1).values, gt_all[..., 1].min(dim=-1).values
-    x2, y2 = gt_all[..., 0].max(dim=-1).values, gt_all[..., 1].max(dim=-1).values
-    valid_mask = (x2 - x1) > 0.1
-    ex_flat = extreme_pts.view(-1, 4, 2)
-    init_polys_flat = snake_decode.get_octagon(ex_flat)
-    init_polys = init_polys_flat.view(B, M, 12, 2)
-    i_it_py = snake_gcn_utils.uniform_upsample(init_polys[valid_mask].unsqueeze(0), snake_config.poly_num)[0]
-    img_inds = []
-    for b in range(B):
-        num_v = int(valid_mask[b].sum().item())
-        if num_v > 0: img_inds.append(torch.full((num_v,), b, dtype=torch.long, device=gt_all.device))
-    ind = torch.cat(img_inds) if img_inds else torch.zeros((0,), dtype=torch.long, device=gt_all.device)
-    return i_it_py, ind, valid_mask
 
 def run_inference(model, device, batch, index, save_dir):
     dr = float(snake_config.down_ratio)
     for k, v in batch.items():
         if isinstance(v, torch.Tensor): batch[k] = v.to(device)
+    
     with torch.no_grad():
         core = model.net if hasattr(model, 'net') else model
         yolo_out = core.yolo(batch['inp'])
         p2 = yolo_out[1][0] if isinstance(yolo_out, tuple) and len(yolo_out) > 1 else None
         cnn_feature = core.cnn_proj(p2)
-        i_it_py, ind, valid_mask = prepare_v3_init(batch, dr)
+        
+        # V2.1 initialization (using box)
+        gt_all = batch['i_gt_py']
+        x1, y1 = gt_all[..., 0].min(dim=-1).values, gt_all[..., 1].min(dim=-1).values
+        x2, y2 = gt_all[..., 0].max(dim=-1).values, gt_all[..., 1].max(dim=-1).values
+        bboxes = torch.stack([x1, y1, x2, y2], dim=-1) # [B, M, 4]
+        init_polys_flat = snake_decode.get_box(bboxes) # Keep as [B, M, 4, 2]
+        i_it_py = snake_gcn_utils.uniform_upsample(init_polys_flat, 128)[0]
+        
         pred_polys = None
         if i_it_py.size(0) > 0:
             c_it_py = snake_gcn_utils.img_poly_to_can_poly(i_it_py)
-            # sample_disp() already calls denormalize_disp() internally
+            ind = torch.zeros(i_it_py.size(0), dtype=torch.long, device=device)
             disp = core.gcn.sample_disp(cnn_feature, i_it_py, c_it_py, ind, steps=50)
-                
             pred_polys = (i_it_py + disp).cpu().numpy() * dr
     
     orig_img = to_numpy(batch['orig_img'][0]).astype(np.uint8)
     init_np = i_it_py.cpu().numpy() * dr if i_it_py.numel() > 0 else None
-    gt_poly_raw = batch['i_gt_py'][0][valid_mask[0]].cpu().numpy() * dr
-    
-    # 自动识别版本标签
-    ver_tag = "v3_1_patchify" if getattr(cfg, 'use_dit_v3_1', False) else "v3_0_perceiver"
-    
-    save_path = os.path.join(save_dir, f"{datetime.datetime.now().strftime('%H%M%S')}_{ver_tag}_idx{index}.png")
+    gt_poly_raw = batch['i_gt_py'][0].cpu().numpy() * dr
+    save_path = os.path.join(save_dir, f"{datetime.datetime.now().strftime('%H%M%S')}_v2_1_idx{index}.png")
     draw_results(orig_img, pred_polys, init_np, gt_poly_raw, save_path)
     print(f"[*] Processed index {index} -> {save_path}")
 
 def main():
-    model, device = load_v3_model()
+    model, device = load_v2_1_model()
     dataset = make_dataset(cfg, cfg.test.dataset, make_transforms(cfg, is_train=False), is_train=False)
-    save_dir = os.path.join(_THIS_DIR, 'visual', 'v3_latest_eval')
+    save_dir = os.path.join(_THIS_DIR, 'visual', 'v2_1_eval')
     os.makedirs(save_dir, exist_ok=True)
     
     # Run 5 random samples
     indices = random.sample(range(len(dataset)), 5)
-    print(f"[*] Starting Batch Inference for 5 samples: {indices}")
+    print(f"[*] Starting Batch Inference for 5 samples (V2.1): {indices}")
     for idx in indices:
         batch = make_collator(cfg)([dataset[idx]])
         run_inference(model, device, batch, idx, save_dir)

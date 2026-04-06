@@ -100,7 +100,9 @@ def run_inference(model, device, batch, save_dir, ver_tag, index):
     # 5. 渲染
     # 安全获取原图
     if 'orig_img' in batch:
-        img = batch['orig_img'][0].detach().cpu().numpy().astype(np.uint8)
+        img_raw = batch['orig_img'][0]
+        img = img_raw.detach().cpu().numpy() if torch.is_tensor(img_raw) else img_raw
+        img = img.astype(np.uint8)
     else:
         print("  [!] Warning: 'orig_img' missing, using black background.")
         img = np.zeros((512, 512, 3), dtype=np.uint8)

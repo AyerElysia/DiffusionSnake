@@ -1,7 +1,8 @@
+import sys, os; sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '../')))
 """
-DiT V2.2 Refinement Inference Script
+DiT V2.3 Hybrid (Flow Matching) Inference Script
 --------------------------------------------------------------
-Usage: Run inference on V2.2 model to compare with other versions.
+Usage: Run inference on V2.3 Hybrid model using Flow Matching.
 """
 import os
 import sys
@@ -12,9 +13,9 @@ import random
 import datetime
 from pathlib import Path
 
-# Load V2.2 Config
+# Load V2.3 Hybrid Config
 _THIS_DIR = os.path.dirname(os.path.abspath(__file__))
-_DEFAULT_CFG = os.path.join(_THIS_DIR, 'configs', 'btcv_diffusion_dit_v2_2.yaml')
+_DEFAULT_CFG = os.path.join(_THIS_DIR, 'configs', 'btcv_diffusion_dit_v2_3.yaml')
 
 if not os.environ.get('CFG_FILE'):
     os.environ['CFG_FILE'] = _DEFAULT_CFG
@@ -56,21 +57,17 @@ def draw_results(img, pred_poly, init_poly=None, gt_poly=None, save_path=None):
         os.makedirs(os.path.dirname(save_path), exist_ok=True)
         cv2.imwrite(save_path, img)
 
-def load_v2_2_model():
-    # Force V2.2 settings
-    cfg.use_diffusion_evolution = True
-    cfg.use_dit_denoiser = False
-    cfg.use_dit_v2_1 = False
-    cfg.use_dit_v2_2 = True
-    
+def load_v23_model():
+    # Make sure we use the config specified
     network = make_network(cfg)
     trainer = make_trainer(cfg, network)
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     
     # Auto-locate checkpoint
-    ckpt_path = os.path.join(_THIS_DIR, 'data', 'outputs', 'btcv_diffusion_dit_v2_2', 'checkpoints', 'latest.pt')
+    cfg_stem = Path(_DEFAULT_CFG).stem
+    ckpt_path = os.path.join(_THIS_DIR, 'data', 'outputs', cfg_stem, 'checkpoints', 'latest.pt')
     
-    print(f"[*] Loading V2.2 Weights from: {ckpt_path}")
+    print(f"[*] Loading V2.3 Weights from: {ckpt_path}")
     if os.path.exists(ckpt_path):
         ckpt_obj = torch.load(ckpt_path, map_location='cpu')
         sd = ckpt_obj.get('state_dict') or ckpt_obj.get('model') or ckpt_obj.get('net') or ckpt_obj
@@ -81,8 +78,8 @@ def load_v2_2_model():
         sys.exit(1)
     return trainer.network.to(device).eval(), device
 
-def prepare_v2_2_init(batch, dr):
-    # V2.2 uses Box initialization
+def prepare_v23_init(batch, dr):
+    # V2.3 uses Box initialization (different from V3's Octagon)
     gt_all = batch['i_gt_py']
     B, M = gt_all.size(0), gt_all.size(1)
     
@@ -111,30 +108,31 @@ def run_inference(model, device, batch, index, save_dir):
         p2 = yolo_out[1][0] if isinstance(yolo_out, tuple) and len(yolo_out) > 1 else None
         cnn_feature = core.cnn_proj(p2)
         
-        i_it_py, ind, valid_mask = prepare_v2_2_init(batch, dr)
+        i_it_py, ind, valid_mask = prepare_v23_init(batch, dr)
         
         pred_polys = None
         if i_it_py.size(0) > 0:
             c_it_py = snake_gcn_utils.img_poly_to_can_poly(i_it_py)
-            disp = core.gcn.sample_disp(cnn_feature, i_it_py, c_it_py, ind, steps=50)
+            # sample_disp in FlowMatchingEvolution will use Euler ODE solver
+            disp = core.gcn.sample_disp(cnn_feature, i_it_py, c_it_py, ind, steps=cfg.flow_ode_steps)
             pred_polys = (i_it_py + disp).cpu().numpy() * dr
     
     orig_img = to_numpy(batch['orig_img'][0]).astype(np.uint8)
     init_np = i_it_py.cpu().numpy() * dr if i_it_py.numel() > 0 else None
     gt_poly_raw = batch['i_gt_py'][0][valid_mask[0]].cpu().numpy() * dr
-    save_path = os.path.join(save_dir, f"{datetime.datetime.now().strftime('%H%M%S')}_v2_2_idx{index}.png")
+    save_path = os.path.join(save_dir, f"v2_3_hybrid_{index}_{datetime.datetime.now().strftime('%H%M%S')}.png")
     draw_results(orig_img, pred_polys, init_np, gt_poly_raw, save_path)
     print(f"[*] Processed index {index} -> {save_path}")
 
 def main():
-    model, device = load_v2_2_model()
+    model, device = load_v23_model()
     dataset = make_dataset(cfg, cfg.test.dataset, make_transforms(cfg, is_train=False), is_train=False)
-    save_dir = os.path.join(_THIS_DIR, 'visual', 'v2_2_eval')
+    save_dir = os.path.join(_THIS_DIR, 'visual', 'v2_3_hybrid_eval')
     os.makedirs(save_dir, exist_ok=True)
     
     # Run 5 random samples
     indices = random.sample(range(len(dataset)), 5)
-    print(f"[*] Starting Batch Inference for 5 samples (V2.2): {indices}")
+    print(f"[*] Starting Batch Inference for 5 samples (V2.3 Hybrid): {indices}")
     for idx in indices:
         batch = make_collator(cfg)([dataset[idx]])
         run_inference(model, device, batch, idx, save_dir)
