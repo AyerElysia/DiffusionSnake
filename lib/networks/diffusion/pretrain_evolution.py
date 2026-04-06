@@ -14,6 +14,7 @@ from .dit_denoiser_v2 import DiTDenoiserV2
 from .dit_denoiser_v2_2 import DiTDenoiserV2_2
 from .dit_denoiser_v2_2_hybrid import DiTDenoiserV2_2Hybrid
 from .dit_denoiser_v3 import DiTDenoiserV3
+from .dit_denoiser_v3_1 import DiTDenoiserV3_1
 import lib.utils.snake.snake_gcn_utils as snake_gcn_utils
 from lib.utils.snake import snake_config
 from lib.config import cfg as global_cfg
@@ -54,8 +55,17 @@ class DiffusionEvolution(nn.Module):
         self.loss_type = loss_type
 
         # 去噪器选择
-        if getattr(global_cfg, 'use_dit_v3', False):
-            from .dit_denoiser_v3 import DiTDenoiserV3
+        if getattr(global_cfg, 'use_dit_v3_1', False):
+            print(f"[DiffusionEvolution] Using DiT Denoiser V3.1 (Patchify + Self->Cross Flow) "
+                  f"(layers={dit_num_layers}, heads={dit_num_heads}, dim={dit_state_dim})")
+            self.denoiser = DiTDenoiserV3_1(
+                state_dim=dit_state_dim,
+                feature_dim=feature_dim,
+                num_layers=dit_num_layers,
+                num_heads=dit_num_heads,
+                num_points=num_points,
+            )
+        elif getattr(global_cfg, 'use_dit_v3', False):
             print(f"[DiffusionEvolution] Using DiT Denoiser V3 (Perceiver Semantics + Self->Cross Flow) "
                   f"(layers={dit_num_layers}, heads={dit_num_heads}, dim={dit_state_dim})")
             self.denoiser = DiTDenoiserV3(
@@ -266,7 +276,7 @@ class DiffusionEvolution(nn.Module):
         adj = snake_gcn_utils.get_adj_ind(snake_config.adj_num, i_it_py.size(1), i_it_py.device)
         
         # 3. 通过去噪器预测噪声
-        if isinstance(self.denoiser, (DiTDenoiser, DiTDenoiserV2, DiTDenoiserV2_2, DiTDenoiserV2_2Hybrid, DiTDenoiserV3)):
+        if isinstance(self.denoiser, (DiTDenoiser, DiTDenoiserV2, DiTDenoiserV2_2, DiTDenoiserV2_2Hybrid, DiTDenoiserV3, DiTDenoiserV3_1)):
             eps_pred, L = self.denoiser(cnn_feature, gcn_feat, x_t, t, adj, polys=i_it_py, py_ind=py_ind)
         else:
             eps_pred, L = self.denoiser(gcn_feat, c_it_py, x_t, t, adj, polys=i_it_py)
