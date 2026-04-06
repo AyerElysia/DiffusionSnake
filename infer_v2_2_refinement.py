@@ -122,7 +122,7 @@ def run_inference(model, device, batch, index, save_dir):
     orig_img = to_numpy(batch['orig_img'][0]).astype(np.uint8)
     init_np = i_it_py.cpu().numpy() * dr if i_it_py.numel() > 0 else None
     gt_poly_raw = batch['i_gt_py'][0][valid_mask[0]].cpu().numpy() * dr
-    save_path = os.path.join(save_dir, f"v2_2_refine_{index}_{datetime.datetime.now().strftime('%H%M%S')}.png")
+    save_path = os.path.join(save_dir, f"{datetime.datetime.now().strftime('%H%M%S')}_v2_2_idx{index}.png")
     draw_results(orig_img, pred_polys, init_np, gt_poly_raw, save_path)
     print(f"[*] Processed index {index} -> {save_path}")
 
