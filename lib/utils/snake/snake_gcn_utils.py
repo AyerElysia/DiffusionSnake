@@ -3,9 +3,9 @@ import os
 import numpy as np
 from lib.utils.snake import snake_decode, snake_config
 try:
-    from lib.csrc.extreme_utils import _ext as extreme_utils
+    from lib.csrc.extreme_utils._ext import _ext as extreme_utils
 except ImportError:
-    # 使用假的实现
+    # 彻底冗余检查，防止其它路径失败
     from lib.csrc.extreme_utils._ext import _ext as extreme_utils
 from lib.utils import data_utils
 import torch.nn.functional as F
