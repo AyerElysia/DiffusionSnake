@@ -1,0 +1,145 @@
+"""
+DiT V2.1 (Anchor Pool) Batch Inference Script
+--------------------------------------------------------------
+Usage: Run inference on V2.1 model for comparison.
+"""
+import os
+import sys
+import cv2
+import torch
+import numpy as np
+import random
+import datetime
+from pathlib import Path
+
+# Load V2.1 Config (same as V2 but with V2.1 flags)
+_THIS_DIR = os.path.dirname(os.path.abspath(__file__))
+_DEFAULT_CFG = os.path.join(_THIS_DIR, 'configs', 'btcv_diffusion_dit_v2.yaml')
+
+if not os.environ.get('CFG_FILE'):
+    os.environ['CFG_FILE'] = _DEFAULT_CFG
+
+from lib.config import cfg, args
+from lib.networks import make_network
+from lib.train.trainers import make_trainer
+from lib.datasets.make_dataset import make_dataset
+from lib.datasets.transforms import make_transforms
+from lib.datasets.collate_batch import make_collator
+from lib.utils.snake import snake_config, snake_decode, snake_gcn_utils
+from lib.utils import data_utils
+
+def to_numpy(x):
+    if isinstance(x, torch.Tensor):
+        x = x.detach().cpu().numpy()
+    return np.asarray(x, dtype=np.float32)
+
+def draw_poly(img, poly, color, thickness=2, closed=True):
+    if poly is None or len(poly) == 0: return
+    pts = poly.astype(np.int32)
+    cv2.polylines(img, [pts], isClosed=closed, color=color, thickness=thickness)
+
+def draw_results(img, pred_poly, init_poly=None, gt_poly=None, save_path=None):
+    img = img.copy()
+    # 1. GT (Blue)
+    if gt_poly is not None:
+        for poly in gt_poly:
+            draw_poly(img, poly, (255, 0, 0), thickness=2)
+    # 2. Initial (Yellow)
+    if init_poly is not None:
+        for poly in init_poly:
+            draw_poly(img, poly, (0, 255, 255), thickness=1)
+    # 3. Refined (Red)
+    if pred_poly is not None:
+        for poly in pred_poly:
+            draw_poly(img, poly, (0, 0, 255), thickness=2)
+    if save_path:
+        os.makedirs(os.path.dirname(save_path), exist_ok=True)
+        cv2.imwrite(save_path, img)
+
+def load_v2_1_model():
+    # Force V2.1 settings
+    cfg.use_diffusion_evolution = True
+    cfg.use_dit_denoiser = False
+    cfg.use_dit_v2_1 = True
+    cfg.use_dit_v2_2 = False
+    cfg.use_dit_v3 = False # FORCE V3 OFF
+    
+    network = make_network(cfg)
+    trainer = make_trainer(cfg, network)
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    
+    # Auto-locate checkpoint
+    ckpt_path = os.path.join(_THIS_DIR, 'data', 'outputs', 'btcv_diffusion_dit_v2_1', 'checkpoints', 'latest.pt')
+    
+    print(f"[*] Loading V2.1 Weights from: {ckpt_path}")
+    if os.path.exists(ckpt_path):
+        ckpt_obj = torch.load(ckpt_path, map_location='cpu')
+        sd = ckpt_obj.get('state_dict') or ckpt_obj.get('model') or ckpt_obj.get('net') or ckpt_obj
+        model = trainer.network.module if hasattr(trainer.network, 'module') else trainer.network
+        model.load_state_dict(sd, strict=False)
+    else:
+        print(f"[!] Checkpoint not found at {ckpt_path}")
+        sys.exit(1)
+    return trainer.network.to(device).eval(), device
+
+def extract_true_extreme_points(poly):
+    B, M, P, _ = poly.shape
+    poly_flat = poly.view(B * M, P, 2)
+    t_idx = torch.argmin(poly_flat[..., 1], dim=-1)
+    l_idx = torch.argmin(poly_flat[..., 0], dim=-1)
+    b_idx = torch.argmax(poly_flat[..., 1], dim=-1)
+    r_idx = torch.argmax(poly_flat[..., 0], dim=-1)
+    batch_idx = torch.arange(B * M, device=poly.device)
+    ex = torch.stack([poly_flat[batch_idx, t_idx], poly_flat[batch_idx, l_idx], 
+                      poly_flat[batch_idx, b_idx], poly_flat[batch_idx, r_idx]], dim=1)
+    return ex.view(B, M, 4, 2)
+
+def run_inference(model, device, batch, index, save_dir):
+    dr = float(snake_config.down_ratio)
+    for k, v in batch.items():
+        if isinstance(v, torch.Tensor): batch[k] = v.to(device)
+    
+    with torch.no_grad():
+        core = model.net if hasattr(model, 'net') else model
+        yolo_out = core.yolo(batch['inp'])
+        p2 = yolo_out[1][0] if isinstance(yolo_out, tuple) and len(yolo_out) > 1 else None
+        cnn_feature = core.cnn_proj(p2)
+        
+        # V2.1 initialization (using box)
+        gt_all = batch['i_gt_py']
+        x1, y1 = gt_all[..., 0].min(dim=-1).values, gt_all[..., 1].min(dim=-1).values
+        x2, y2 = gt_all[..., 0].max(dim=-1).values, gt_all[..., 1].max(dim=-1).values
+        bboxes = torch.stack([x1, y1, x2, y2], dim=-1) # [B, M, 4]
+        init_polys_flat = snake_decode.get_box(bboxes) # Keep as [B, M, 4, 2]
+        i_it_py = snake_gcn_utils.uniform_upsample(init_polys_flat, 128)[0]
+        
+        pred_polys = None
+        if i_it_py.size(0) > 0:
+            c_it_py = snake_gcn_utils.img_poly_to_can_poly(i_it_py)
+            ind = torch.zeros(i_it_py.size(0), dtype=torch.long, device=device)
+            disp = core.gcn.sample_disp(cnn_feature, i_it_py, c_it_py, ind, steps=50)
+            pred_polys = (i_it_py + disp).cpu().numpy() * dr
+    
+    orig_img = to_numpy(batch['orig_img'][0]).astype(np.uint8)
+    init_np = i_it_py.cpu().numpy() * dr if i_it_py.numel() > 0 else None
+    gt_poly_raw = batch['i_gt_py'][0].cpu().numpy() * dr
+    save_path = os.path.join(save_dir, f"v2_1_refine_{index}_{datetime.datetime.now().strftime('%H%M%S')}.png")
+    draw_results(orig_img, pred_polys, init_np, gt_poly_raw, save_path)
+    print(f"[*] Processed index {index} -> {save_path}")
+
+def main():
+    model, device = load_v2_1_model()
+    dataset = make_dataset(cfg, cfg.test.dataset, make_transforms(cfg, is_train=False), is_train=False)
+    save_dir = os.path.join(_THIS_DIR, 'visual', 'v2_1_eval')
+    os.makedirs(save_dir, exist_ok=True)
+    
+    # Run 5 random samples
+    indices = random.sample(range(len(dataset)), 5)
+    print(f"[*] Starting Batch Inference for 5 samples (V2.1): {indices}")
+    for idx in indices:
+        batch = make_collator(cfg)([dataset[idx]])
+        run_inference(model, device, batch, idx, save_dir)
+    print(f"\n[✔] Inference Complete! All results in: {save_dir}")
+
+if __name__ == '__main__':
+    main()
