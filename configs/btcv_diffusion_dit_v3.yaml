@@ -59,20 +59,14 @@ diffusion_loss_type: 'adaptive'
 diffusion_disp_norm: true
 diffusion_disp_stats: "data/stats/btcv_disp_stats.json"
 
-# ===== DiT V3 去噪器配置 =====
-use_dit_denoiser: false   # V1 关闭
-use_dit_v2: false         # V2 关闭
-use_dit_v2_1: true        # V3 启用空间锚点池化 (必开，防止 48GB OOM)
-use_dit_v3: true          # V3 启用: 启用 Octagon 初始化 和 Point Self-Attention
-dit_num_layers: 6
+# ===== DiT V3.1 去噪器核心配置 (对齐 V2.0 语义) =====
+use_dit_v3: true           # 核心开关: 启用 Octagon 初始化 与 DiT V3.1 架构
+dit_num_layers: 6          # 去噪深度
+dit_num_heads: 8           # 注意力头数
+dit_state_dim: 256         # 特征维度
 
-dit_num_heads: 8
-dit_state_dim: 256
-
-# ===== GRPO 配置 =====
-use_grpo: false
-
-# ===== 其他 =====
+# ===== 系统开关 =====
+use_grpo: false            # 是否开启 GRPO 强化学习
 heads: {'ct_hm': 9, 'wh': 2}
 segm_or_bbox: 'segm'
 use_diffusion_trainer: true

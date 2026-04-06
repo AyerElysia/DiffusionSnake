@@ -146,4 +146,5 @@ class DiTDenoiserV3(nn.Module):
 
         # Final output
         pred = self.final_layer(x, t_emb)
-        return pred
+        L = torch.zeros(1, device=x_t.device, dtype=x_t.dtype)
+        return pred, L
