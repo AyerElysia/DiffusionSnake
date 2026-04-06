@@ -26,7 +26,7 @@ voc_scale_range = np.arange(0.6, 1.4, 0.1)
 box_center = False
 center_scope = False
 
-if getattr(cfg, 'use_dit_v3', False):
+if getattr(cfg, 'use_dit_v3', False) or getattr(cfg, 'use_dit_v3_1', False):
     init = 'octagon'
 else:
     init = 'quadrangle'

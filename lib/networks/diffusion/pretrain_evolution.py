@@ -4,6 +4,7 @@ import torch.nn.functional as F
 from diffusers import DDPMScheduler, DDIMScheduler
 import os
 import sys
+import re
 import numpy as np
 from typing import Tuple, Optional, Dict, Any
 import json
@@ -18,6 +19,25 @@ from .dit_denoiser_v3_1 import DiTDenoiserV3_1
 import lib.utils.snake.snake_gcn_utils as snake_gcn_utils
 from lib.utils.snake import snake_config
 from lib.config import cfg as global_cfg
+
+
+def remap_legacy_state_dict(sd: dict) -> dict:
+    """Remap legacy checkpoint keys to match current model architecture.
+
+    Handles the rename of ``time_emb_1`` / ``time_emb_3`` (old separate
+    nn.Linear layers) to ``time_emb_net.1`` / ``time_emb_net.3``
+    (nn.Sequential).
+    """
+    _LEGACY_RE = re.compile(r'(\.?)time_emb_(\d)(\..*)')
+    new_sd = {}
+    for k, v in sd.items():
+        m = _LEGACY_RE.search(k)
+        if m:
+            new_k = _LEGACY_RE.sub(r'\1time_emb_net.\2\3', k)
+            new_sd[new_k] = v
+        else:
+            new_sd[k] = v
+    return new_sd
 
 class DiffusionEvolution(nn.Module):
     """

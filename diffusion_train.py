@@ -257,6 +257,11 @@ def main():
                 if state_dict is None:
                     state_dict = resume_checkpoint
                 try:
+                    from lib.networks.diffusion.pretrain_evolution import remap_legacy_state_dict
+                    state_dict = remap_legacy_state_dict(state_dict)
+                except ImportError:
+                    pass
+                try:
                     model_to_load = trainer.network.module if hasattr(trainer.network, 'module') else trainer.network
                     model_to_load.load_state_dict(state_dict, strict=False)
                 except Exception:
