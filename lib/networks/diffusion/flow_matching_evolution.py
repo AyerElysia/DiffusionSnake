@@ -7,7 +7,6 @@ import numpy as np
 from typing import Tuple, Optional, Dict, Any
 import json
 
-from .dit_denoiser_v2_3 import DiTFlowMatchingV2_3
 import lib.utils.snake.snake_gcn_utils as snake_gcn_utils
 from lib.utils.snake import snake_config
 from lib.config import cfg as global_cfg
@@ -35,8 +34,20 @@ class FlowMatchingEvolution(nn.Module):
         self.loss_type = loss_type
         self.ode_steps = ode_steps
 
-        # V2.3 启用专属去噪网络
-        if getattr(global_cfg, 'use_hybrid', False):
+        # V3.2: Efficient Self+Cross Attention with Flow Matching
+        if getattr(global_cfg, 'use_dit_v3_2', False):
+            from .dit_denoiser_v3_2 import DiTFlowMatchingV3_2
+            print(f"[FlowMatchingEvolution] Using DiT Flow Network V3.2 "
+                  f"(Self+Cross + Patchify, ODE steps={ode_steps})")
+            self.denoiser = DiTFlowMatchingV3_2(
+                state_dim=dit_state_dim,
+                feature_dim=feature_dim,
+                num_layers=dit_num_layers,
+                num_heads=dit_num_heads,
+                num_points=num_points,
+            )
+        # V2.3 Hybrid: Joint Attention with Odd-Even Injection
+        elif getattr(global_cfg, 'use_hybrid', False):
             from .dit_denoiser_v2_3_hybrid import DiTFlowMatchingHybrid
             print(f"[FlowMatchingEvolution] Using HYBRID Flow Network V2.3 (Odd-Even Injection)")
             self.denoiser = DiTFlowMatchingHybrid(
@@ -46,9 +57,10 @@ class FlowMatchingEvolution(nn.Module):
                 num_heads=dit_num_heads,
                 num_points=num_points,
             )
+        # V2.3 Default: Joint Attention MM-DiT
         else:
             from .dit_denoiser_v2_3 import DiTFlowMatchingV2_3
-            print(f"[FlowMatchingEvolution] Using DiT Flow Network V2.3 (MM-DiT Join)")
+            print(f"[FlowMatchingEvolution] Using DiT Flow Network V2.3 (MM-DiT Joint)")
             self.denoiser = DiTFlowMatchingV2_3(
                 state_dim=dit_state_dim,
                 feature_dim=feature_dim,
