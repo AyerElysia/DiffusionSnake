@@ -7,20 +7,8 @@ from lib.config import cfg
 import warnings
 from lib.networks.YOLOV8.nn.tasks import DetectionModel, attempt_load_one_weight
 import os
-import time
-import numpy as np
-import cv2
-# from transformers import AutoTokenizer, AutoModel
 
 warnings.filterwarnings("ignore")
-# from lib.utils.snake import snake_gcn_utils
-# from torchvision.utils import save_image
-# import sys
-# import cv2
-# from lib.networks.darnet.drn_contours import DRNContours
-# from math import sqrt
-# from lib.networks.classifier.wave_mlp import WaveMLP
-# #from lib.networks.snake.evolve import Evolution
 
 
 # 网络拼接主程序（之前的都是准备）--------------------------------------------------------------------------------------------
@@ -270,86 +258,9 @@ class Network(nn.Module):
         # 记录特征图尺寸，供可视化/坐标缩放使用（不再依赖 ct_hm）
         output['feat_hw'] = (h, w)
 
-        #------------------------------
-        #------------------------------
-        # 简单可视化 YOLO 检测框：同一图像的检测框画在同一白板上（在可能的 GT 替换之前，确保是 YOLO 的预测）
-        # 保存目录：/mnt/sdb1/leijh/EnergySnake1/EnergeSnake1/lib/zrc_visual/yolo_det
-        # try:
-        #     save_root = "/mnt/sdb1/leijh/EnergySnake1/EnergeSnake1/lib/ljh_visual/yolo_det"
-        #     os.makedirs(save_root, exist_ok=True)
-
-        #     det_vis = output.get('detection', None)
-        #     feat_hw = output.get('feat_hw', None)
-            
-            
-        #     if det_vis is not None and feat_hw is not None:
-        #         Hf, Wf = int(feat_hw[0]), int(feat_hw[1])
-        #         B = det_vis.size(0)
-        #         # 获取输入图像作为背景
-        #         input_images = batch['orig_img'][0]
-        #         # 转换为numpy
-        #         img_np = input_images.detach().cpu().numpy()
-        #         if img_np.shape[0] == 3:
-        #             img_np = np.transpose(img_np, (1, 2, 0)).astype(np.uint8)
-        #         # 确保是BGR格式（OpenCV默认格式）
-        #         if img_np.shape[2] == 3:
-        #             # 如果是RGB格式，转换为BGR
-        #             img_np = cv2.cvtColor(img_np, cv2.COLOR_RGB2BGR)
-
-        #         # 计数器，确保文件名不冲突
-        #         if not hasattr(self, '_det_vis_counter'):
-        #             self._det_vis_counter = 0
-
-        #         for b in range(B):
-        #             # 生成白底画布（使用特征图尺寸坐标系，避免额外缩放）
-        #             # canvas = np.ones((Hf*4, Wf*4, 3), dtype=np.uint8) * 255
-        #             det_b = det_vis[b]
-        #             # 过滤掉 padding 的全 0 行与低分框（>0 分即可，已做过 NMS）
-        #             det_b = det_b.detach().float().cpu().numpy()
-        #             if det_b.size == 0:
-        #                 pass
-        #             else:
-        #                 # 保留 score > 0 的框
-        #                 keep = det_b[:, 4] > 0
-        #                 det_b = det_b[keep]
-
-        #                 for box in det_b:
-        #                     x1, y1, x2, y2, score, cls_id = box[:6]
-        #                     x1i, y1i, x2i, y2i = int(round(x1)), int(round(y1)), int(round(x2)), int(round(y2))
-        #                     # 绘制矩形与简单标签
-        #                     color = (0, 255, 0)
-        #                     cv2.rectangle(img_np, (x1i, y1i), (x2i, y2i), color, 1)
-        #                     label = f"{int(cls_id)}:{score:.2f}"
-        #                     # 放在框左上角，避免越界
-        #                     tx, ty = max(0, x1i), max(0, y1i - 2)
-        #                     cv2.putText(img_np, label, (tx, ty), cv2.FONT_HERSHEY_SIMPLEX, 0.3, (0, 0, 255), 1, cv2.LINE_AA)
-
-        #             fname = f"det_{self._det_vis_counter:07d}_b{b}.png"
-        #             cv2.imwrite(os.path.join(save_root, fname), img_np)
-        #         self._det_vis_counter += 1
-        # except Exception as e:
-        #     # 可视化失败不影响训练/推理
-        #     print(e)
-        #     pass
-        #------------------------------
-        #------------------------------
-
-
         # 训练时可选择使用 GT 框替换
         if getattr(cfg, 'use_gt_det', False):
             self.use_gt_detection(output, batch)
-
-        #------------------------------
-        # 测试 clinical_bert
-        # input_text = "verba"
-        # inputs = self.clinical_bert_tokenizer(input_text, return_tensors="pt").to('cuda')
-        # with torch.no_grad():
-        #     clinical_bert_output = self.clinical_bert(**inputs)
-        # # 提取 ClinicalBERT 的 [CLS] 嵌入   last_hidden_state 结构：["[CLS]", ```, "[SEP]"]
-        # clinical_bert_features = clinical_bert_output.last_hidden_state[:, 0, :]  # [CLS] 的嵌入
-        # # 降维到 [1, 64]
-        # clinical_bert_features = self.bert_dim_reduction(clinical_bert_features)
-        # ------------------------------
 
         # 传入 Snake 进行演化
         if not self.freeze_snake:
@@ -361,77 +272,6 @@ class Network(nn.Module):
 
         # 暴露 YOLO 原始预测供损失使用
         output['yolo_preds'] = (yolo_y, yolo_feats)
-
-
-
-        ## -------------------------------------------------------------------------------------------------------------
-        # # 训练阶段使用双分类头一致性损失策略
-        # if cfg.train_or_test == 'train':
-        #     init = self.gcn.prepare_training(output, batch)
-        #
-        #     if 'py_pred' in output:
-        #         py_pred = output['py_pred']
-        #
-        #         # 取最后一次演化结果
-        #         if isinstance(py_pred, list):
-        #             py_pred = py_pred[-1]
-        #
-        #         # 获取预测数量
-        #         # num_preds = py_pred.size(0)  # 实际预测数量
-        #
-        #         detection = output['detection']
-        #
-        #         py_ind = init['py_ind']
-        #         py_count = torch.bincount(py_ind)
-        #
-        #         topk_list = []
-        #         for i in range(detection.shape[0]):
-        #             count = py_count[i]
-        #             # 提取第五维的值，并获取前 count 个最大值的索引
-        #             topk_values, topk_indices = torch.topk(detection[i, :, 4], k=count)
-        #             # 使用这些索引提取整个组的信息
-        #             topk_groups = detection[i, topk_indices, :]
-        #             topk_list.append(topk_groups)
-        #
-        #         if isinstance(topk_list, list):
-        #             topk_tensor = torch.cat(topk_list,0)
-        #         topk_class = topk_tensor[:,5]
-        #         output["detect_classes"] = topk_class
-        #
-        #         # 下面是后分类头的代码
-        #         # 取轮廓特征
-        #         py_feature = snake_gcn_utils.get_gcn_feature(cnn_feature, py_pred, init['py_ind'], 128, 128)
-        #         #py_feature = torch.cat((py_feature, py_feature), dim=1)
-        #         py_feature = torch.unsqueeze(py_feature, 1)
-        #         py_feature = torch.cat((py_feature, py_feature, py_feature), dim=1)
-        #         seg_class = self.class_head(py_feature)
-        #
-        #         output["seg_classes"] = seg_class
-        ## -------------------------------------------------------------------------------------------------------------
-
-
-            # #可视化CT——HM
-            # from torchvision.utils import save_image
-            # ct_hm = output['ct_hm']
-            # ct_hm1 = ct_hm[0]
-            # ct_hm_gt = batch['ct_hm']
-            # ct_hm_gt1 = ct_hm_gt[0]
-            # img = batch['inp']
-            # img1 = img[0]
-            # save_image(img1, '/home/ub/PycharmProjects/EnergeSnake/zrc_visual/230_ct_hm/img.png',
-            #            normalize=True)
-            # for i in range(ct_hm1.shape[0]):
-            #     save_image(ct_hm1[i], f'/home/ub/PycharmProjects/EnergeSnake/zrc_visual/230_ct_hm/ct_hm_{i}.png', normalize=True)
-            #     save_image(ct_hm_gt1[i], f'/home/ub/PycharmProjects/EnergeSnake/zrc_visual/230_ct_hm/ct_hm_gt_{i}.png', normalize=True)
-            #
-            # #可视化CNN-FEARTURE
-            # cnn_feature1 = cnn_feature[0]
-            # img = batch['inp']
-            # img1 = img[0]
-            # save_image(img1, '/home/ub/PycharmProjects/EnergeSnake/zrc_visual/230_cnn_feature/img.png',
-            #            normalize=True)
-            # for i in range(cnn_feature1.shape[0]):
-            #     save_image(cnn_feature1[i], f'/home/ub/PycharmProjects/EnergeSnake/zrc_visual/230_cnn_feature/cnn_f_{i}.png', normalize=True)
 
         return output
 

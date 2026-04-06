@@ -98,7 +98,7 @@ class DiTDenoiserV3(nn.Module):
         adj=None,
         polys=None,
         py_ind: torch.Tensor = None,
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
+    ) -> torch.Tensor:
         """
         Forward pass.
 
@@ -111,7 +111,6 @@ class DiTDenoiserV3(nn.Module):
 
         Returns:
             eps_pred: (N, P, 2) - Predicted noise
-            L:       scalar     - Auxiliary loss placeholder
         """
         N, P, _ = x_t.shape
         t_emb = self.time_emb_net(t)
@@ -147,5 +146,4 @@ class DiTDenoiserV3(nn.Module):
 
         # Final output
         pred = self.final_layer(x, t_emb)
-        L = torch.zeros(1, device=x_t.device, dtype=x_t.dtype)
-        return pred, L
+        return pred
