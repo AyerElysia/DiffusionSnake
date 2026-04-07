@@ -19,10 +19,10 @@ train:
     per_contour: false
 
     optim: 'adamw'
-    lr: 1e-5
+    lr: 5e-5
     milestones: (80, 120)
     gamma: 0.5
-    batch_size: 32
+    batch_size: 64
     gradient_accumulation_steps: 1
     gradient_clip: 1.0
     weight_decay: 0.01
@@ -55,7 +55,7 @@ use_diffusion_evolution: true
 use_flow_matching: true
 flow_ode_steps: 10
 diffusion_disp_norm: true
-diffusion_disp_stats: "data/stats/btcv_disp_stats.json"
+diffusion_disp_stats: "data/stats/btcv_disp_stats_octagon.json"
 
 # ===== DiT V3.2 去噪器核心配置 =====
 use_dit_v3_2: true           # V3.2: Self+Cross + Flow Matching

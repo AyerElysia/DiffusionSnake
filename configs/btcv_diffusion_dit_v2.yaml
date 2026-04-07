@@ -7,8 +7,8 @@ network: 'ro_34'
 task: 'snake'
 model_dir: "data/model/btcv_diffusion_dit_v2"
 
-gpus: [5]
-resume: false
+gpus: [7]
+resume: true
 
 # ===== 训练配置 =====
 train_or_test: train
@@ -28,9 +28,9 @@ train:
     weight_decay: 0.01
     warmup_steps: 1000
 
-    epoch: 1000
+    epoch: 2000
     num_workers: 4
-    save_ep: 10
+    save_ep: 100
 
 # ===== 测试配置 =====
 test:
@@ -57,7 +57,7 @@ use_ddim_inference: true
 diffusion_loss_weight: 1.0
 diffusion_loss_type: 'adaptive'
 diffusion_disp_norm: true
-diffusion_disp_stats: "data/stats/btcv_disp_stats.json"
+diffusion_disp_stats: "data/stats/btcv_disp_stats_box.json"
 
 # ===== DiT V2 去噪器配置 =====
 use_dit_denoiser: false   # V1 关闭

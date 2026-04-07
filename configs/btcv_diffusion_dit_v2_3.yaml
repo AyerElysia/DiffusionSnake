@@ -57,7 +57,7 @@ use_ddim_inference: true
 diffusion_loss_weight: 1.0
 diffusion_loss_type: 'adaptive'
 diffusion_disp_norm: true
-diffusion_disp_stats: "data/stats/btcv_disp_stats.json"
+diffusion_disp_stats: "data/stats/btcv_disp_stats_box.json"
 
 # ===== DiT V2 去噪器配置 =====
 use_dit_denoiser: false   # V1 关闭
