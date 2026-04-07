@@ -161,8 +161,9 @@ class Dataset(data.Dataset):
         x_min, y_min = np.min(extreme_point[:, 0]), np.min(extreme_point[:, 1])
         x_max, y_max = np.max(extreme_point[:, 0]), np.max(extreme_point[:, 1])
 
-        octagon = snake_voc_utils.get_octagon(extreme_point)
-        img_init_poly = snake_voc_utils.uniformsample(octagon, snake_config.poly_num)
+        bbox = [x_min, y_min, x_max, y_max]
+        base_init_poly = snake_voc_utils.get_evolution_init(extreme_point, bbox)
+        img_init_poly = snake_voc_utils.uniformsample(base_init_poly, snake_config.poly_num)
         can_init_poly = snake_voc_utils.img_poly_to_can_poly(img_init_poly, x_min, y_min, x_max, y_max)
 
         img_gt_poly = snake_voc_utils.uniformsample(poly, len(poly) * snake_config.gt_poly_num)

@@ -195,26 +195,9 @@ class Dataset(data.Dataset):
     def prepare_evolution(self, poly, extreme_point, img_init_4polys, img_init_polys, can_init_polys, img_gt_polys, can_gt_polys):
         x_min, y_min = np.min(extreme_point[:, 0]), np.min(extreme_point[:, 1])
         x_max, y_max = np.max(extreme_point[:, 0]), np.max(extreme_point[:, 1])
-        # 181-196替换198-1979行
-        # # 获取矩形边界框
-        # rect_box = snake_voc_utils.uniformsample(img_init_4polys, poly.shape[0])
-        # # 确保两个多边形从相同的起始点开始对齐
-        # # 找到poly_128中距离rect_box第一个点最近的点作为起始点
-        # distances = np.sum((poly - rect_box[0]) ** 2, axis=1)
-        # start_idx = np.argmin(distances)
-
-        # # 重新排列poly_128，使其从对齐点开始
-        # poly_aligned = np.roll(poly, -start_idx, axis=0)
-        # weight_rect = 1.0/4.0
-        # weight_poly = 3.0/4.0
-        
-        # # 计算平均值：矩形边界框和真实分割边界的平均
-        # img_init_poly = weight_rect * rect_box + weight_poly * poly_aligned
-        # # 将真实分割边界poly（330点）下采样到128点
-        # img_init_poly = snake_voc_utils.uniformsample(img_init_poly, snake_config.poly_num)
-        
-        octagon = snake_voc_utils.get_octagon(extreme_point)
-        img_init_poly = snake_voc_utils.uniformsample(octagon, snake_config.poly_num)
+        bbox = [x_min, y_min, x_max, y_max]
+        base_init_poly = snake_voc_utils.get_evolution_init(extreme_point, bbox)
+        img_init_poly = snake_voc_utils.uniformsample(base_init_poly, snake_config.poly_num)
         can_init_poly = snake_voc_utils.img_poly_to_can_poly(img_init_poly, x_min, y_min, x_max, y_max)
 
         img_gt_poly = snake_voc_utils.uniformsample(poly, len(poly) * snake_config.gt_poly_num)

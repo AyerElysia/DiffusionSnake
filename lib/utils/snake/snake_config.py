@@ -26,10 +26,41 @@ voc_scale_range = np.arange(0.6, 1.4, 0.1)
 box_center = False
 center_scope = False
 
-if getattr(cfg, 'use_dit_v3', False) or getattr(cfg, 'use_dit_v3_1', False):
-    init = 'octagon'
-else:
-    init = 'quadrangle'
+def is_v2_family():
+    return any([
+        getattr(cfg, 'use_dit_v2', False),
+        getattr(cfg, 'use_dit_v2_1', False),
+        getattr(cfg, 'use_dit_v2_2', False),
+        getattr(cfg, 'use_dit_v2_3', False),
+    ])
+
+
+def is_v3_family():
+    return any([
+        getattr(cfg, 'use_dit_v3', False),
+        getattr(cfg, 'use_dit_v3_1', False),
+        getattr(cfg, 'use_dit_v3_2', False),
+    ])
+
+
+def get_box_init_mode():
+    if is_v3_family():
+        return 'octagon'
+    if is_v2_family():
+        return 'box'
+    return 'quadrangle'
+
+
+def get_evolve_init_mode():
+    if is_v3_family():
+        return 'octagon'
+    if is_v2_family():
+        return 'box'
+    return 'octagon'
+
+
+init = get_box_init_mode()
+evolve_init = get_evolve_init_mode()
 
 init_poly_num = 40
 poly_num = 128
@@ -51,4 +82,3 @@ ct_score = cfg.ct_score
 ro = 4
 
 segm_or_bbox = 'segm'
-

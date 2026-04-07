@@ -354,16 +354,30 @@ def get_box(box):
     return np.array(box)
 
 
-def get_init(box):
-    # return get_box(box)
-    return get_quadrangle(box)
+def get_box_corners(box):
+    x_min, y_min, x_max, y_max = box
+    box = [
+        [x_min, y_min],
+        [x_min, y_max],
+        [x_max, y_max],
+        [x_max, y_min]
+    ]
+    return np.array(box)
 
-    # x_min, y_min, x_max, y_max = box
-    # scale = (y_max - y_min) / (x_max - x_min)   # 计算宽高比，并以此为依据是用菱形还是矩形
-    # if scale < 2.5:
-    #     return get_quadrangle(box)
-    # else:
-    #     return get_box(box)
+
+def get_init(box):
+    if snake_config.init == 'quadrangle':
+        return get_quadrangle(box)
+    if snake_config.init == 'octagon':
+        ex = get_quadrangle(box)
+        return get_octagon(ex)
+    return get_box_corners(box)
+
+
+def get_evolution_init(extreme_point, box):
+    if snake_config.evolve_init == 'octagon':
+        return get_octagon(extreme_point)
+    return get_box_corners(box)
 
 
 def get_octagon(ex):

@@ -49,29 +49,53 @@ def prepare_testing(output):
     return init
 
 
+def _get_box_from_extreme(ex):
+    x_min = torch.min(ex[..., 0], dim=-1)[0]
+    y_min = torch.min(ex[..., 1], dim=-1)[0]
+    x_max = torch.max(ex[..., 0], dim=-1)[0]
+    y_max = torch.max(ex[..., 1], dim=-1)[0]
+    return torch.stack([x_min, y_min, x_max, y_max], dim=-1)
+
+
+def _get_evolve_init_from_extreme(ex):
+    if snake_config.evolve_init == 'octagon':
+        return snake_decode.get_octagon(ex)
+    return snake_decode.get_box(_get_box_from_extreme(ex))
+
+
 def prepare_testing_init(box, score): # 上采样40个点构建八边形     没必要深究
-    # box(1,100,4)   score(1,100)
+    if box.numel() == 0 or score.numel() == 0 or box.size(1) == 0:
+        empty_poly = box.new_zeros((0, snake_config.init_poly_num, 2))
+        empty_ind = torch.zeros((0,), dtype=torch.long, device=box.device)
+        return {'i_it_4py': empty_poly, 'c_it_4py': empty_poly.clone(), 'ind': empty_ind}
+
     i_it_4pys = snake_decode.get_init(box)
-    #print(i_it_4pys.shape)
-    # torch.Size([1, 100, 4, 2])
-    ''' 1 表示有一个批次（batch）的数据。
-        100 表示特征维度 ?
-        4 表示每个多边形有 4 个顶点。
-        2 表示每个顶点的 x 和 y 坐标。'''
+    if i_it_4pys.numel() == 0 or i_it_4pys.size(1) == 0:
+        empty_poly = box.new_zeros((0, snake_config.init_poly_num, 2))
+        empty_ind = torch.zeros((0,), dtype=torch.long, device=box.device)
+        return {'i_it_4py': empty_poly, 'c_it_4py': empty_poly.clone(), 'ind': empty_ind}
+
     i_it_4pys = uniform_upsample(i_it_4pys, snake_config.init_poly_num)  # init_poly_num = 40
-    #print(i_it_4pys.shape)
-    # torch.Size([1, 100, 40, 2])
     c_it_4pys = img_poly_to_can_poly(i_it_4pys)
 
     i_it_4pys = i_it_4pys / 4.0
     c_it_4pys = c_it_4pys / 4.0
 
-    # 使用非常低的置信度阈值，因为YOLO输出的置信度分数非常小
-    # 正常情况下应该使用 ct_score = 0.05，但现在需要降低到 1e-4
     ind = score > 1e-4  # 0.0001 - 匹配实际检测置信度范围
-    i_it_4pys = i_it_4pys[ind]  # （0，40，2）
-    c_it_4pys = c_it_4pys[ind]  # （0，40，2）
-    ind = torch.cat([torch.full([ind[i].sum()], i) for i in range(ind.size(0))], dim=0)
+    if ind.dim() == 1:
+        ind = ind.unsqueeze(0)
+    if not bool(ind.any()):
+        empty_poly = box.new_zeros((0, snake_config.init_poly_num, 2))
+        empty_ind = torch.zeros((0,), dtype=torch.long, device=box.device)
+        return {'i_it_4py': empty_poly, 'c_it_4py': empty_poly.clone(), 'ind': empty_ind}
+
+    i_it_4pys = i_it_4pys[ind]
+    c_it_4pys = c_it_4pys[ind]
+    counts = ind.long().sum(dim=1)
+    ind = torch.cat([
+        torch.full((int(counts[i].item()),), i, dtype=torch.long, device=box.device)
+        for i in range(ind.size(0))
+    ], dim=0)
     init = {'i_it_4py': i_it_4pys, 'c_it_4py': c_it_4pys, 'ind': ind}
 
     return init
@@ -114,7 +138,7 @@ def prepare_training_box(ret, batch, init):
     c_gt_4py = torch.cat([batch['c_gt_4py'][i][gt_ind[i]] for i in range(batch_size)], dim=0)
     init_4py = {'i_it_4py': i_it_4py, 'c_it_4py': c_it_4py, 'i_gt_4py': i_gt_4py, 'c_gt_4py': c_gt_4py}
 
-    i_it_py = snake_decode.get_octagon(i_gt_4py[None])
+    i_it_py = _get_evolve_init_from_extreme(i_gt_4py[None])
     i_it_py = uniform_upsample(i_it_py, snake_config.poly_num)[0]
     c_it_py = img_poly_to_can_poly(i_it_py)
     i_gt_py = torch.cat([batch['i_gt_py'][i][gt_ind[i]] for i in range(batch_size)], dim=0)
@@ -173,7 +197,7 @@ def prepare_training_evolve(ex, init):
         shift = -(ex[:, :1] - i_gt_py).pow(2).sum(2).argmin(1)
         i_gt_py = extreme_utils.roll_array(i_gt_py, shift)
 
-    i_it_py = snake_decode.get_octagon(ex[None])
+    i_it_py = _get_evolve_init_from_extreme(ex[None])
     i_it_py = uniform_upsample(i_it_py, snake_config.poly_num)[0]
     c_it_py = img_poly_to_can_poly(i_it_py)
     evolve = {'i_it_py': i_it_py, 'c_it_py': c_it_py, 'i_gt_py': i_gt_py}
@@ -186,7 +210,7 @@ def prepare_testing_evolve(ex):
         i_it_pys = torch.zeros([0, snake_config.poly_num, 2]).to(ex)
         c_it_pys = torch.zeros_like(i_it_pys)
     else:
-        i_it_pys = snake_decode.get_octagon(ex[None])
+        i_it_pys = _get_evolve_init_from_extreme(ex[None])
         i_it_pys = uniform_upsample(i_it_pys, snake_config.poly_num)[0]
         c_it_pys = img_poly_to_can_poly(i_it_pys)
     evolve = {'i_it_py': i_it_pys, 'c_it_py': c_it_pys}
