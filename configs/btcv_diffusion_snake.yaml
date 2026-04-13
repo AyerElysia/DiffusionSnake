@@ -42,7 +42,7 @@ train:
     dataset: 'BtcvTrain'
     num_workers: 4
     epoch: 1000
-    data_path: '/home/medteam/Zhrch/Datasets/BTCV/btcv_png_new_snake'
+    data_path: '/mnt/sdb1/leijh/DiffusionSnake/Datasets/BTCV/btcv_png_new_snake'
     save_ep: 10
 
 loss_scales: {det: 0, ex: 1.0, py: 1.2}
@@ -50,7 +50,7 @@ loss_scales: {det: 0, ex: 1.0, py: 1.2}
 test:
     dataset: 'BtcvVal'
     batch_size: 1
-    img_path: '/home/medteam/Zhrch/Datasets/BTCV/btcv_png_test_new_snake'
+    img_path: '/mnt/sdb1/leijh/DiffusionSnake/Datasets/BTCV/btcv_png_test_new_snake'
     epoch: -1
 
 use_nms_for_snake: true

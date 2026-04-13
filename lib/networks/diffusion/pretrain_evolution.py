@@ -39,6 +39,33 @@ def remap_legacy_state_dict(sd: dict) -> dict:
             new_sd[k] = v
     return new_sd
 
+
+def _select_denoiser_type(global_cfg, use_dit_v2, use_dit_v2_1, use_dit_v2_2,
+                          use_dit_denoiser, use_hybrid=False):
+    """Determine denoiser type from config flags with clear precedence.
+
+    Returns:
+        str: One of 'dit_v3_1', 'dit_v3', 'dit_v2_2_hybrid', 'dit_v2_2',
+             'dit_v2_1', 'dit_v2', 'dit_v1', 'snake'
+    """
+    if getattr(global_cfg, 'use_dit_v3_1', False):
+        return 'dit_v3_1'
+    elif getattr(global_cfg, 'use_dit_v3', False):
+        return 'dit_v3'
+    elif use_dit_v2_2:
+        if use_hybrid or getattr(global_cfg, 'use_hybrid', False):
+            return 'dit_v2_2_hybrid'
+        return 'dit_v2_2'
+    elif use_dit_v2_1:
+        return 'dit_v2_1'
+    elif use_dit_v2:
+        return 'dit_v2'
+    elif use_dit_denoiser:
+        return 'dit_v1'
+    else:
+        return 'snake'
+
+
 class DiffusionEvolution(nn.Module):
     """
     预训练专用的扩散模型实现
@@ -74,8 +101,14 @@ class DiffusionEvolution(nn.Module):
         self.loss_weight = loss_weight
         self.loss_type = loss_type
 
-        # 去噪器选择
-        if getattr(global_cfg, 'use_dit_v3_1', False):
+        # Determine denoiser type with clear precedence
+        denoiser_type = _select_denoiser_type(
+            global_cfg, use_dit_v2, use_dit_v2_1, use_dit_v2_2,
+            use_dit_denoiser, use_hybrid=getattr(global_cfg, 'use_hybrid', False)
+        )
+
+        # Initialize denoiser based on type
+        if denoiser_type == 'dit_v3_1':
             print(f"[DiffusionEvolution] Using DiT Denoiser V3.1 (Patchify + Self->Cross Flow) "
                   f"(layers={dit_num_layers}, heads={dit_num_heads}, dim={dit_state_dim})")
             self.denoiser = DiTDenoiserV3_1(
@@ -85,7 +118,7 @@ class DiffusionEvolution(nn.Module):
                 num_heads=dit_num_heads,
                 num_points=num_points,
             )
-        elif getattr(global_cfg, 'use_dit_v3', False):
+        elif denoiser_type == 'dit_v3':
             print(f"[DiffusionEvolution] Using DiT Denoiser V3 (Perceiver Semantics + Self->Cross Flow) "
                   f"(layers={dit_num_layers}, heads={dit_num_heads}, dim={dit_state_dim})")
             self.denoiser = DiTDenoiserV3(
@@ -95,30 +128,27 @@ class DiffusionEvolution(nn.Module):
                 num_heads=dit_num_heads,
                 num_points=num_points,
             )
-        elif use_dit_v2_2:
-            if getattr(global_cfg, 'use_hybrid', False):
-                from .dit_denoiser_v2_2_hybrid import DiTDenoiserV2_2Hybrid
-                print(f"[DiffusionEvolution] Using HYBRID DiT Denoiser V2.2 (Odd-Even Injection)")
-                self.denoiser = DiTDenoiserV2_2Hybrid(
-                    state_dim=dit_state_dim,
-                    feature_dim=feature_dim,
-                    num_layers=dit_num_layers,
-                    num_heads=dit_num_heads,
-                    num_points=num_points,
-                )
-            else:
-                from .dit_denoiser_v2_2 import DiTDenoiserV2_2
-                print(f"[DiffusionEvolution] Using DiT Denoiser V2.2 (MM-DiT Patchify) "
-                      f"(layers={dit_num_layers}, heads={dit_num_heads}, dim={dit_state_dim})")
-                self.denoiser = DiTDenoiserV2_2(
-                    state_dim=dit_state_dim,
-                    feature_dim=feature_dim,
-                    num_layers=dit_num_layers,
-                    num_heads=dit_num_heads,
-                    num_points=num_points,
-                )
-        elif use_dit_v2 or use_dit_v2_1:
-            ver = "V2.1 (Anchor Pool)" if use_dit_v2_1 else "V2"
+        elif denoiser_type == 'dit_v2_2_hybrid':
+            print(f"[DiffusionEvolution] Using HYBRID DiT Denoiser V2.2 (Odd-Even Injection)")
+            self.denoiser = DiTDenoiserV2_2Hybrid(
+                state_dim=dit_state_dim,
+                feature_dim=feature_dim,
+                num_layers=dit_num_layers,
+                num_heads=dit_num_heads,
+                num_points=num_points,
+            )
+        elif denoiser_type == 'dit_v2_2':
+            print(f"[DiffusionEvolution] Using DiT Denoiser V2.2 (MM-DiT Patchify) "
+                  f"(layers={dit_num_layers}, heads={dit_num_heads}, dim={dit_state_dim})")
+            self.denoiser = DiTDenoiserV2_2(
+                state_dim=dit_state_dim,
+                feature_dim=feature_dim,
+                num_layers=dit_num_layers,
+                num_heads=dit_num_heads,
+                num_points=num_points,
+            )
+        elif denoiser_type in ('dit_v2_1', 'dit_v2'):
+            ver = "V2.1 (Anchor Pool)" if denoiser_type == 'dit_v2_1' else "V2"
             print(f"[DiffusionEvolution] Using DiT Denoiser {ver} "
                   f"(layers={dit_num_layers}, heads={dit_num_heads}, dim={dit_state_dim})")
             self.denoiser = DiTDenoiserV2(
@@ -127,9 +157,9 @@ class DiffusionEvolution(nn.Module):
                 num_layers=dit_num_layers,
                 num_heads=dit_num_heads,
                 num_points=num_points,
-                use_v2_1=use_dit_v2_1,
+                use_v2_1=(denoiser_type == 'dit_v2_1'),
             )
-        elif use_dit_denoiser:
+        elif denoiser_type == 'dit_v1':
             print("[DiffusionEvolution] Using DiT Denoiser V1")
             self.denoiser = DiTDenoiser(
                 state_dim=dit_state_dim,
@@ -138,7 +168,7 @@ class DiffusionEvolution(nn.Module):
                 num_heads=dit_num_heads,
                 num_points=num_points,
             )
-        else:
+        else:  # 'snake'
             print("[DiffusionEvolution] Using GCN Snake Denoiser")
             self.denoiser = SnakeDenoiser(
                 state_dim=state_dim,
@@ -147,6 +177,8 @@ class DiffusionEvolution(nn.Module):
                 res_layers=res_layers,
                 fusion_dim=fusion_dim,
             )
+
+        self.denoiser_type = denoiser_type
         
         # 根据配置选择调度器
         if use_ddim_inference:
@@ -291,14 +323,14 @@ class DiffusionEvolution(nn.Module):
         # 1. 采样局部 GCN 特征 (保留作为 Local Context)
         h, w = cnn_feature.size(2), cnn_feature.size(3)
         gcn_feat = snake_gcn_utils.get_gcn_feature(cnn_feature, i_it_py, py_ind, h, w)
-        
+
         # 2. 构建邻接矩阵 (仅 GCN Denoiser 需要)
         adj = snake_gcn_utils.get_adj_ind(snake_config.adj_num, i_it_py.size(1), i_it_py.device)
-        
-        # 3. 通过去噪器预测噪声
-        if isinstance(self.denoiser, (DiTDenoiser, DiTDenoiserV2, DiTDenoiserV2_2, DiTDenoiserV2_2Hybrid, DiTDenoiserV3, DiTDenoiserV3_1)):
+
+        # 3. 通过去噪器预测噪声 (使用 denoiser_type 而非 isinstance)
+        if self.denoiser_type.startswith('dit'):
             eps_pred, L = self.denoiser(cnn_feature, gcn_feat, x_t, t, adj, polys=i_it_py, py_ind=py_ind)
-        else:
+        else:  # snake
             eps_pred, L = self.denoiser(gcn_feat, c_it_py, x_t, t, adj, polys=i_it_py)
 
         return eps_pred, L

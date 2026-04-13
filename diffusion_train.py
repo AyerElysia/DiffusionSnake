@@ -188,15 +188,24 @@ def main():
         # 合并数据集
         combined_dataset = ConcatDataset([train_dataset, test_dataset])
 
+        # 兼容通过 batch_sampler 构建的 DataLoader（其 batch_size 可能为 None）
+        inferred_batch_size = getattr(train_loader, 'batch_size', None)
+        if inferred_batch_size is None:
+            inferred_batch_size = getattr(getattr(train_loader, 'batch_sampler', None), 'batch_size', None)
+        if inferred_batch_size is None:
+            inferred_batch_size = int(getattr(cfg.train, 'batch_size', 1))
+
+        inferred_drop_last = getattr(getattr(train_loader, 'batch_sampler', None), 'drop_last', False)
+
         # 创建新的数据加载器
         data_loader = DataLoader(
             combined_dataset,
-            batch_size=train_loader.batch_size,
+            batch_size=int(inferred_batch_size),
             shuffle=True,
             num_workers=train_loader.num_workers,
             collate_fn=train_loader.collate_fn if hasattr(train_loader, 'collate_fn') else None,
             pin_memory=True,
-            drop_last=True,
+            drop_last=bool(inferred_drop_last),
         )
 
         logger.info(f"Combined dataset size: {len(combined_dataset)}")

@@ -21,7 +21,7 @@
 
 截止到 **2026-04-04**，以下关键 Bug 已修复：
 
-1.  **极点提取对齐 (`infer_v3_refinement.py`)**:
+1.  **极点提取对齐 (`infer_v3_refinement.py` / `scripts/infer_v3_final.py`)**:
     - **逻辑**: 推理时不再直接用 YOLO Box 四角，而是从原始多边形中提取 True Min/Max (T, L, B, R)。
     - **偏移**: 引入 `+0.5` 像素偏移，确保在输入特征图（Stride=4）中心对齐。
 2.  **八边形构造修复 (`snake_decode.py`)**:
@@ -50,7 +50,7 @@ python verify_octagon_v3.py
 ```bash
 python infer_v3_refinement.py --ckpt data/outputs/btcv_diffusion_dit_v3/checkpoints/latest.pt
 ```
-- **检查点**: 查看 `visual/v3_latest_eval/`。如果预测轮廓呈现合理的凹凸细节而非大范围偏离，说明对齐成功。
+- **检查点**: 查看 `visual/v3_clean_eval/`。如果预测轮廓呈现合理的凹凸细节而非大范围偏离，说明对齐成功。
 
 ---
 

@@ -1,3 +1,6 @@
+# NOTE: This config uses processed1232 dataset which is NOT available on this machine.
+# Data paths below point to old machine location and need to be updated if data is available.
+
 model: 'sbd'
 network: 'ro_34'
 task: 'snake'

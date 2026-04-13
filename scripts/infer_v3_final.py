@@ -8,6 +8,9 @@ from pathlib import Path
 
 # 环境与配置初始化
 _THIS_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+_DEFAULT_CFG = os.path.join(_THIS_DIR, 'configs', 'btcv_diffusion_dit_v3.yaml')
+if not os.environ.get('CFG_FILE'):
+    os.environ['CFG_FILE'] = _DEFAULT_CFG
 sys.path.insert(0, _THIS_DIR)
 
 from lib.config import cfg, args
@@ -26,7 +29,13 @@ def load_v3_model(cfg_file=None):
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
     # 获取权重路径
-    ckpt_path = os.path.join(_THIS_DIR, 'data/outputs', cfg.model_dir.split('/')[-1], 'checkpoints', 'latest.pt')
+    ckpt_path = getattr(args, 'ckpt', '') or os.path.join(
+        _THIS_DIR,
+        'data/outputs',
+        cfg.model_dir.split('/')[-1],
+        'checkpoints',
+        'latest.pt',
+    )
     print(f"[*] Loading Weights: {ckpt_path}")
 
     if os.path.exists(ckpt_path):

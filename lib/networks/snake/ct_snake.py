@@ -91,19 +91,6 @@ class Network(nn.Module):
             for p in self.yolo.parameters():
                 p.requires_grad = False
 
-        # ClinicalBERT 部分
-        # 加载 ClinicalBERT 模型和分词器
-        # self.clinical_bert = AutoModel.from_pretrained(cfg.model_clinical_bert)
-        # self.clinical_bert_tokenizer = AutoTokenizer.from_pretrained(cfg.model_clinical_bert)
-        # # 冻结 ClinicalBERT 的参数
-        # for param in self.clinical_bert.parameters():
-        #     param.requires_grad = False
-        # # 添加一个全连接层用于降维
-        # self.bert_dim_reduction = nn.Linear(768, 64)
-
-        # 双分类头部分
-        # self.class_head = WaveMLP('M', num_classes=cfg.heads['ct_hm'])
-
     # 注意：自定义 NMS/IoU 函数已移除，统一使用 YOLOv8 的 non_max_suppression，避免训练/测试不一致与重复实现。
 
     def decode_detection_from_yolo(self, yolo_y, h, w):
@@ -165,34 +152,6 @@ class Network(nn.Module):
         if p2 is None:
             raise RuntimeError("YOLO head features are not available; expected a list with P2 at index 0.")
         cnn_feature = self.cnn_proj(p2)
-
-        # 可视化并保存 cnn_feature（仅保存第一个 batch 的前若干通道为网格）
-        # vis_root = "/mnt/sdb1/leijh/EnergySnake1/EnergeSnake1/zrc_visual/cnn_feature"
-        # os.makedirs(vis_root, exist_ok=True)
-        # feat = cnn_feature.detach().float().cpu()[0]  # [C, H, W]
-        # C, H, W = feat.shape
-        # max_ch = min(64, C)
-        # cols = int(np.ceil(np.sqrt(max_ch)))
-        # rows = int(np.ceil(max_ch / cols))
-        # grid = np.zeros((rows * H, cols * W), dtype=np.uint8)
-        # for idx in range(max_ch):
-        #     r, c = divmod(idx, cols)
-        #     ch = feat[idx].numpy()
-        #     ch_min, ch_max = float(ch.min()), float(ch.max())
-        #     if ch_max > ch_min:
-        #         ch_norm = (ch - ch_min) / (ch_max - ch_min)
-        #     else:
-        #         ch_norm = np.zeros_like(ch)
-        #     tile = (ch_norm * 255.0).astype(np.uint8)
-        #     grid[r * H:(r + 1) * H, c * W:(c + 1) * W] = tile
-        # ts = time.strftime('%Y%m%d_%H%M%S')
-        # out_path = os.path.join(vis_root, f'cnn_grid_{ts}.png')
-        # cv2.imwrite(out_path, grid)
-        # print(f"保存 cnn_feature 到 {out_path}")
-
-        
-
-        # print("cnn_feature.shape",cnn_feature.shape)  #[1, 64, 128, 128]
 
         # 从 YOLO 输出构建 detection (B, N, 6) => [x1,y1,x2,y2,score,cls]
         # 并按配置执行阈值+NMS，确保训练/测试阶段一致地给 Snake 提供精简候选

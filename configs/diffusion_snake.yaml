@@ -1,3 +1,7 @@
+# NOTE: This config uses COCO dataset which is NOT available on this machine.
+# Data paths below point to old machine locations and need to be updated if COCO data is available.
+# Current machine only has BTCV dataset. Use btcv_diffusion_*.yaml configs instead.
+
 model: 'sbd'
 network: 'ro_34'
 task: 'snake'

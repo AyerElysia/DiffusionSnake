@@ -1,5 +1,7 @@
 # V3 A+C 更新报告
 
+> 注：当前仓库实际随附的统计文件是 `data/stats/btcv_disp_stats.json`。本文中提到的 `btcv_disp_stats_box.json` 与 `btcv_disp_stats_octagon.json` 属于历史记录，没有随当前目录一并保留。
+
 ## 结论
 
 本次完成了两项指定修改：
@@ -141,4 +143,3 @@
 
 - 最优循环对齐
 - 起点无关训练
-

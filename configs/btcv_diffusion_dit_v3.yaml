@@ -7,22 +7,22 @@ network: 'ro_34'
 task: 'snake'
 model_dir: "data/model/btcv_diffusion_dit_v3"
 
-gpus: [5]
-resume: false
+gpus: [0,1,2,3]
+resume: true
 
 # ===== 训练配置 =====
 train_or_test: train
 
 train:
     dataset: 'BtcvTrain'
-    data_path: '/home/medteam/Zhrch/Datasets/BTCV/btcv_png_new_snake'
+    data_path: '/mnt/sdb1/leijh/DiffusionSnake/Datasets/BTCV/btcv_png_new_snake'
     per_contour: false
 
     optim: 'adamw'
     lr: 5e-5
     milestones: (80, 120)
     gamma: 0.5
-    batch_size: 64
+    batch_size: 16
     gradient_accumulation_steps: 1
     gradient_clip: 1.0
     weight_decay: 0.01
@@ -36,7 +36,7 @@ train:
 test:
     dataset: 'BtcvVal'
     batch_size: 1
-    img_path: '/home/medteam/Zhrch/Datasets/BTCV/btcv_png_test_new_snake'
+    img_path: '/mnt/sdb1/leijh/DiffusionSnake/Datasets/BTCV/btcv_png_test_new_snake'
     epoch: -1
 
 # ===== 检测配置 =====
@@ -57,7 +57,7 @@ use_ddim_inference: true
 diffusion_loss_weight: 1.0
 diffusion_loss_type: 'adaptive'
 diffusion_disp_norm: true
-diffusion_disp_stats: "data/stats/btcv_disp_stats_octagon.json"
+diffusion_disp_stats: "data/stats/btcv_disp_stats.json"
 
 # ===== DiT V3.1 去噪器核心配置 (对齐 V2.0 语义) =====
 use_dit_v3: true           # 核心开关: 启用 Octagon 初始化 与 DiT V3.1 架构

@@ -454,7 +454,7 @@ diff_loss = MSE(eps_pred, eps_gt)  # 噪声预测误差
 
 #### 5.2 推理流程
 
-**入口文件**: `infer_v3_refinement.py`
+**入口文件**: `infer_v3_refinement.py`（兼容入口，实际实现位于 `scripts/infer_v3_final.py`）
 
 ```python
 def run_inference(model, batch):
@@ -497,7 +497,6 @@ def run_inference(model, batch):
 ```python
 # V3 配置
 use_dit_v3: True          # 启用 V3
-use_dit_v2_1: True        # 使用 SpatialAnchor (显存优化)
 
 # V3 初始化: 八边形
 if cfg.use_dit_v3:
@@ -531,23 +530,21 @@ network: 'ro_34'
 task: 'snake'
 
 # ===== DiT 版本选择 =====
-use_dit_denoiser: false   # V1 关闭
-use_dit_v2: false         # V2 关闭
-use_dit_v2_1: true        # V3 启用空间锚点池化
 use_dit_v3: true          # V3 启用八边形初始化
 
 # ===== 扩散参数 =====
 diffusion_timesteps: 1000
 use_ddim_inference: true
 diffusion_loss_weight: 1.0
+diffusion_disp_stats: "data/stats/btcv_disp_stats.json"
 
 # ===== 训练参数 =====
 train:
-  lr: 1e-5
-  batch_size: 32
+  lr: 5e-5
+  batch_size: 64
   epoch: 1000
   warmup_steps: 1000
-  save_ep: 10
+  save_ep: 100
 
 # ===== 检测参数 =====
 det_conf_thresh: 0.01
@@ -590,6 +587,7 @@ CUDA_VISIBLE_DEVICES=0,1,2,3 torchrun --standalone --nproc_per_node=4 diffusion_
 # V3 推理
 export CFG_FILE=configs/btcv_diffusion_dit_v3.yaml
 python infer_v3_refinement.py --ckpt data/outputs/btcv_diffusion_dit_v3/checkpoints/latest.pt
+# 输出目录: visual/v3_clean_eval/
 ```
 
 ### 验证八边形初始化
@@ -613,7 +611,8 @@ python verify_octagon_v3.py
 | `lib/utils/snake/snake_gcn_utils.py` | 训练/测试数据准备 |
 | `lib/datasets/voc/snake.py` | 数据集加载 |
 | `diffusion_train.py` | 训练入口 |
-| `infer_v3_refinement.py` | V3 推理脚本 |
+| `infer_v3_refinement.py` | V3 推理兼容入口 |
+| `scripts/infer_v3_final.py` | 当前 V3 推理实现 |
 | `verify_octagon_v3.py` | 八边形验证脚本 |
 
 ---
@@ -626,8 +625,8 @@ python verify_octagon_v3.py
 visual/
 ├── octagon_comparison.png      # 单实例八边形对比
 ├── octagon_multi_boxes.png     # 多实例八边形效果
-├── v3_latest_eval/             # V3 推理结果
-│   └── v3_refine_*.png
+├── v3_clean_eval/              # 当前 V3 推理结果
+│   └── CLEAN_v3_*.png
 │       ├── GT: 蓝色
 │       ├── Init: 黄色
 │       └── Pred: 红色

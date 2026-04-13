@@ -112,6 +112,13 @@ class DiTDenoiserV3(nn.Module):
         Returns:
             eps_pred: (N, P, 2) - Predicted noise
         """
+        # Input validation
+        assert x_t.dim() == 3 and x_t.shape[-1] == 2, \
+            f"Expected x_t shape (N, P, 2), got {x_t.shape}"
+        assert t.dim() == 1, f"Expected t shape (N,), got {t.shape}"
+        assert sampled_feat.dim() == 3, \
+            f"Expected sampled_feat shape (N, C, P), got {sampled_feat.shape}"
+
         N, P, _ = x_t.shape
         t_emb = self.time_emb_net(t)
 

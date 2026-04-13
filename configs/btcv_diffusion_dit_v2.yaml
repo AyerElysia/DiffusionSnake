@@ -7,7 +7,7 @@ network: 'ro_34'
 task: 'snake'
 model_dir: "data/model/btcv_diffusion_dit_v2"
 
-gpus: [7]
+gpus: [4,5,6,7]
 resume: true
 
 # ===== 训练配置 =====
@@ -15,14 +15,14 @@ train_or_test: train
 
 train:
     dataset: 'BtcvTrain'
-    data_path: '/home/medteam/Zhrch/Datasets/BTCV/btcv_png_new_snake'
+    data_path: '/mnt/sdb1/leijh/DiffusionSnake/Datasets/BTCV/btcv_png_new_snake'
     per_contour: false
 
     optim: 'adamw'
     lr: 5e-5
     milestones: (80, 120)
     gamma: 0.5
-    batch_size: 32
+    batch_size: 16
     gradient_accumulation_steps: 1
     gradient_clip: 1.0
     weight_decay: 0.01
@@ -36,7 +36,7 @@ train:
 test:
     dataset: 'BtcvVal'
     batch_size: 1
-    img_path: '/home/medteam/Zhrch/Datasets/BTCV/btcv_png_test_new_snake'
+    img_path: '/mnt/sdb1/leijh/DiffusionSnake/Datasets/BTCV/btcv_png_test_new_snake'
     epoch: -1
 
 # ===== 检测配置 =====

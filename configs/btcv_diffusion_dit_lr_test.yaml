@@ -16,7 +16,7 @@ train_or_test: train
 train:
     # 基础配置
     dataset: 'BtcvTrain'
-    data_path: '/home/medteam/Zhrch/Datasets/BTCV/btcv_png_new_snake'
+    data_path: '/mnt/sdb1/leijh/DiffusionSnake/Datasets/BTCV/btcv_png_new_snake'
     per_contour: false
 
     # 训练超参数（保守设置）
@@ -39,7 +39,7 @@ train:
 test:
     dataset: 'BtcvVal'
     batch_size: 1
-    img_path: '/home/medteam/Zhrch/Datasets/BTCV/btcv_png_test_new_snake'
+    img_path: '/mnt/sdb1/leijh/DiffusionSnake/Datasets/BTCV/btcv_png_test_new_snake'
     epoch: -1
 
 # ===== 检测配置 =====

@@ -1,3 +1,6 @@
+# NOTE: This config uses RAOS dataset which is NOT available on this machine.
+# Data paths below point to old machine location and need to be updated if data is available.
+
 model: 'sbd'
 network: 'ro_34'
 task: 'snake'
@@ -34,7 +37,7 @@ train:
     dataset: 'RaosTrain'
     num_workers: 4
     epoch: 500
-    data_path: '/home/medteam/Zhrch/Datasets/RAOS/RAOS-Real/CancerImages_Set1/processed_Tr_resized'
+    data_path: '/mnt/sdb1/leijh/DiffusionSnake/Datasets/RAOS/RAOS-Real/CancerImages_Set1/processed_Tr_resized'
     save_ep: 10
 
 loss_scales: {det: 0, ex: 1.0, py: 1.2}
@@ -42,7 +45,7 @@ loss_scales: {det: 0, ex: 1.0, py: 1.2}
 test:
     dataset: 'RaosVal'
     batch_size: 1
-    img_path: '/home/medteam/Zhrch/Datasets/RAOS/RAOS-Real/CancerImages_Set1/processed_Ts_resized'
+    img_path: '/mnt/sdb1/leijh/DiffusionSnake/Datasets/RAOS/RAOS-Real/CancerImages_Set1/processed_Ts_resized'
     epoch: -1
 
 use_nms_for_snake: true

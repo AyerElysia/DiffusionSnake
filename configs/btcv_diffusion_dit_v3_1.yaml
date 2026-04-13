@@ -15,7 +15,7 @@ train_or_test: train
 
 train:
     dataset: 'BtcvTrain'
-    data_path: '/home/medteam/Zhrch/Datasets/BTCV/btcv_png_new_snake'
+    data_path: '/mnt/sdb1/leijh/DiffusionSnake/Datasets/BTCV/btcv_png_new_snake'
     per_contour: false
 
     optim: 'adamw'
@@ -36,7 +36,7 @@ train:
 test:
     dataset: 'BtcvVal'
     batch_size: 1
-    img_path: '/home/medteam/Zhrch/Datasets/BTCV/btcv_png_test_new_snake'
+    img_path: '/mnt/sdb1/leijh/DiffusionSnake/Datasets/BTCV/btcv_png_test_new_snake'
     epoch: -1
 
 # ===== 检测配置 =====
@@ -57,7 +57,7 @@ use_ddim_inference: true
 diffusion_loss_weight: 1.0
 diffusion_loss_type: 'adaptive'
 diffusion_disp_norm: true
-diffusion_disp_stats: "data/stats/btcv_disp_stats_octagon.json"
+diffusion_disp_stats: "data/stats/btcv_disp_stats.json"
 
 # ===== DiT V3.1 去噪器核心配置 =====
 use_dit_v3_1: true           # V3.1: Patchify + Self->Cross Flow
