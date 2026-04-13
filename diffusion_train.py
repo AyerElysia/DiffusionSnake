@@ -9,21 +9,34 @@ import time
 import copy
 import sys
 import json
+import logging
 from pathlib import Path
 import torch.distributed as dist
 from torch.nn.parallel import DistributedDataParallel as DDP
 
 from torch.optim.lr_scheduler import MultiStepLR, SequentialLR, LinearLR, CosineAnnealingLR
 
+# Configure logging
+logging.basicConfig(level=logging.INFO, format='[%(levelname)s] %(message)s')
+logger = logging.getLogger(__name__)
+
+# Training constants
+GRAD_CLIP_VALUE = 40.0
+TIME_SCALE_FACTOR = 1000.0
+DEFAULT_WARMUP_START_FACTOR = 1e-3
+DEFAULT_LR_GAMMA = 0.5
+
 try:
     import wandb
-except Exception:
+except ImportError:
     wandb = None
+    logger.warning("wandb not available, logging will be local only")
 
 try:
     from diffusers.optimization import get_scheduler, SchedulerType
-except Exception:
+except ImportError:
     get_scheduler = None
+    logger.info("diffusers.optimization not available, using PyTorch schedulers")
     class SchedulerType:
         CONSTANT = "constant"
         CONSTANT_WITH_WARMUP = "constant_with_warmup"
@@ -55,6 +68,14 @@ from lib.recorder import JsonLogger, NullLogger
 from lib.visualizers.diffusion_one_sample import save_affine_visualization
 
 
+def safe_barrier(is_distributed: bool) -> None:
+    """Safely execute distributed barrier with error handling."""
+    if is_distributed:
+        try:
+            dist.barrier()
+        except RuntimeError as e:
+            logger.warning(f"Distributed barrier failed: {e}")
+
 
 def main():
     is_distributed = False
@@ -65,8 +86,10 @@ def main():
         world_size = int(os.environ.get('WORLD_SIZE', '1'))
         rank = int(os.environ.get('RANK', '0'))
         local_rank = int(os.environ.get('LOCAL_RANK', '0'))
-    except Exception:
+    except (ValueError, TypeError) as e:
+        logger.warning(f"Failed to parse distributed environment variables: {e}")
         world_size, rank, local_rank = 1, 0, 0
+
     is_distributed = world_size > 1
     if is_distributed:
         torch.cuda.set_device(local_rank)
@@ -81,43 +104,40 @@ def main():
     try:
         _cfg_file_used = getattr(args, 'cfg_file', '') or os.environ.get('CFG_FILE', '')
         _cfg_stem = Path(str(_cfg_file_used)).stem if _cfg_file_used else 'default'
-    except Exception:
+    except (AttributeError, TypeError) as e:
+        logger.warning(f"Failed to get config file stem: {e}")
         _cfg_stem = 'default'
 
     try:
         train_name = getattr(cfg.train, 'dataset', None)
         test_name = getattr(cfg.test, 'dataset', None)
-        print(f"[diffusion_train] cfg_file={os.environ.get('CFG_FILE','')}")
-        print(f"[diffusion_train] train.dataset={train_name} test.dataset={test_name}")
+        logger.info(f"cfg_file={os.environ.get('CFG_FILE','')}")
+        logger.info(f"train.dataset={train_name} test.dataset={test_name}")
         if train_name in DatasetCatalog.dataset_attrs:
             a = DatasetCatalog.get(train_name)
-            print(f"[diffusion_train] train.data_root={a.get('data_root')} ann_file={a.get('ann_file')}")
+            logger.info(f"train.data_root={a.get('data_root')} ann_file={a.get('ann_file')}")
         if test_name in DatasetCatalog.dataset_attrs:
             a = DatasetCatalog.get(test_name)
-            print(f"[diffusion_train] test.data_root={a.get('data_root')} ann_file={a.get('ann_file')}")
-    except Exception:
-        pass
+            logger.info(f"test.data_root={a.get('data_root')} ann_file={a.get('ann_file')}")
+    except (AttributeError, KeyError) as e:
+        logger.warning(f"Failed to log dataset info: {e}")
 
     cfg.train.num_workers = 0
 
-    try:
+    # Set optimizer to adamw if not already configured
+    if not hasattr(cfg.train, 'optim') or cfg.train.optim is None:
         cfg.train.optim = 'adamw'
-    except Exception:
-        pass
+        logger.info("Set default optimizer to adamw")
 
     # Build
     network = make_network(cfg)
     trainer = make_trainer(cfg, network)
-    try:
+    if torch.cuda.is_available():
         trainer.network.cuda()
-    except Exception:
-        pass
+
     if is_distributed:
-        try:
-            _ddp_find_unused = os.environ.get('DDP_FIND_UNUSED_PARAMETERS', '1')
-            _ddp_find_unused = str(_ddp_find_unused).strip().lower() in ('1', 'true', 'yes', 'y', 'on')
-        except Exception:
-            _ddp_find_unused = True
+        _ddp_find_unused = os.environ.get('DDP_FIND_UNUSED_PARAMETERS', '1')
+        _ddp_find_unused = str(_ddp_find_unused).strip().lower() in ('1', 'true', 'yes', 'y', 'on')
         trainer.network = DDP(
             trainer.network,
             device_ids=[local_rank],
@@ -128,10 +148,8 @@ def main():
     optimizer = make_optimizer(cfg, trainer.network)
     recorder = make_recorder(cfg)
 
-    try:
-        print(f"[DEBUG] diffusion_train use_grpo={getattr(cfg, 'use_grpo', None)}")
-    except Exception:
-        pass
+    if is_main_process:
+        logger.info(f"use_grpo={getattr(cfg, 'use_grpo', None)}")
 
     # 使用训练数据加载器，遍历完整训练集
     data_loader = make_data_loader(cfg, is_train=True, is_distributed=is_distributed)
@@ -181,11 +199,8 @@ def main():
     log_path = os.path.join(out_dir, 'logs.jsonl')
     ckpt_dir = os.path.join(out_dir, 'checkpoints')
     os.makedirs(ckpt_dir, exist_ok=True)
-    save_ep = 0
-    try:
-        save_ep = int(getattr(cfg.train, 'save_ep', 0))
-    except Exception:
-        save_ep = 0
+
+    save_ep = int(getattr(cfg.train, 'save_ep', 0))
     resume_step = 0
     resume_json_pos = None
     resume_checkpoint = None
@@ -248,36 +263,45 @@ def main():
         if candidate and os.path.exists(candidate):
             try:
                 resume_checkpoint = torch.load(candidate, map_location='cpu')
-            except Exception:
+                logger.info(f"Loaded checkpoint from {candidate}")
+            except (RuntimeError, FileNotFoundError) as e:
+                logger.error(f"Failed to load checkpoint from {candidate}: {e}")
                 resume_checkpoint = None
+
             if isinstance(resume_checkpoint, dict):
                 state_dict = resume_checkpoint.get('state_dict')
                 if state_dict is None:
                     state_dict = resume_checkpoint.get('model')
                 if state_dict is None:
                     state_dict = resume_checkpoint
+
                 try:
                     from lib.networks.diffusion.pretrain_evolution import remap_legacy_state_dict
                     state_dict = remap_legacy_state_dict(state_dict)
                 except ImportError:
-                    pass
+                    logger.debug("Legacy state dict remapping not available")
+
                 try:
                     model_to_load = trainer.network.module if hasattr(trainer.network, 'module') else trainer.network
-                    model_to_load.load_state_dict(state_dict, strict=False)
-                except Exception:
-                    pass
+                    missing, unexpected = model_to_load.load_state_dict(state_dict, strict=False)
+                    if missing:
+                        logger.warning(f"Missing keys in checkpoint: {missing[:5]}...")
+                    if unexpected:
+                        logger.warning(f"Unexpected keys in checkpoint: {unexpected[:5]}...")
+                except RuntimeError as e:
+                    logger.error(f"Failed to load model state dict: {e}")
+
                 if 'optimizer' in resume_checkpoint:
                     _safe_load_optimizer_state(optimizer, resume_checkpoint['optimizer'])
-                try:
-                    resume_step = int(resume_checkpoint.get('step', 0))
-                except Exception:
-                    resume_step = 0
+
+                resume_step = int(resume_checkpoint.get('step', 0))
+                logger.info(f"Resuming from step {resume_step}")
 
     def _find_jsonl_truncate_pos(jsonl_path: str, keep_step: int):
         """Return byte position to truncate jsonl so that all remaining lines satisfy step <= keep_step."""
         try:
             keep_step = int(keep_step)
-        except Exception:
+        except (ValueError, TypeError):
             return None
         if keep_step <= 0:
             return None
@@ -295,45 +319,38 @@ def main():
                     pos = f.tell()
                     try:
                         obj = json.loads(line.decode('utf-8'))
-                    except Exception:
+                    except (json.JSONDecodeError, UnicodeDecodeError):
                         # Keep unparsable lines; do not truncate based on them.
                         continue
                     try:
                         step_val = int(obj.get('step', -1))
-                    except Exception:
+                    except (ValueError, TypeError):
                         step_val = -1
                     if step_val > keep_step:
                         truncate_pos = line_start
                         break
-        except Exception:
+        except IOError as e:
+            logger.warning(f"Failed to read log file for truncation: {e}")
             return None
         return truncate_pos
 
     # If resuming, truncate logs.jsonl so new records overwrite the future part.
     # Default enabled unless ONE_SAMPLE_TRUNCATE_LOG=0
-    truncate_log = True
-    try:
-        truncate_log = str(os.environ.get('ONE_SAMPLE_TRUNCATE_LOG', '1')).strip().lower() not in ('0', 'false', 'no', 'off')
-    except Exception:
-        truncate_log = True
-    if is_distributed:
-        try:
-            dist.barrier()
-        except Exception:
-            pass
+    truncate_log = str(os.environ.get('ONE_SAMPLE_TRUNCATE_LOG', '1')).strip().lower() not in ('0', 'false', 'no', 'off')
+
+    safe_barrier(is_distributed)
+
     if is_main_process and truncate_log and int(resume_step) > 0:
         resume_json_pos = _find_jsonl_truncate_pos(log_path, int(resume_step))
         if resume_json_pos is not None:
             try:
                 with open(log_path, 'rb+') as f:
                     f.truncate(int(resume_json_pos))
-            except Exception:
-                pass
-    if is_distributed:
-        try:
-            dist.barrier()
-        except Exception:
-            pass
+                logger.info(f"Truncated log file at position {resume_json_pos}")
+            except IOError as e:
+                logger.warning(f"Failed to truncate log file: {e}")
+
+    safe_barrier(is_distributed)
 
     if is_main_process:
         json_logger = JsonLogger(log_path)
@@ -354,7 +371,9 @@ def main():
                 dir=wandb_dir,
                 resume='allow',
             )
-        except Exception:
+            logger.info("WandB initialized successfully")
+        except Exception as e:
+            logger.warning(f"Failed to initialize WandB: {e}")
             wandb_run = None
 
     def _count_trainable_params(module: torch.nn.Module) -> int:
@@ -463,40 +482,27 @@ def main():
                     max_abs = max(max_abs, float(g.detach().abs().max().item()))
             total_l2 = float(total_l2 ** 0.5)
 
-            torch.nn.utils.clip_grad_value_(trainer.network.parameters(), 40)
+            torch.nn.utils.clip_grad_value_(trainer.network.parameters(), GRAD_CLIP_VALUE)
             optimizer_p.step()
             if scheduler_p is not None:
                 # MultiStepLR 或 diffusers 的 scheduler 都支持每步 step
                 scheduler_p.step()
 
             # periodic inference visualization (Diffusion phase only)
-            diff_viz_interval = 0
-            try:
-                diff_viz_interval = int(os.environ.get('ONE_SAMPLE_DIFF_VIZ_INTERVAL', '0'))
-            except Exception:
-                diff_viz_interval = 0
+            diff_viz_interval = int(os.environ.get('ONE_SAMPLE_DIFF_VIZ_INTERVAL', '0'))
             if phase_name.lower() == 'diff' and diff_viz_interval > 0 and (step % diff_viz_interval == 0):
-                if is_distributed:
-                    try:
-                        dist.barrier()
-                    except Exception:
-                        pass
+                safe_barrier(is_distributed)
                 if is_main_process:
                     infer_and_save(f"{phase_name}_step{step}")
                     # switch back to train mode for next iteration
                     trainer.network.train()
-                if is_distributed:
-                    try:
-                        dist.barrier()
-                    except Exception:
-                        pass
+                safe_barrier(is_distributed)
+
             dt = time.time() - t0
             # json logging per step
-            try:
-                lr = optimizer_p.param_groups[0].get('lr', None)
-                lr = float(lr) if lr is not None else None
-            except Exception:
-                lr = None
+            lr = optimizer_p.param_groups[0].get('lr', None)
+            lr = float(lr) if lr is not None else None
+
             entry = {
                 'phase': str(phase_name),
                 'step': int(step),
@@ -722,7 +728,7 @@ def main():
                         max_abs = max(max_abs, float(g.detach().abs().max().item()))
                 total_l2 = float(total_l2 ** 0.5)
 
-                torch.nn.utils.clip_grad_value_(trainer.network.parameters(), 40)
+                torch.nn.utils.clip_grad_value_(trainer.network.parameters(), GRAD_CLIP_VALUE)
                 optimizer.step()
                 if scheduler is not None:
                     scheduler.step()
@@ -731,34 +737,20 @@ def main():
                 dt = time.time() - t0
 
                 # periodic inference visualization every N steps
-                viz_interval = 0
-                try:
-                    viz_interval = int(os.environ.get('ONE_SAMPLE_VIZ_INTERVAL', str(viz_interval)))
-                except Exception:
-                    viz_interval = 0
+                viz_interval = int(os.environ.get('ONE_SAMPLE_VIZ_INTERVAL', '0'))
                 do_viz = (viz_interval > 0 and (global_step % viz_interval == 0))
                 if do_viz:
-                    if is_distributed:
-                        try:
-                            dist.barrier()
-                        except Exception:
-                            pass
+                    safe_barrier(is_distributed)
                     if is_main_process:
                         if viz_batch is not None:
                             infer_and_save(f"one_stage_step{global_step}")
                             trainer.network.train()
-                    if is_distributed:
-                        try:
-                            dist.barrier()
-                        except Exception:
-                            pass
+                    safe_barrier(is_distributed)
 
                 # json logging per step
-                try:
-                    lr = optimizer.param_groups[0].get('lr', None)
-                    lr = float(lr) if lr is not None else None
-                except Exception:
-                    lr = None
+                lr = optimizer.param_groups[0].get('lr', None)
+                lr = float(lr) if lr is not None else None
+
                 entry = {
                     'phase': 'one_stage',
                     'epoch': int(epoch),
@@ -798,45 +790,35 @@ def main():
             # epoch-based checkpoint saving
             do_save_epoch = (save_ep > 0 and ((epoch + 1) % save_ep == 0)) or (epoch == (num_epochs - 1))
             if do_save_epoch:
-                if is_distributed:
-                    try:
-                        dist.barrier()
-                    except Exception:
-                        pass
+                safe_barrier(is_distributed)
                 if is_main_process:
                     _save_checkpoint(global_step, scheduler, total_steps=total_steps, epoch=(epoch + 1))
-                if is_distributed:
-                    try:
-                        dist.barrier()
-                    except Exception:
-                        pass
+                safe_barrier(is_distributed)
 
             start_step_in_epoch = 0
 
     # Final inference visualization on affine-input coords
     if is_main_process:
         infer_and_save('final')
+
     # close logger
-    try:
+    if hasattr(json_logger, 'close'):
         json_logger.close()
-    except Exception:
-        pass
 
     if is_main_process and wandb_run is not None:
         try:
             wandb.finish()
-        except Exception:
-            pass
+            logger.info("WandB run finished")
+        except Exception as e:
+            logger.warning(f"Failed to finish WandB run: {e}")
+
+    safe_barrier(is_distributed)
 
     if is_distributed:
         try:
-            dist.barrier()
-        except Exception:
-            pass
-        try:
             dist.destroy_process_group()
-        except Exception:
-            pass
+        except Exception as e:
+            logger.warning(f"Failed to destroy process group: {e}")
 
 
 if __name__ == '__main__':

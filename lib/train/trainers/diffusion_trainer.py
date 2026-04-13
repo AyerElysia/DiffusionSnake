@@ -1,9 +1,11 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+import logging
 from lib.config import cfg
 from lib.networks.YOLOV8.utils.loss import v8DetectionLoss
-import gc
+
+logger = logging.getLogger(__name__)
 
 
 class DiffusionPretrainNetworkWrapper(nn.Module):
@@ -18,7 +20,8 @@ class DiffusionPretrainNetworkWrapper(nn.Module):
         # YOLO 损失
         try:
             self.det_crit = self.net.yolo.init_criterion()
-        except Exception:
+        except (AttributeError, RuntimeError) as e:
+            logger.warning(f"Failed to init YOLO criterion, using default: {e}")
             self.det_crit = v8DetectionLoss(self.net.yolo)
 
         # 先验损失
@@ -36,12 +39,9 @@ class DiffusionPretrainNetworkWrapper(nn.Module):
         self.freeze_yolo = bool(getattr(cfg, 'freeze_yolo', False))
 
         if self.freeze_yolo:
-            try:
-                for p in self.net.yolo.parameters():
-                    p.requires_grad = False
-                self.net.yolo.eval()
-            except Exception:
-                pass
+            for p in self.net.yolo.parameters():
+                p.requires_grad = False
+            self.net.yolo.eval()
 
     def forward(self, batch):
         # 仅调用原网络，保证不会进入 GRPO 分支
@@ -77,23 +77,17 @@ class DiffusionPretrainNetworkWrapper(nn.Module):
             diff_weight = float(getattr(cfg, 'diffusion_loss_weight', 1.0))
             loss = loss + diff_weight * output['diff_loss']
             scalar_stats.update({'diff_loss': output['diff_loss'], 'diff_loss_scaled': diff_weight * output['diff_loss']})
-            try:
-                for k_, v_ in output.items():
-                    if isinstance(k_, str) and k_.startswith('diff_loss'):
-                        scalar_stats[k_] = v_
-            except Exception:
-                pass
+            for k_, v_ in output.items():
+                if isinstance(k_, str) and k_.startswith('diff_loss'):
+                    scalar_stats[k_] = v_
         else:
             scalar_stats.update({'diff_loss': torch.tensor(0.0, device=base_device)})
 
         # 4) Combined metric for monitoring: detection loss + diffusion loss (both unscaled)
-        try:
-            det_l = scalar_stats.get('det_loss', None)
-            diff_l = scalar_stats.get('diff_loss', None)
-            if isinstance(det_l, torch.Tensor) and isinstance(diff_l, torch.Tensor):
-                scalar_stats['det_plus_diff_loss'] = det_l + diff_l
-        except Exception:
-            pass
+        det_l = scalar_stats.get('det_loss', None)
+        diff_l = scalar_stats.get('diff_loss', None)
+        if isinstance(det_l, torch.Tensor) and isinstance(diff_l, torch.Tensor):
+            scalar_stats['det_plus_diff_loss'] = det_l + diff_l
 
         # 3) CMAM 先验（可选）
         if 'L' in output and 'L_star' in output and (not self.freeze_snake):
@@ -105,32 +99,14 @@ class DiffusionPretrainNetworkWrapper(nn.Module):
             scalar_stats.update({'L_loss': torch.tensor(0.0, device=base_device)})
 
         scalar_stats.update({'loss': loss})
-        try:
-            for k, v in list(scalar_stats.items()):
-                if isinstance(v, torch.Tensor):
-                    scalar_stats[k] = v.detach()
-        except Exception:
-            pass
-        if self.training:
-            try:
-                if isinstance(output, dict):
-                    output.pop('yolo_preds', None)
-            except Exception:
-                pass
-            full_output = output
+        for k, v in list(scalar_stats.items()):
+            if isinstance(v, torch.Tensor):
+                scalar_stats[k] = v.detach()
+
+        # Clean up large intermediate outputs during training to save memory
+        if self.training and isinstance(output, dict):
+            output.pop('yolo_preds', None)
+            # Return minimal output during training
             output = {}
-            try:
-                del full_output
-            except Exception:
-                pass
-            try:
-                gc.collect()
-            except Exception:
-                pass
-            try:
-                if torch.cuda.is_available():
-                    torch.cuda.empty_cache()
-                    torch.cuda.ipc_collect()
-            except Exception:
-                pass
+
         return output, loss, scalar_stats, image_stats
