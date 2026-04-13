@@ -151,8 +151,61 @@ def main():
     if is_main_process:
         logger.info(f"use_grpo={getattr(cfg, 'use_grpo', None)}")
 
-    # 使用训练数据加载器，遍历完整训练集
-    data_loader = make_data_loader(cfg, is_train=True, is_distributed=is_distributed)
+    # ========== 合并训练集和测试集数据 ==========
+    # 目的：测试模型上限潜力（数据泄露，仅用于实验）
+    logger.info("=" * 60)
+    logger.info("WARNING: Merging train and test datasets for potential testing")
+    logger.info("This is intentional data leakage for model capacity evaluation")
+    logger.info("=" * 60)
+
+    # 创建训练集和测试集的数据加载器
+    train_loader = make_data_loader(cfg, is_train=True, is_distributed=is_distributed)
+
+    # 临时修改配置以加载测试集
+    original_dataset = cfg.train.dataset
+    try:
+        # 将训练数据集名称替换为测试集名称
+        if 'Train' in cfg.train.dataset:
+            test_dataset_name = cfg.train.dataset.replace('Train', 'Val')
+            cfg.train.dataset = test_dataset_name
+            test_loader = make_data_loader(cfg, is_train=True, is_distributed=is_distributed)
+            logger.info(f"Loaded test dataset: {test_dataset_name}")
+        else:
+            test_loader = None
+            logger.warning("Could not determine test dataset name, using train only")
+    finally:
+        # 恢复原始配置
+        cfg.train.dataset = original_dataset
+
+    # 合并数据加载器
+    if test_loader is not None:
+        from torch.utils.data import ConcatDataset, DataLoader
+
+        # 获取底层数据集
+        train_dataset = train_loader.dataset
+        test_dataset = test_loader.dataset
+
+        # 合并数据集
+        combined_dataset = ConcatDataset([train_dataset, test_dataset])
+
+        # 创建新的数据加载器
+        data_loader = DataLoader(
+            combined_dataset,
+            batch_size=train_loader.batch_size,
+            shuffle=True,
+            num_workers=train_loader.num_workers,
+            collate_fn=train_loader.collate_fn if hasattr(train_loader, 'collate_fn') else None,
+            pin_memory=True,
+            drop_last=True,
+        )
+
+        logger.info(f"Combined dataset size: {len(combined_dataset)}")
+        logger.info(f"  - Train samples: {len(train_dataset)}")
+        logger.info(f"  - Test samples: {len(test_dataset)}")
+        logger.info(f"  - Total batches per epoch: {len(data_loader)}")
+    else:
+        data_loader = train_loader
+        logger.info(f"Using train dataset only: {len(train_loader.dataset)} samples")
 
     def move_batch_to_cuda(batch):
         for k in list(batch.keys()):
@@ -182,13 +235,8 @@ def main():
         save_dir = os.path.join(out_dir, 'visual', 'diffusion_one_sample')
         save_affine_visualization(output=output, batch=batch, tag=str(tag), save_dir=save_dir)
 
-    # 改为单阶段联合训练（YOLO 与 Diff 同时训练），忽略两阶段环境变量
-    det_steps = int(os.environ.get('ONE_SAMPLE_DET_STEPS', '0'))
-    diff_steps = int(os.environ.get('ONE_SAMPLE_DIFF_STEPS', '0'))
+    # 单阶段联合训练配置
     log_interval = int(os.environ.get('ONE_SAMPLE_LOG_INTERVAL', '1'))
-    # 强制两阶段步数为0，进入单阶段联合训练
-    det_steps = 0
-    diff_steps = 0
 
     # json logging setup
     out_dir_override = os.environ.get('ONE_SAMPLE_OUT_DIR', '').strip()
@@ -284,10 +332,17 @@ def main():
                 try:
                     model_to_load = trainer.network.module if hasattr(trainer.network, 'module') else trainer.network
                     missing, unexpected = model_to_load.load_state_dict(state_dict, strict=False)
+
+                    # Validate critical modules loaded
+                    critical_missing = [k for k in missing if any(x in k for x in ['yolo', 'gcn', 'denoiser'])]
+                    if critical_missing:
+                        logger.error(f"Critical modules missing from checkpoint: {critical_missing[:10]}")
+                        logger.warning("Training may start from partially initialized weights!")
+
                     if missing:
-                        logger.warning(f"Missing keys in checkpoint: {missing[:5]}...")
+                        logger.warning(f"Missing keys ({len(missing)} total): {missing[:5]}...")
                     if unexpected:
-                        logger.warning(f"Unexpected keys in checkpoint: {unexpected[:5]}...")
+                        logger.warning(f"Unexpected keys ({len(unexpected)} total): {unexpected[:5]}...")
                 except RuntimeError as e:
                     logger.error(f"Failed to load model state dict: {e}")
 
@@ -319,8 +374,9 @@ def main():
                     pos = f.tell()
                     try:
                         obj = json.loads(line.decode('utf-8'))
-                    except (json.JSONDecodeError, UnicodeDecodeError):
-                        # Keep unparsable lines; do not truncate based on them.
+                    except (json.JSONDecodeError, UnicodeDecodeError) as e:
+                        # Log corrupted lines for debugging
+                        logger.debug(f"Skipping corrupted log line at pos {line_start}: {e}")
                         continue
                     try:
                         step_val = int(obj.get('step', -1))
