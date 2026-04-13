@@ -22,7 +22,7 @@ train:
     lr: 5e-5
     milestones: (80, 120)
     gamma: 0.5
-    batch_size: 16
+    batch_size: 24
     gradient_accumulation_steps: 1
     gradient_clip: 1.0
     weight_decay: 0.01

@@ -4,7 +4,7 @@ from .dataset_catalog import DatasetCatalog
 import torch
 import torch.utils.data
 import torch.utils.data.distributed
-import imp
+import importlib.util
 import os
 from .collate_batch import make_collator
 
@@ -13,9 +13,14 @@ torch.multiprocessing.set_sharing_strategy('file_system')
 
 
 def _dataset_factory(data_source, task):
-    module = '.'.join(['lib.datasets', data_source, task])
+    module_name = '.'.join(['lib.datasets', data_source, task])
     path = os.path.join('lib/datasets', data_source, task+'.py')
-    dataset = imp.load_source(module, path).Dataset   # lib/datasets/sbd/snake.py
+
+    # Use importlib instead of deprecated imp
+    spec = importlib.util.spec_from_file_location(module_name, path)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    dataset = module.Dataset
     return dataset
     # 动态加载类， 函数返回 Dataset 类，而不是类的实例，用的时候要创建实例化对象。
 

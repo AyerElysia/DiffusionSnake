@@ -10,13 +10,14 @@ from lib.utils.snake import snake_config, snake_gcn_utils
 
 def main():
     cfg.merge_from_file('configs/btcv_diffusion_dit_v3.yaml')
-    cfg.train.data_path = '/home/medteam/Zhrch/Datasets/BTCV/btcv_png_new_snake'
+    # 使用当前机器的正确路径
+    cfg.train.data_path = '/mnt/sdb1/leijh/DiffusionSnake/Datasets/BTCV/btcv_png_new_snake'
     dataset = make_dataset(cfg, 'BtcvTrain', make_transforms(cfg, is_train=True), is_train=True)
     batch = make_collator(cfg)([dataset[0]])
     init_data = snake_gcn_utils.prepare_training({'detection': torch.zeros((1, 100, 6))}, batch)
     i_init = init_data['i_it_py'][0].numpy() * snake_config.down_ratio
     i_gt = init_data['i_gt_py'][0].numpy() * snake_config.down_ratio
-    img = batch['orig_img'][0].numpy().astype(np.uint8)
+    img = batch['orig_img'][0].astype(np.uint8).copy()
     for i in range(0, 128, 8):
         cv2.arrowedLine(img, tuple(i_init[i].astype(int)), tuple(i_gt[i].astype(int)), (255, 255, 255), 1)
     cv2.polylines(img, [i_init.astype(int)], True, (0, 255, 255), 1)
