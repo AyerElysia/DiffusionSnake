@@ -428,7 +428,7 @@ def main():
         if str(phase_name).lower() == 'det':
             try:
                 ms = list(getattr(cfg.train, 'milestones', (80, 120)))
-                scheduler_p = MultiStepLR(optimizer_p, milestones=ms, gamma=getattr(cfg.train, 'gamma', 0.5))
+                scheduler_p = MultiStepLR(optimizer_p, milestones=ms, gamma=getattr(cfg.train, 'gamma', DEFAULT_LR_GAMMA))
             except Exception:
                 scheduler_p = None
         else:
@@ -437,7 +437,7 @@ def main():
             except Exception:
                 warmup_steps = 0
             try:
-                gamma = float(getattr(cfg.train, 'gamma', 0.5))
+                gamma = float(getattr(cfg.train, 'gamma', DEFAULT_LR_GAMMA))
             except Exception:
                 gamma = 0.5
             try:
@@ -449,7 +449,7 @@ def main():
                 milestones = [max(1, int(0.6 * steps)), max(1, int(0.85 * steps))]
 
             if warmup_steps > 0:
-                warmup = LinearLR(optimizer_p, start_factor=1e-3, end_factor=1.0, total_iters=int(warmup_steps))
+                warmup = LinearLR(optimizer_p, start_factor=DEFAULT_WARMUP_START_FACTOR, end_factor=1.0, total_iters=int(warmup_steps))
                 main_sched = MultiStepLR(optimizer_p, milestones=milestones, gamma=gamma)
                 scheduler_p = SequentialLR(optimizer_p, schedulers=[warmup, main_sched], milestones=[int(warmup_steps)])
             else:
@@ -511,7 +511,7 @@ def main():
                 'lr': lr,
                 'grad_l2': float(total_l2),
                 'grad_max': float(max_abs),
-                'time_ms': float(dt * 1000.0)
+                'time_ms': float(dt * TIME_SCALE_FACTOR)
             }
             # include loss stats if dict
             if isinstance(loss_stats, dict):
@@ -550,7 +550,7 @@ def main():
 
         warmup_steps = int(max(0, warmup_steps))
         if warmup_steps > 0:
-            warmup = LinearLR(optimizer_obj, start_factor=1e-3, end_factor=1.0, total_iters=int(warmup_steps))
+            warmup = LinearLR(optimizer_obj, start_factor=DEFAULT_WARMUP_START_FACTOR, end_factor=1.0, total_iters=int(warmup_steps))
             main_sched = MultiStepLR(optimizer_obj, milestones=milestones, gamma=gamma)
             return SequentialLR(optimizer_obj, schedulers=[warmup, main_sched], milestones=[int(warmup_steps)])
         return MultiStepLR(optimizer_obj, milestones=milestones, gamma=gamma)
@@ -762,7 +762,7 @@ def main():
                     'lr': lr,
                     'grad_l2': float(total_l2),
                     'grad_max': float(max_abs),
-                    'time_ms': float(dt * 1000.0)
+                    'time_ms': float(dt * TIME_SCALE_FACTOR)
                 }
                 if isinstance(loss_stats, dict):
                     safe_stats = {}
