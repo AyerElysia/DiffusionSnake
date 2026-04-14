@@ -57,7 +57,7 @@ use_ddim_inference: true
 diffusion_loss_weight: 1.0
 diffusion_loss_type: 'adaptive'
 diffusion_disp_norm: true
-diffusion_disp_stats: "data/stats/btcv_disp_stats.json"
+diffusion_disp_stats: "data/stats/btcv_disp_stats_octagon.json"
 
 # ===== DiT V3.1 去噪器核心配置 =====
 use_dit_v3_1: true           # V3.1: Patchify + Self->Cross Flow

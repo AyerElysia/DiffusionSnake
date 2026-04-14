@@ -373,7 +373,6 @@ class DiffusionEvolution(nn.Module):
                 i_init_train_py = init['i_it_py'].to(device)
                 c_init_train_py = init['c_it_py'].to(device)
                 i_gt_py = init['i_gt_py'].to(device)
-                i_gt_py_orig = i_gt_py.clone()
                 py_ind = init['py_ind']
 
                 # 仅保留 A1 路径，不构建 B/C 变体
@@ -396,8 +395,9 @@ class DiffusionEvolution(nn.Module):
                 nearest = torch.argmin(d2, dim=1)
                 if i_gt_py.size(0) > 0:
                     rolled = []
+                    nearest_cpu = nearest.cpu().tolist()
                     for i in range(i_gt_py.size(0)):
-                        s = int(nearest[i].item())
+                        s = nearest_cpu[i]
                         if s != 0:
                             rolled.append(torch.roll(i_gt_py[i], shifts=-s, dims=0))
                         else:

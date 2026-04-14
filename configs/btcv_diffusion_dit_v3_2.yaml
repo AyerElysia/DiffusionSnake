@@ -55,7 +55,7 @@ use_diffusion_evolution: true
 use_flow_matching: true
 flow_ode_steps: 10
 diffusion_disp_norm: true
-diffusion_disp_stats: "data/stats/btcv_disp_stats.json"
+diffusion_disp_stats: "data/stats/btcv_disp_stats_octagon.json"
 
 # ===== DiT V3.2 去噪器核心配置 =====
 use_dit_v3_2: true           # V3.2: Self+Cross + Flow Matching

@@ -87,7 +87,8 @@ def make_data_loader(cfg, is_train=True, is_distributed=False, max_iter=-1):
         dataset,
         batch_sampler=batch_sampler,
         num_workers=num_workers,
-        collate_fn=collator
+        collate_fn=collator,
+        pin_memory=True
     )
 
     return data_loader

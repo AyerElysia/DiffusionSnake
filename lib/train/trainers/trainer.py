@@ -122,9 +122,8 @@ class Trainer(object):
                 recorder.update_image_stats(image_stats)
                 recorder.record('train')
 
-            # 主动释放当前迭代的临时张量引用并清空缓存
+            # 释放当前迭代的临时张量引用（不再调用 empty_cache，避免每步 50-200ms 开销）
             del output, loss, loss_stats, image_stats, batch
-            torch.cuda.empty_cache()
 
     def train_staged_with_tracking(self, epoch, data_loader, optimizer_groups, recorder, loss_tracker):
         """

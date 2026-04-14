@@ -31,8 +31,8 @@ def _neg_loss(pred, gt):      # 修改版的焦点损失（Modified focal loss�
 
     loss = 0
 
-    pos_loss = torch.log(pred) * torch.pow(1 - pred, 2) * pos_inds      # 正样本：对这个损失求导可以发现，当 pred 接近 0 的时候，导数的梯度很小，导致这些容易分类的样本对总损失的贡献很小
-    neg_loss = torch.log(1 - pred) * torch.pow(pred, 2) * neg_weights * neg_inds  # 负样本：对这个损失求导可以发现，当 pred 接近 1 的时候，导数的梯度很小，导致这些容易分类的样本对总损失的贡献很小
+    pos_loss = torch.log(pred.clamp(min=1e-6)) * torch.pow(1 - pred, 2) * pos_inds
+    neg_loss = torch.log((1 - pred).clamp(min=1e-6)) * torch.pow(pred, 2) * neg_weights * neg_inds
     # 二者的结合作用将会使损失更接近 0 和 1 之间的部分，即最难分类的部分
 
     num_pos = pos_inds.float().sum()

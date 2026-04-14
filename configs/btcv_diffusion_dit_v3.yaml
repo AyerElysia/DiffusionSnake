@@ -57,7 +57,7 @@ use_ddim_inference: true
 diffusion_loss_weight: 1.0
 diffusion_loss_type: 'adaptive'
 diffusion_disp_norm: true
-diffusion_disp_stats: "data/stats/btcv_disp_stats.json"
+diffusion_disp_stats: "data/stats/btcv_disp_stats_octagon.json"
 
 # ===== DiT V3.1 去噪器核心配置 (对齐 V2.0 语义) =====
 use_dit_v3: true           # 核心开关: 启用 Octagon 初始化 与 DiT V3.1 架构

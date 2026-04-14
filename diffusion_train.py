@@ -122,7 +122,7 @@ def main():
     except (AttributeError, KeyError) as e:
         logger.warning(f"Failed to log dataset info: {e}")
 
-    cfg.train.num_workers = 0
+    # cfg.train.num_workers = 0  # 已移除：使用 yaml 中配置的 num_workers (默认4)
 
     # Set optimizer to adamw if not already configured
     if not hasattr(cfg.train, 'optim') or cfg.train.optim is None:

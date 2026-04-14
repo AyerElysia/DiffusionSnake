@@ -117,13 +117,13 @@ def gaussian_radius(height, width, min_overlap=0.7):
     a1 = 1
     b1 = (height + width)
     c1 = width * height * (1 - min_overlap) / (1 + min_overlap)
-    sq1 = torch.sqrt(b1.pow(2) - 4 * a1 * c1)
+    sq1 = torch.sqrt(torch.clamp(b1.pow(2) - 4 * a1 * c1, min=0))
     r1 = (b1 + sq1) / 2
 
     a2 = 4
     b2 = 2 * (height + width)
     c2 = (1 - min_overlap) * width * height
-    sq2 = torch.sqrt(b2.pow(2) - 4 * a2 * c2)
+    sq2 = torch.sqrt(torch.clamp(b2.pow(2) - 4 * a2 * c2, min=0))
     r2 = (b2 + sq2) / 2
 
     a3 = 4 * min_overlap
