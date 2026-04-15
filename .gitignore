@@ -190,6 +190,7 @@ cython_debug/
 
 # Results and Visualization
 /visual/
+/scripts/visual/
 /results/
 /test_results/
 /vis/

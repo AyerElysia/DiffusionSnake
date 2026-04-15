@@ -51,12 +51,23 @@ cfg.use_dit_v2_1 = False
 cfg.use_dit_v2_2 = False
 cfg.use_dit_v2_3 = False
 cfg.use_dit_v3 = False
+cfg.use_dit_v3_1 = False
+cfg.use_dit_v3_2 = False
+cfg.use_dit_v3_3 = False
+cfg.use_dit_v3_4 = False
+cfg.circular_conv_kernel = 5
 cfg.use_flow_matching = False
 cfg.flow_ode_steps = 10
 cfg.use_hybrid = False
 cfg.dit_num_layers = 6
 cfg.dit_num_heads = 8
 cfg.dit_state_dim = 256
+
+# V3.4: Multi-step iterative refinement
+cfg.use_iterative_refinement = False
+cfg.iterative_num_steps = 3
+cfg.iterative_fractions = [0.3333, 0.5, 1.0]
+cfg.iterative_ddim_steps = 20
 
 # YOLO/NMS related toggles
 cfg.use_nms_for_snake = True

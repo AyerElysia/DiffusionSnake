@@ -108,7 +108,18 @@ def infer_one(model, device, sample, out_path):
         if i_it_py.numel() == 0:
             pred_py = i_it_py
         else:
-            disp = core.gcn.sample_disp(cnn_feature, i_it_py, c_it_py, py_ind)
+            if getattr(cfg, 'use_iterative_refinement', False):
+                iter_steps = int(getattr(cfg, 'iterative_num_steps', 3))
+                fractions = list(getattr(cfg, 'iterative_fractions', []))
+                if not fractions:
+                    fractions = [1.0 / (iter_steps - i) for i in range(iter_steps)]
+                ddim_steps = int(getattr(cfg, 'iterative_ddim_steps', 20))
+                disp = core.gcn.sample_disp_iterative(
+                    cnn_feature, i_it_py, c_it_py, py_ind,
+                    num_iter_steps=iter_steps, fractions=fractions, ddim_steps=ddim_steps,
+                )
+            else:
+                disp = core.gcn.sample_disp(cnn_feature, i_it_py, c_it_py, py_ind)
             pred_py = i_it_py + disp
 
     dr = float(snake_config.down_ratio)

@@ -108,6 +108,12 @@ class DiffusionEvolution(nn.Module):
         self.use_ddim = use_ddim_inference
         self.loss_weight = loss_weight
         self.loss_type = loss_type
+        self.use_iterative_refinement = bool(
+            getattr(global_cfg, 'use_iterative_refinement', False)
+            or getattr(global_cfg, 'use_dit_v3_4', False)
+        )
+        if self.use_iterative_refinement:
+            logger.info("[DiffusionEvolution] V3.4 iterative refinement enabled")
 
         # Determine denoiser type with clear precedence
         denoiser_type = _select_denoiser_type(
@@ -401,6 +407,33 @@ class DiffusionEvolution(nn.Module):
 
         return self.denormalize_disp(x)
 
+    @torch.no_grad()
+    def sample_disp_iterative(self, cnn_feature, i_it_py, c_it_py, py_ind,
+                              num_iter_steps=3, fractions=None, ddim_steps=20):
+        """V3.4 multi-step iterative DDIM sampling.
+
+        At each step, predicts displacement from the current contour position,
+        applies a fraction of it, and re-samples CNN features at the updated position.
+        """
+        if fractions is None:
+            fractions = [1.0 / (num_iter_steps - i) for i in range(num_iter_steps)]
+        N, P, _ = i_it_py.shape
+        device = i_it_py.device
+        if N == 0:
+            return torch.zeros((0, P, 2), device=device, dtype=i_it_py.dtype)
+
+        current_contour = i_it_py.clone()
+        total_disp = torch.zeros(N, P, 2, device=device, dtype=i_it_py.dtype)
+
+        for step_idx in range(num_iter_steps):
+            disp = self.sample_disp(cnn_feature, current_contour, c_it_py, py_ind, steps=ddim_steps)
+            frac = fractions[step_idx]
+            applied_disp = disp * frac
+            current_contour = current_contour + applied_disp
+            total_disp = total_disp + applied_disp
+
+        return total_disp
+
     def forward(self, output, cnn_feature, batch=None):
         ret = output
         if self.training:
@@ -451,6 +484,19 @@ class DiffusionEvolution(nn.Module):
                     i_gt_py = torch.stack(rolled, dim=0)
 
                 x0 = i_gt_py - i_init_train_py
+
+                # --- V3.4: Multi-step iterative training (random starting point) ---
+                if self.use_iterative_refinement:
+                    iter_steps = getattr(global_cfg, 'iterative_num_steps', 3)
+                    full_disp = x0.clone()
+                    B = x0.size(0)
+                    situations = torch.randint(0, iter_steps, (B,), device=device)
+                    for sit in range(1, iter_steps):
+                        mask = (situations == sit)
+                        if mask.any():
+                            frac = sit / iter_steps
+                            i_init_train_py[mask] = i_init_train_py[mask] + full_disp[mask] * frac
+                            x0[mask] = full_disp[mask] * (1.0 - frac)
 
                 x0 = self.normalize_disp(x0)
 
@@ -511,6 +557,17 @@ class DiffusionEvolution(nn.Module):
                 if i_it_py.numel() == 0:
                     disp = torch.zeros_like(i_it_py)
                     ret.update({'disp': disp, 'py': i_it_py})
+                elif self.use_iterative_refinement:
+                    iter_steps = getattr(global_cfg, 'iterative_num_steps', 3)
+                    fractions = list(getattr(global_cfg, 'iterative_fractions', []))
+                    if not fractions:
+                        fractions = [1.0 / (iter_steps - i) for i in range(iter_steps)]
+                    ddim_steps = getattr(global_cfg, 'iterative_ddim_steps', 20)
+                    disp = self.sample_disp_iterative(
+                        cnn_feature, i_it_py, c_it_py, py_ind,
+                        num_iter_steps=iter_steps, fractions=fractions, ddim_steps=ddim_steps,
+                    )
+                    ret.update({'disp': disp, 'py': i_it_py + disp})
                 else:
                     disp = self.sample_disp(cnn_feature, i_it_py, c_it_py, py_ind, steps=50)
                     ret.update({
