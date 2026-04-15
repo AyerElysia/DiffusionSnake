@@ -1,0 +1,66 @@
+# V3.3a single-sample overfit config for BTCV
+# V3.3a: V3 + Circular Conv (no smoothness loss)
+
+model: 'sbd'
+network: 'ro_34'
+task: 'snake'
+model_dir: "data/model/btcv_diffusion_dit_v3_3a_single_overfit_gpu6"
+
+gpus: [6]
+resume: false
+
+train_or_test: train
+
+train:
+    dataset: 'BtcvMini'
+    data_path: '/mnt/sdb1/leijh/DiffusionSnake/Datasets/BTCV/btcv_png_single_overfit'
+    per_contour: false
+
+    optim: 'adamw'
+    lr: 5e-5
+    milestones: (80, 120)
+    gamma: 0.5
+    batch_size: 1
+    gradient_accumulation_steps: 1
+    gradient_clip: 1.0
+    weight_decay: 0.01
+    warmup_steps: 100
+
+    epoch: 10000
+    num_workers: 0
+    save_ep: 100
+
+test:
+    dataset: 'BtcvMini'
+    batch_size: 1
+    img_path: '/mnt/sdb1/leijh/DiffusionSnake/Datasets/BTCV/btcv_png_single_overfit'
+    epoch: -1
+
+use_nms_for_snake: true
+det_conf_thresh: 0.01
+det_iou_thresh: 0.45
+det_max_det: 100
+per_class_nms: true
+use_gt_det: false
+
+loss_scales: {det: 0, ex: 1.0, py: 1.2}  # No smoothness loss
+
+use_diffusion_evolution: true
+diffusion_timesteps: 1000
+use_ddim_inference: true
+diffusion_loss_weight: 1.0
+diffusion_loss_type: 'adaptive'
+diffusion_disp_norm: true
+diffusion_disp_stats: "data/stats/btcv_disp_stats_octagon.json"
+
+# V3.3 specific settings
+use_dit_v3_3: true
+circular_conv_kernel: 5
+dit_num_layers: 6
+dit_num_heads: 8
+dit_state_dim: 256
+
+use_grpo: false
+heads: {'ct_hm': 9, 'wh': 2}
+segm_or_bbox: 'segm'
+use_diffusion_trainer: true

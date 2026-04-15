@@ -2,6 +2,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from diffusers import DDPMScheduler, DDIMScheduler
+import logging
 import os
 import sys
 import re
@@ -16,9 +17,12 @@ from .dit_denoiser_v2_2 import DiTDenoiserV2_2
 from .dit_denoiser_v2_2_hybrid import DiTDenoiserV2_2Hybrid
 from .dit_denoiser_v3 import DiTDenoiserV3
 from .dit_denoiser_v3_1 import DiTDenoiserV3_1
+from .dit_denoiser_v3_3 import DiTDenoiserV3_3  # NEW
 import lib.utils.snake.snake_gcn_utils as snake_gcn_utils
 from lib.utils.snake import snake_config
 from lib.config import cfg as global_cfg
+
+logger = logging.getLogger(__name__)
 
 
 def remap_legacy_state_dict(sd: dict) -> dict:
@@ -45,10 +49,14 @@ def _select_denoiser_type(global_cfg, use_dit_v2, use_dit_v2_1, use_dit_v2_2,
     """Determine denoiser type from config flags with clear precedence.
 
     Returns:
-        str: One of 'dit_v3_1', 'dit_v3', 'dit_v2_2_hybrid', 'dit_v2_2',
+        str: One of 'dit_v3_3', 'dit_v3_2', 'dit_v3_1', 'dit_v3', 'dit_v2_2_hybrid', 'dit_v2_2',
              'dit_v2_1', 'dit_v2', 'dit_v1', 'snake'
     """
-    if getattr(global_cfg, 'use_dit_v3_1', False):
+    if getattr(global_cfg, 'use_dit_v3_3', False):
+        return 'dit_v3_3'
+    elif getattr(global_cfg, 'use_dit_v3_2', False):
+        return 'dit_v3_2'
+    elif getattr(global_cfg, 'use_dit_v3_1', False):
         return 'dit_v3_1'
     elif getattr(global_cfg, 'use_dit_v3', False):
         return 'dit_v3'
@@ -108,9 +116,25 @@ class DiffusionEvolution(nn.Module):
         )
 
         # Initialize denoiser based on type
-        if denoiser_type == 'dit_v3_1':
-            print(f"[DiffusionEvolution] Using DiT Denoiser V3.1 (Patchify + Self->Cross Flow) "
-                  f"(layers={dit_num_layers}, heads={dit_num_heads}, dim={dit_state_dim})")
+        if denoiser_type == 'dit_v3_3':
+            circular_conv_kernel = getattr(global_cfg, 'circular_conv_kernel', 5)
+            logger.info(
+                f"[DiffusionEvolution] Using DiT Denoiser V3.3 (V3 + Circular Conv) "
+                f"(layers={dit_num_layers}, heads={dit_num_heads}, dim={dit_state_dim}, kernel={circular_conv_kernel})"
+            )
+            self.denoiser = DiTDenoiserV3_3(
+                state_dim=dit_state_dim,
+                feature_dim=feature_dim,
+                num_layers=dit_num_layers,
+                num_heads=dit_num_heads,
+                num_points=num_points,
+                circular_conv_kernel=circular_conv_kernel,
+            )
+        elif denoiser_type == 'dit_v3_1':
+            logger.info(
+                f"[DiffusionEvolution] Using DiT Denoiser V3.1 (Patchify + Self->Cross Flow) "
+                f"(layers={dit_num_layers}, heads={dit_num_heads}, dim={dit_state_dim})"
+            )
             self.denoiser = DiTDenoiserV3_1(
                 state_dim=dit_state_dim,
                 feature_dim=feature_dim,
@@ -119,8 +143,10 @@ class DiffusionEvolution(nn.Module):
                 num_points=num_points,
             )
         elif denoiser_type == 'dit_v3':
-            print(f"[DiffusionEvolution] Using DiT Denoiser V3 (Perceiver Semantics + Self->Cross Flow) "
-                  f"(layers={dit_num_layers}, heads={dit_num_heads}, dim={dit_state_dim})")
+            logger.info(
+                f"[DiffusionEvolution] Using DiT Denoiser V3 (Perceiver Semantics + Self->Cross Flow) "
+                f"(layers={dit_num_layers}, heads={dit_num_heads}, dim={dit_state_dim})"
+            )
             self.denoiser = DiTDenoiserV3(
                 state_dim=dit_state_dim,
                 feature_dim=feature_dim,
@@ -129,7 +155,7 @@ class DiffusionEvolution(nn.Module):
                 num_points=num_points,
             )
         elif denoiser_type == 'dit_v2_2_hybrid':
-            print(f"[DiffusionEvolution] Using HYBRID DiT Denoiser V2.2 (Odd-Even Injection)")
+            logger.info("[DiffusionEvolution] Using HYBRID DiT Denoiser V2.2 (Odd-Even Injection)")
             self.denoiser = DiTDenoiserV2_2Hybrid(
                 state_dim=dit_state_dim,
                 feature_dim=feature_dim,
@@ -138,8 +164,10 @@ class DiffusionEvolution(nn.Module):
                 num_points=num_points,
             )
         elif denoiser_type == 'dit_v2_2':
-            print(f"[DiffusionEvolution] Using DiT Denoiser V2.2 (MM-DiT Patchify) "
-                  f"(layers={dit_num_layers}, heads={dit_num_heads}, dim={dit_state_dim})")
+            logger.info(
+                f"[DiffusionEvolution] Using DiT Denoiser V2.2 (MM-DiT Patchify) "
+                f"(layers={dit_num_layers}, heads={dit_num_heads}, dim={dit_state_dim})"
+            )
             self.denoiser = DiTDenoiserV2_2(
                 state_dim=dit_state_dim,
                 feature_dim=feature_dim,
@@ -149,8 +177,10 @@ class DiffusionEvolution(nn.Module):
             )
         elif denoiser_type in ('dit_v2_1', 'dit_v2'):
             ver = "V2.1 (Anchor Pool)" if denoiser_type == 'dit_v2_1' else "V2"
-            print(f"[DiffusionEvolution] Using DiT Denoiser {ver} "
-                  f"(layers={dit_num_layers}, heads={dit_num_heads}, dim={dit_state_dim})")
+            logger.info(
+                f"[DiffusionEvolution] Using DiT Denoiser {ver} "
+                f"(layers={dit_num_layers}, heads={dit_num_heads}, dim={dit_state_dim})"
+            )
             self.denoiser = DiTDenoiserV2(
                 state_dim=dit_state_dim,
                 feature_dim=feature_dim,
@@ -160,7 +190,7 @@ class DiffusionEvolution(nn.Module):
                 use_v2_1=(denoiser_type == 'dit_v2_1'),
             )
         elif denoiser_type == 'dit_v1':
-            print("[DiffusionEvolution] Using DiT Denoiser V1")
+            logger.info("[DiffusionEvolution] Using DiT Denoiser V1")
             self.denoiser = DiTDenoiser(
                 state_dim=dit_state_dim,
                 feature_dim=feature_dim,
@@ -169,7 +199,7 @@ class DiffusionEvolution(nn.Module):
                 num_points=num_points,
             )
         else:  # 'snake'
-            print("[DiffusionEvolution] Using GCN Snake Denoiser")
+            logger.info("[DiffusionEvolution] Using GCN Snake Denoiser")
             self.denoiser = SnakeDenoiser(
                 state_dim=state_dim,
                 use_vm2=use_vm2,
@@ -315,6 +345,22 @@ class DiffusionEvolution(nn.Module):
         am1 = self._sqrt_one_minus_alphas_cumprod_dev.index_select(0, t).view(-1, 1, 1)
         return a * x0 + am1 * noise
 
+    def _predict_x0_from_eps(self, x_t: torch.Tensor, eps: torch.Tensor, t: torch.Tensor) -> torch.Tensor:
+        """Predict x0 from x_t and predicted noise eps.
+
+        From DDPM: x_t = sqrt(a_bar)*x0 + sqrt(1-a_bar)*eps
+        Solve for x0: x0 = (x_t - sqrt(1-a_bar)*eps) / sqrt(a_bar)
+        """
+        self._ensure_sched_cache(x_t.device)
+        if self._sqrt_alphas_cumprod_dev is None:
+            # Fallback: use scheduler's step function
+            return self.scheduler.step(eps, t[0].item(), x_t).pred_original_sample
+
+        t = t.long()
+        a = self._sqrt_alphas_cumprod_dev.index_select(0, t).view(-1, 1, 1)
+        am1 = self._sqrt_one_minus_alphas_cumprod_dev.index_select(0, t).view(-1, 1, 1)
+        return (x_t - am1 * eps) / a
+
     def predict_eps(self, cnn_feature: torch.Tensor, i_it_py: torch.Tensor, c_it_py: torch.Tensor,
                    py_ind: torch.Tensor, x_t: torch.Tensor, t: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
         """
@@ -437,12 +483,19 @@ class DiffusionEvolution(nn.Module):
             lossA1 = F.mse_loss(eps_pred_A1, noise_A1, reduction='mean') if eps_pred_A1.numel() > 0 else (cnn_feature.sum() * 0.0)
             diff_loss = lossA1
 
+            # Compute predicted contours for smoothness loss (V3.3)
+            # Predict x0 from eps_pred and x_t
+            x0_pred = self._predict_x0_from_eps(x_t[0 * N_orig:1 * N_orig], eps_pred_A1, t[:N_orig])
+            x0_pred_denorm = self.denormalize_disp(x0_pred)
+            pred_contours = i_init_train_py + x0_pred_denorm
+
             ret.update({
                 'diff_loss': diff_loss,
                 'diff_lossA1': lossA1,
                 'diff_loss_total': diff_loss,
                 'diff_loss1': lossA1,
                 'py_pred': [i_init_train_py],
+                'pred_contours': pred_contours,  # NEW for smoothness loss
             })
             
         else:

@@ -98,6 +98,62 @@ class DiffusionPretrainNetworkWrapper(nn.Module):
         else:
             scalar_stats.update({'L_loss': torch.tensor(0.0, device=base_device)})
 
+        # 4) Smoothness Loss (NEW in V3.3)
+        if (not self.freeze_snake) and ('pred_contours' in output):
+            smooth_weight = float(self.loss_scales.get('smooth', 0.0))
+            curv_weight = float(self.loss_scales.get('curv', 0.0))
+
+            if smooth_weight > 0 or curv_weight > 0:
+                contours = output['pred_contours']  # (N, P, 2)
+                base_contours = output.get('i_it_py', None)
+
+                # Regularize the predicted correction rather than absolute coordinates.
+                # This keeps the penalty focused on local jaggedness and avoids
+                # over-penalizing the coarse contour geometry itself.
+                if isinstance(base_contours, torch.Tensor) and base_contours.shape == contours.shape:
+                    contours = contours - base_contours
+
+                # Laplacian smoothness loss
+                if smooth_weight > 0:
+                    prev = torch.roll(contours, 1, dims=1)
+                    next = torch.roll(contours, -1, dims=1)
+                    laplacian = contours - (prev + next) / 2
+                    smooth_loss = torch.mean(laplacian ** 2)
+                    loss = loss + smooth_weight * smooth_loss
+                    scalar_stats.update({
+                        'smooth_loss': smooth_loss,
+                        'smooth_loss_scaled': smooth_weight * smooth_loss
+                    })
+                else:
+                    scalar_stats.update({'smooth_loss': torch.tensor(0.0, device=base_device)})
+
+                # Curvature loss
+                if curv_weight > 0:
+                    # Cyclic second-order difference keeps the contour closed.
+                    v2 = (
+                        torch.roll(contours, -1, dims=1)
+                        - 2.0 * contours
+                        + torch.roll(contours, 1, dims=1)
+                    )
+                    curv_loss = torch.mean(v2 ** 2)
+                    loss = loss + curv_weight * curv_loss
+                    scalar_stats.update({
+                        'curv_loss': curv_loss,
+                        'curv_loss_scaled': curv_weight * curv_loss
+                    })
+                else:
+                    scalar_stats.update({'curv_loss': torch.tensor(0.0, device=base_device)})
+            else:
+                scalar_stats.update({
+                    'smooth_loss': torch.tensor(0.0, device=base_device),
+                    'curv_loss': torch.tensor(0.0, device=base_device)
+                })
+        else:
+            scalar_stats.update({
+                'smooth_loss': torch.tensor(0.0, device=base_device),
+                'curv_loss': torch.tensor(0.0, device=base_device)
+            })
+
         scalar_stats.update({'loss': loss})
         for k, v in list(scalar_stats.items()):
             if isinstance(v, torch.Tensor):

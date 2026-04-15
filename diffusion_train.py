@@ -130,7 +130,9 @@ def main():
         logger.info("Set default optimizer to adamw")
 
     # Build
+    logger.info("Building network")
     network = make_network(cfg)
+    logger.info("Building trainer")
     trainer = make_trainer(cfg, network)
     if torch.cuda.is_available():
         trainer.network.cuda()
@@ -243,6 +245,8 @@ def main():
             output, _, _, _ = trainer.network(batch)
         save_dir = os.path.join(out_dir, 'visual', 'diffusion_one_sample')
         save_affine_visualization(output=output, batch=batch, tag=str(tag), save_dir=save_dir)
+
+    infer_and_save = _visualize_one_sample
 
     # 单阶段联合训练配置
     log_interval = int(os.environ.get('ONE_SAMPLE_LOG_INTERVAL', '1'))
@@ -676,6 +680,7 @@ def main():
 
     # 统一进入单阶段联合训练（余弦学习率调度器）。支持在指定 epoch 后冻结检测头。
     if True:
+        logger.info("Starting epoch-based training loop")
         trainer.network.train()
         steps_per_epoch = 0
         try:
