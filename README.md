@@ -450,7 +450,51 @@ loss = det_loss * det_weight + diff_loss * diff_weight
 
 # 扩散损失
 diff_loss = MSE(eps_pred, eps_gt)  # 噪声预测误差
+
+# 可选: 平滑损失 / 曲率损失
+# smooth_loss: 惩罚相邻顶点间的剧烈变化
+# curv_loss: 惩罚轮廓曲率过大
+if smooth_loss:
+    loss += smooth_weight * compute_smoothness(pred_disp)
+if curv_loss:
+    loss += curv_weight * compute_curvature(pred_disp)
 ```
+
+#### 5.3 GRPO 强化学习训练 (实验性)
+
+**入口文件**: `grpo_train.py`
+
+使用 Group Relative Policy Optimization 对扩散模型进行强化学习微调，以边界 Dice 作为奖励信号：
+
+```
+┌─────────────────────────────────────────────────────────────┐
+│                    GRPO 训练流程                              │
+├─────────────────────────────────────────────────────────────┤
+│                                                             │
+│  for epoch in range(num_epochs):                            │
+│      for batch in data_loader:                              │
+│          │                                                  │
+│          ├──▶ 1. 从当前策略采样多条轨迹                        │
+│          │     (多次 diffusion rollout, 记录 logprob)         │
+│          │                                                  │
+│          ├──▶ 2. 计算奖励: mBoundDice (多容忍度边界 Dice)     │
+│          │                                                  │
+│          ├──▶ 3. GAE 优势估计                                │
+│          │                                                  │
+│          ├──▶ 4. PPO-clip 策略梯度更新 (带 KL 正则)          │
+│          │                                                  │
+│          └──▶ 5. 记录奖励/散度/kl                            │
+│                                                             │
+└─────────────────────────────────────────────────────────────┘
+```
+
+**关键文件**:
+- `lib/networks/diffusion/grpo_evolution.py` — GRPO 演化 wrapper，含 `sample_with_logprob` 和 GAE 优势计算
+- `lib/networks/diffusion/ddpm_with_logprob.py` — DDPM 采样返回 log-probability
+- `lib/train/rewards/region_reward.py` — mBoundF 奖励函数（多容忍度边界 Dice）
+- `lib/train/trainers/diffusion_grpo_trainer.py` — GRPO 训练 wrapper
+
+**注意**: GRPO 训练仍在实验中，`grpo_train.py` 标注为"需调整"状态。
 
 #### 5.2 推理流程
 
@@ -484,13 +528,18 @@ def run_inference(model, batch):
 
 ### 版本对比表
 
-| 版本 | 初始化 | 去噪器 | 视觉编码 | 位置编码 | 注意力模式 |
-|------|--------|--------|----------|----------|-----------|
-| **V1** | 矩形 | `DiTDenoiser` | Perceiver | SnakePosEnc | Cross |
-| **V2** | 矩形 | `DiTDenoiserV2` | Perceiver + Local | CyclicRoPE | Cross (奇偶交替) |
-| **V2.1** | 矩形 | `DiTDenoiserV2` | SpatialAnchor + Local | CyclicRoPE | Cross (奇偶交替) |
-| **V2.2** | 矩形 | `DiTDenoiserV2_2` | Patchify | - | Joint (MM-DiT) |
-| **V3** | **八边形** | `DiTDenoiserV3` | SpatialAnchor + Local | CyclicRoPE | Cross → Self |
+| 版本 | 初始化 | 去噪器 | 视觉编码 | 位置编码 | 注意力模式 | 特殊功能 |
+|------|--------|--------|----------|----------|-----------|---------|
+| **V1** | 矩形 | `DiTDenoiser` | Perceiver | SnakePosEnc | Cross | 基础 Cross-Attention |
+| **V2** | 矩形 | `DiTDenoiserV2` | Perceiver + Local | CyclicRoPE | Cross (奇偶交替) | CyclicRoPE, 奇偶交替注意力 |
+| **V2.1** | 矩形 | `DiTDenoiserV2` | SpatialAnchor + Local | CyclicRoPE | Cross (奇偶交替) | 换 SpatialAnchor 编码器 |
+| **V2.2** | 矩形 | `DiTDenoiserV2_2` | Patchify | - | Joint (MM-DiT) | Patchify 全局上下文 |
+| **V2.3** | 矩形 | FlowMatching | MM-DiT Joint | - | **Flow Matching** | ODE 连续向量场演化 |
+| **V3** | **八边形** | `DiTDenoiserV3` | SpatialAnchor + Local | CyclicRoPE | Cross → Self | 八边形初始化 + Self-then-Cross |
+| **V3.1** | **八边形** | `DiTDenoiserV3_1` | Perceiver + Patchify | CyclicRoPE | Cross → Self | 双全局上下文对齐 V2 语义 |
+| **V3.2** | **八边形** | `DiTFlowMatchingV3_2` | Self+Cross+Patchify | CyclicRoPE | **Flow Matching** | ODE 演化 + 八边形 |
+| **V3.3** | **八边形** | `DiTDenoiserV3_3` | Perceiver + Local | CyclicRoPE | Cross → Self | Circular Conv1d 平滑约束 |
+| **V3.5** | **八边形** | `DiTDenoiserV3_5` | Perceiver + FourierBridge | CyclicRoPE | Fourier-Space | **傅里叶空间扩散 (K=16)** |
 
 ### V3 关键改进
 
@@ -516,6 +565,64 @@ class DiTBlockV3:
 
         return x
 ```
+
+### V3.2: Flow Matching 演化
+
+**入口文件**: `lib/networks/diffusion/flow_matching_evolution.py`
+
+用 ODE 连续向量场替代离散 DDPM 采样，通过 Rectified Flow 训练直接预测速度场而非噪声：
+
+```python
+# Flow Matching 训练: 预测速度场 v = dx/dt
+class FlowMatchingEvolution:
+    def forward(self, output, cnn_feature, batch):
+        # 1. 计算 x0 (目标位移), x1 (纯噪声)
+        # 2. 线性插值: x_t = t * x1 + (1-t) * x0
+        # 3. 速度场: v = x1 - x0 (恒定)
+        # 4. 预测: v_pred = denoiser(x_t, t, context)
+        # 5. 损失: MSE(v_pred, v)
+        loss = F.mse_loss(v_pred, x1 - x0)
+        return loss
+```
+
+推理时通过 ODE 积分从噪声逐步演化到位移场，支持 V2.3/V3.2 去噪器。
+
+### V3.3: Circular Conv1d 平滑约束
+
+**入口文件**: `lib/networks/diffusion/dit_denoiser_v3_3.py`
+
+在最终输出层前加入 Circular Conv1d，利用局部邻域一致性约束防止异常顶点：
+
+```python
+# V3.3a/b 变体:
+# V3.3a: CircularConv1d 替换最后 FFN 的输出投影
+# V3.3b: CircularConv1d 作为额外分支与 FFN 输出相加
+class DiTDenoiserV3_3:
+    def forward(self, x, context, t_emb):
+        # ... standard DiT blocks ...
+        x = self.circular_conv1d(x)  # kernel 沿轮廓维度滑动，首尾相连
+        return self.output_head(x)
+```
+
+### V3.5: 傅里叶空间扩散 (最新)
+
+**入口文件**: `lib/networks/diffusion/dit_denoiser_v3_5.py`
+
+不再在 128 个顶点坐标上直接扩散，而是将轮廓变换到傅里叶空间（K=16 个复系数），扩散过程在频域进行：
+
+```python
+class DiTDenoiserV3_5:
+    def forward(self, x, context, t_emb):
+        # 1. 空间坐标 → FFT → 16 个复系数
+        coeffs = torch.fft.rfft(x, n=K, dim=1)
+        # 2. 在傅里叶空间做扩散去噪
+        coeffs_pred = self.fourier_denoiser(coeffs, context, t_emb)
+        # 3. IFFT → 空间坐标输出
+        x_pred = torch.fft.irfft(coeffs_pred, n=128, dim=1)
+        return x_pred
+```
+
+优势：天然保证输出轮廓平滑（高频分量被截断），无需后处理。
 
 ---
 
