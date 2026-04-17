@@ -13,6 +13,12 @@
   - [3. 初始化轮廓生成](#3-初始化轮廓生成)
   - [4. 扩散模型演化](#4-扩散模型演化)
   - [5. 训练与推理](#5-训练与推理)
+    - [5.1 训练流程](#51-训练流程)
+    - [5.2 推理流程](#52-推理流程)
+    - [5.3 边缘感知平滑后处理](#53-边缘感知平滑后处理)
+    - [5.4 单样本过拟合训练](#54-单样本过拟合训练)
+    - [5.5 位移场归一化](#55-位移场归一化)
+    - [5.6 GRPO 强化学习训练](#53-grpo-强化学习训练-实验性)
 - [模型版本详解](#模型版本详解)
 - [配置文件说明](#配置文件说明)
 - [快速开始](#快速开始)
@@ -522,6 +528,52 @@ def run_inference(model, batch):
     draw_results(orig_img, pred_poly, i_it_py, gt_poly)
 ```
 
+#### 5.3 边缘感知平滑后处理
+
+**入口文件**: `edge_smoothing.py`, `scripts/infer_v3_with_smoothing.py`
+
+扩散模型输出轮廓后，可通过 curvature-based 平滑进行后处理：
+
+- **平坦区域**：施加较强平滑消除锯齿
+- **尖锐转角**：保留角点特征，不过度模糊
+- 支持单独对 V3 系列模型输出进行平滑
+
+```bash
+# 带平滑的 V3 推理
+python scripts/infer_v3_with_smoothing.py --ckpt <path>
+# 或单独测试平滑模块
+python verify_edge_smoothing.py
+```
+
+#### 5.4 单样本过拟合训练
+
+用于快速验证架构改动是否有效。选取单一样本进行过拟合训练，观察模型是否能拟合该样本的轮廓：
+
+```bash
+# 以 V3.5 单样本过拟合为例
+export CFG_FILE=configs/btcv_diffusion_dit_v3_5_single_overfit.yaml
+python diffusion_train.py
+
+# 批量推理对比所有版本
+python infer_all_single_overfit.py
+# 输出: 各版本可视化对比图
+```
+
+支持的版本：V2, V2.1, V2.2, V2.3, V3, V3.1, V3.2, V3.3a, V3.3b, V3.4, V3.5，均有对应的 `_single_overfit` 配置文件。
+
+#### 5.5 位移场归一化
+
+**入口文件**: `compute_disp_stats.py`
+
+计算训练集中位移场的统计信息（均值、标准差），用于归一化扩散模型的位移目标：
+
+```bash
+python compute_disp_stats.py
+# 输出: data/stats/btcv_disp_stats.json
+```
+
+配置中通过 `diffusion_disp_norm: true` 启用归一化，推理时自动反归一化。
+
 ---
 
 ## 模型版本详解
@@ -709,18 +761,59 @@ python verify_octagon_v3.py
 
 ## 关键文件索引
 
+### 核心模块
+
 | 文件 | 说明 |
 |------|------|
 | `lib/networks/snake/ct_snake.py` | 主网络定义 (YOLO + Evolution) |
-| `lib/networks/diffusion/pretrain_evolution.py` | 扩散训练主模块 |
+| `lib/networks/diffusion/pretrain_evolution.py` | 扩散训练主模块，去噪器选择与调度 |
+| `lib/networks/diffusion/flow_matching_evolution.py` | Flow Matching (ODE) 演化 wrapper |
+| `lib/networks/diffusion/grpo_evolution.py` | GRPO 强化学习演化 wrapper |
 | `lib/networks/diffusion/dit_denoiser_v3.py` | V3 DiT 去噪器 |
+| `lib/networks/diffusion/dit_denoiser_v3_2.py` | V3.2 Flow Matching 去噪器 |
+| `lib/networks/diffusion/dit_denoiser_v3_3.py` | V3.3 Circular Conv1d 去噪器 |
+| `lib/networks/diffusion/dit_denoiser_v3_5.py` | V3.5 傅里叶空间去噪器 |
 | `lib/utils/snake/snake_decode.py` | 初始化轮廓生成 |
 | `lib/utils/snake/snake_gcn_utils.py` | 训练/测试数据准备 |
 | `lib/datasets/voc/snake.py` | 数据集加载 |
-| `diffusion_train.py` | 训练入口 |
+
+### 训练相关
+
+| 文件 | 说明 |
+|------|------|
+| `diffusion_train.py` | 主训练入口 (36KB) |
+| `grpo_train.py` | GRPO 强化学习训练 |
+| `lib/train/trainers/diffusion_trainer.py` | 标准训练 wrapper |
+| `lib/train/trainers/diffusion_grpo_trainer.py` | GRPO 训练 wrapper |
+| `lib/train/rewards/region_reward.py` | mBoundF 奖励函数 |
+
+### 推理与分析脚本
+
+| 文件 | 说明 |
+|------|------|
 | `infer_v3_refinement.py` | V3 推理兼容入口 |
 | `scripts/infer_v3_final.py` | 当前 V3 推理实现 |
-| `verify_octagon_v3.py` | 八边形验证脚本 |
+| `scripts/infer_v3_with_smoothing.py` | V3 + 边缘平滑推理 |
+| `scripts/infer_v3_2_refinement.py` | V3.2 Flow Matching 推理 |
+| `scripts/infer_all_versions.py` | 多版本对比推理 |
+| `scripts/infer_single_sample.py` | 单样本推理 |
+| `scripts/infer_without_yolo.py` | 使用 GT 检测的推理 |
+| `infer_all_single_overfit.py` | 单样本过拟合批量推理 |
+
+### 工具与分析
+
+| 文件 | 说明 |
+|------|------|
+| `verify_octagon_v3.py` | 八边形初始化验证 |
+| `edge_smoothing.py` | 边缘感知平滑模块 |
+| `compute_disp_stats.py` | 位移场统计计算 |
+| `compute_octagon_stats.py` | 八边形初始化统计 |
+| `analyze_init_quality.py` | 初始化轮廓质量分析 |
+| `test_fourier_smooth.py` | V3.5 傅里叶平滑测试 |
+| `test_v3_5_inference.py` | V3.5 推理测试 |
+| `sync_logs_to_wandb.py` | JSON 日志同步至 WandB |
+| `tools/crf/crf_postprocessor.py` | CRF 后处理模块 |
+| `lib/networks/vision_mamba2/` | Vision Mamba2 集成 |
 
 ---
 
@@ -737,13 +830,20 @@ visual/
 │       ├── GT: 蓝色
 │       ├── Init: 黄色
 │       └── Pred: 红色
-└── diffusion_one_sample/       # 训练过程可视化
+├── diffusion_one_sample/       # 训练过程可视化
+├── v3_smoothing_eval/          # V3 + 平滑推理结果
+├── single_overfit_comparison/  # 单样本过拟合各版本对比
+└── fourier_smooth_eval/        # V3.5 傅里叶平滑结果
 ```
 
 ---
 
 ## 更新日志
 
+- **2026-04-17**: V3.5 傅里叶空间扩散 pipeline 完成，推理测试 & 配置
+- **2026-04-16**: V3.3 Circular Conv1d 平滑约束 (V3.3a/b 变体)；边缘感知平滑后处理；单样本过拟合训练流程 (V2~V3.5)
+- **2026-04-15**: 单样本过拟合配置批量创建；批量推理对比脚本
+- **2026-04-13**: 训练可视化改进，初始化质量分析
 - **2026-04-04**: 修复 V3 八边形初始化，实现 canonical 12 点版本
 - **2026-04-03**: 完成 V3 DiT 去噪器实现
 - **2026-04-02**: V2 系列稳定版本
@@ -759,6 +859,9 @@ visual/
 - YOLOv8: [Ultralytics, 2023]
 - DDPM: [Ho et al., NeurIPS 2020]
 - DDIM: [Song et al., ICLR 2021]
+- Flow Matching / Rectified Flow: [Lipman et al., ICLR 2023], [Liu et al., 2022]
+- GRPO: [Shao et al., 2024] (DeepSeekMath)
+- Vision Mamba: [Hatamizadeh et al., 2024]
 
 ---
 
