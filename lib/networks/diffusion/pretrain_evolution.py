@@ -18,6 +18,7 @@ from .dit_denoiser_v2_2_hybrid import DiTDenoiserV2_2Hybrid
 from .dit_denoiser_v3 import DiTDenoiserV3
 from .dit_denoiser_v3_1 import DiTDenoiserV3_1
 from .dit_denoiser_v3_3 import DiTDenoiserV3_3  # NEW
+from .dit_denoiser_v3_5 import DiTDenoiserV3_5  # V3.5 Fourier-space
 import lib.utils.snake.snake_gcn_utils as snake_gcn_utils
 from lib.utils.snake import snake_config
 from lib.config import cfg as global_cfg
@@ -52,7 +53,9 @@ def _select_denoiser_type(global_cfg, use_dit_v2, use_dit_v2_1, use_dit_v2_2,
         str: One of 'dit_v3_3', 'dit_v3_2', 'dit_v3_1', 'dit_v3', 'dit_v2_2_hybrid', 'dit_v2_2',
              'dit_v2_1', 'dit_v2', 'dit_v1', 'snake'
     """
-    if getattr(global_cfg, 'use_dit_v3_3', False):
+    if getattr(global_cfg, 'use_dit_v3_5', False):
+        return 'dit_v3_5'
+    elif getattr(global_cfg, 'use_dit_v3_3', False):
         return 'dit_v3_3'
     elif getattr(global_cfg, 'use_dit_v3_2', False):
         return 'dit_v3_2'
@@ -121,8 +124,27 @@ class DiffusionEvolution(nn.Module):
             use_dit_denoiser, use_hybrid=getattr(global_cfg, 'use_hybrid', False)
         )
 
+        # V3.5: Fourier-space diffusion config
+        self.use_fourier_diffusion = (denoiser_type == 'dit_v3_5')
+        self.fourier_k = getattr(global_cfg, 'fourier_k', 16)
+        if self.use_fourier_diffusion:
+            logger.info(f"[DiffusionEvolution] V3.5 Fourier-space diffusion enabled (K={self.fourier_k})")
+
         # Initialize denoiser based on type
-        if denoiser_type == 'dit_v3_3':
+        if denoiser_type == 'dit_v3_5':
+            logger.info(
+                f"[DiffusionEvolution] Using DiT Denoiser V3.5 (Fourier-Space) "
+                f"(layers={dit_num_layers}, heads={dit_num_heads}, dim={dit_state_dim}, K={self.fourier_k})"
+            )
+            self.denoiser = DiTDenoiserV3_5(
+                state_dim=dit_state_dim,
+                feature_dim=feature_dim,
+                num_layers=dit_num_layers,
+                num_heads=dit_num_heads,
+                num_points=num_points,
+                num_fourier_k=self.fourier_k,
+            )
+        elif denoiser_type == 'dit_v3_3':
             circular_conv_kernel = getattr(global_cfg, 'circular_conv_kernel', 5)
             logger.info(
                 f"[DiffusionEvolution] Using DiT Denoiser V3.3 (V3 + Circular Conv) "
@@ -302,6 +324,30 @@ class DiffusionEvolution(nn.Module):
             return disp_norm
         scale = (self._disp_max - self._disp_min).clamp_min(1e-12)
         return (disp_norm + 1.0) * 0.5 * scale.to(disp_norm.device, disp_norm.dtype) + self._disp_min.to(disp_norm.device, disp_norm.dtype)
+
+    def normalize_disp_fourier(self, fourier_coeff: torch.Tensor) -> torch.Tensor:
+        """Normalize Fourier coefficients to roughly [-1, 1].
+        Uses the spatial displacement range to derive a scale for Fourier coefficients.
+        Since FFT preserves energy (Parseval's theorem), the Fourier coefficient
+        magnitudes scale with the spatial displacement magnitude.
+        """
+        if not self._has_disp_stats():
+            return fourier_coeff
+        # Use the max absolute spatial range as the Fourier scale
+        spatial_range = (self._disp_max - self._disp_min).clamp_min(1e-12)
+        # Fourier coefficients scale ~ spatial_range * num_points / 2
+        # But we want [-1, 1], so divide by an empirical scale
+        # DC component (k=0) ~ mean displacement * N, others ~ amplitude * N/2
+        scale = spatial_range.max().to(fourier_coeff.device, fourier_coeff.dtype)
+        return fourier_coeff / (scale + 1e-8)
+
+    def denormalize_disp_fourier(self, fourier_norm: torch.Tensor) -> torch.Tensor:
+        """Denormalize Fourier coefficients back to original scale."""
+        if not self._has_disp_stats():
+            return fourier_norm
+        spatial_range = (self._disp_max - self._disp_min).clamp_min(1e-12)
+        scale = spatial_range.max().to(fourier_norm.device, fourier_norm.dtype)
+        return fourier_norm * (scale + 1e-8)
     
     def configure_snake(self, res_layers=7, fusion_dim=256):
         """Configure Snake backbone parameters"""
@@ -386,6 +432,74 @@ class DiffusionEvolution(nn.Module):
             eps_pred, L = self.denoiser(gcn_feat, c_it_py, x_t, t, adj, polys=i_it_py)
 
         return eps_pred, L
+
+    @staticmethod
+    def fourier_smooth(disp, k):
+        """Fourier low-pass filter on contour displacement.
+        Args:
+            disp: (B, N_points, 2) displacement vectors
+            k: keep lowest k frequency components per side (total 2k+1 kept)
+        Returns:
+            smoothed displacement (B, N_points, 2)
+        """
+        B, N, C = disp.shape
+        freq = torch.fft.rfft(disp, dim=1)  # (B, N//2+1, 2)
+        mask = torch.zeros(freq.shape[1], device=disp.device, dtype=torch.bool)
+        mask[:k + 1] = True
+        freq[:, ~mask, :] = 0
+        return torch.fft.irfft(freq, n=N, dim=1)
+
+    def disp_to_fourier(self, disp):
+        """Convert (N, 128, 2) displacement to (N, K, 4) Fourier coefficients.
+        The 4 channels are: [real_x, imag_x, real_y, imag_y].
+        """
+        K = self.fourier_k
+        # FFT along point dimension for each coordinate
+        freq_x = torch.fft.rfft(disp[..., 0], dim=1)  # (N, 65) complex
+        freq_y = torch.fft.rfft(disp[..., 1], dim=1)  # (N, 65) complex
+        # Take first K coefficients
+        freq_x = freq_x[:, :K]  # (N, K) complex
+        freq_y = freq_y[:, :K]  # (N, K) complex
+        # Stack as (N, K, 4): [real_x, imag_x, real_y, imag_y]
+        return torch.stack([freq_x.real, freq_x.imag, freq_y.real, freq_y.imag], dim=-1)
+
+    def fourier_to_disp(self, fourier_coeff, num_points=128):
+        """Convert (N, K, 4) Fourier coefficients back to (N, 128, 2) displacement."""
+        K = fourier_coeff.shape[1]
+        n_freq = num_points // 2 + 1  # 65 for 128 points
+        device = fourier_coeff.device
+        dtype = fourier_coeff.dtype
+        N = fourier_coeff.shape[0]
+        # Reconstruct complex coefficients, zero-pad high frequencies
+        full_x = torch.zeros(N, n_freq, device=device, dtype=torch.complex64)
+        full_y = torch.zeros(N, n_freq, device=device, dtype=torch.complex64)
+        real_x, imag_x, real_y, imag_y = fourier_coeff.unbind(dim=-1)
+        full_x[:, :K] = torch.complex(real_x.float(), imag_x.float())
+        full_y[:, :K] = torch.complex(real_y.float(), imag_y.float())
+        # IFFT
+        disp_x = torch.fft.irfft(full_x, n=num_points, dim=1)  # (N, 128)
+        disp_y = torch.fft.irfft(full_y, n=num_points, dim=1)  # (N, 128)
+        return torch.stack([disp_x, disp_y], dim=-1).to(dtype)
+
+    @torch.no_grad()
+    def sample_disp_fourier(self, cnn_feature, i_it_py, c_it_py, py_ind, steps: int = 50):
+        """DDIM sampling in Fourier space for V3.5."""
+        N, P, _ = i_it_py.shape
+        device = i_it_py.device
+        K = self.fourier_k
+        if N == 0:
+            return torch.zeros((0, P, 2), device=device, dtype=i_it_py.dtype)
+        # Start from Gaussian noise in Fourier space (N, K, 4)
+        x = torch.randn(N, K, 4, device=device)
+        self.scheduler.set_timesteps(steps, device=device)
+        for t in self.scheduler.timesteps:
+            t_batch = torch.full((N,), t, device=device, dtype=torch.long)
+            eps_pred, _ = self.predict_eps(cnn_feature, i_it_py, c_it_py, py_ind, x, t_batch)
+            out = self.scheduler.step(model_output=eps_pred, timestep=t, sample=x)
+            x = out.prev_sample
+        # Convert Fourier coefficients back to displacement
+        x0_fourier = self.denormalize_disp_fourier(x)
+        return self.fourier_to_disp(x0_fourier, num_points=P)
 
     @torch.no_grad()
     def sample_disp(self, cnn_feature, i_it_py, c_it_py, py_ind, steps: int = 50):
@@ -498,22 +612,23 @@ class DiffusionEvolution(nn.Module):
                             i_init_train_py[mask] = i_init_train_py[mask] + full_disp[mask] * frac
                             x0[mask] = full_disp[mask] * (1.0 - frac)
 
-                x0 = self.normalize_disp(x0)
+                # --- V3.5: Convert to Fourier space ---
+                if self.use_fourier_diffusion:
+                    x0_fourier = self.disp_to_fourier(x0)  # (N, K, 4)
+                    x0_combined = self.normalize_disp_fourier(x0_fourier)
+                else:
+                    x0_combined = self.normalize_disp(x0)
 
                 # 不再构建 B/C 对齐与目标
 
-                N = x0.size(0)
+                N = x0_combined.size(0)
                 if N == 0:
                     ret.update({'diff_loss': (cnn_feature.sum() * 0.0), 'py_pred': [i_init_train_py]})
                     return ret
 
                 # 仅保留 A1：起始轮廓与完整目标位移
-                vec_full = x0
-                contour1 = i_init_train_py
-                c_contour1 = c_init_train_py
-                contours_combined = contour1
-                c_combined = c_contour1
-                x0_combined = vec_full
+                contours_combined = i_init_train_py
+                c_combined = c_init_train_py
                 py_ind_combined = py_ind
 
                 N3 = x0_combined.size(0)
@@ -532,7 +647,11 @@ class DiffusionEvolution(nn.Module):
             # Compute predicted contours for smoothness loss (V3.3)
             # Predict x0 from eps_pred and x_t
             x0_pred = self._predict_x0_from_eps(x_t[0 * N_orig:1 * N_orig], eps_pred_A1, t[:N_orig])
-            x0_pred_denorm = self.denormalize_disp(x0_pred)
+            if self.use_fourier_diffusion:
+                x0_pred_fourier = self.denormalize_disp_fourier(x0_pred)
+                x0_pred_denorm = self.fourier_to_disp(x0_pred_fourier)
+            else:
+                x0_pred_denorm = self.denormalize_disp(x0_pred)
             pred_contours = i_init_train_py + x0_pred_denorm
 
             ret.update({
@@ -557,6 +676,12 @@ class DiffusionEvolution(nn.Module):
                 if i_it_py.numel() == 0:
                     disp = torch.zeros_like(i_it_py)
                     ret.update({'disp': disp, 'py': i_it_py})
+                elif self.use_fourier_diffusion:
+                    # V3.5: DDIM sampling in Fourier space
+                    disp = self.sample_disp_fourier(
+                        cnn_feature, i_it_py, c_it_py, py_ind, steps=50
+                    )
+                    ret.update({'disp': disp, 'py': i_it_py + disp})
                 elif self.use_iterative_refinement:
                     iter_steps = getattr(global_cfg, 'iterative_num_steps', 3)
                     fractions = list(getattr(global_cfg, 'iterative_fractions', []))
@@ -567,9 +692,17 @@ class DiffusionEvolution(nn.Module):
                         cnn_feature, i_it_py, c_it_py, py_ind,
                         num_iter_steps=iter_steps, fractions=fractions, ddim_steps=ddim_steps,
                     )
+                    # V3.5: Fourier low-pass post-processing
+                    smooth_k = getattr(global_cfg, 'fourier_smooth_k', 0)
+                    if smooth_k > 0:
+                        disp = self.fourier_smooth(disp, smooth_k)
                     ret.update({'disp': disp, 'py': i_it_py + disp})
                 else:
                     disp = self.sample_disp(cnn_feature, i_it_py, c_it_py, py_ind, steps=50)
+                    # V3.5: Fourier low-pass post-processing
+                    smooth_k = getattr(global_cfg, 'fourier_smooth_k', 0)
+                    if smooth_k > 0:
+                        disp = self.fourier_smooth(disp, smooth_k)
                     ret.update({
                         'disp': disp,
                         'py': i_it_py + disp

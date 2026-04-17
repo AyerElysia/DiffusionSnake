@@ -69,6 +69,13 @@ cfg.iterative_num_steps = 3
 cfg.iterative_fractions = [0.3333, 0.5, 1.0]
 cfg.iterative_ddim_steps = 20
 
+# V3.5: Fourier low-pass post-processing
+cfg.fourier_smooth_k = 0  # 0=disabled, >0=keep lowest K freq components per side
+
+# V3.5: Fourier-space diffusion
+cfg.use_dit_v3_5 = False
+cfg.fourier_k = 16  # number of Fourier coefficients (K)
+
 # YOLO/NMS related toggles
 cfg.use_nms_for_snake = True
 cfg.det_conf_thresh = 0.20

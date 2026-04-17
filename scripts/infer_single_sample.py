@@ -47,6 +47,18 @@ def draw_poly(img, poly, color, thickness=2):
     cv2.polylines(img, [pts], isClosed=True, color=color, thickness=thickness)
 
 
+def fourier_low_pass(disp, k):
+    """Low-pass filter on a closed contour displacement."""
+    if disp.numel() == 0 or k <= 0:
+        return disp
+    B, N, C = disp.shape
+    freq = torch.fft.rfft(disp, dim=1)
+    mask = torch.zeros(freq.shape[1], device=disp.device, dtype=torch.bool)
+    mask[:k + 1] = True
+    freq[:, ~mask, :] = 0
+    return torch.fft.irfft(freq, n=N, dim=1)
+
+
 def load_model(ckpt_path):
     cfg.use_diffusion_evolution = True
     cfg.use_diffusion_trainer = True
@@ -105,8 +117,16 @@ def infer_one(model, device, sample, out_path):
         i_gt_4py = batch['i_gt_4py'][0][mask] if 'i_gt_4py' in batch else None
         py_ind = torch.zeros((i_it_py.size(0),), dtype=torch.long, device=device)
 
-        if i_it_py.numel() == 0:
+        # V3.5 uses its own Fourier-space forward path.
+        # For all other models, keep the normal single-sample initialization
+        # and only apply Fourier smoothing to the final displacement.
+        if getattr(cfg, 'use_dit_v3_5', False):
+            output, _, _, _ = model(batch)
+            pred_py = output.get('py', i_it_py)
+            init_py = output.get('i_it_py', i_it_py)
+        elif i_it_py.numel() == 0:
             pred_py = i_it_py
+            init_py = i_it_py
         else:
             if getattr(cfg, 'use_iterative_refinement', False):
                 iter_steps = int(getattr(cfg, 'iterative_num_steps', 3))
@@ -120,11 +140,15 @@ def infer_one(model, device, sample, out_path):
                 )
             else:
                 disp = core.gcn.sample_disp(cnn_feature, i_it_py, c_it_py, py_ind)
+            k = int(getattr(cfg, 'fourier_smooth_k', 0))
+            if k > 0:
+                disp = fourier_low_pass(disp, k)
             pred_py = i_it_py + disp
+            init_py = i_it_py
 
     dr = float(snake_config.down_ratio)
     orig_img = to_numpy(batch['orig_img'][0]).astype(np.uint8).copy()
-    init_np = to_numpy(i_it_py) * dr
+    init_np = to_numpy(init_py) * dr
     pred_np = to_numpy(pred_py) * dr
     gt_np = to_numpy(i_gt_py) * dr
     gt4_np = to_numpy(i_gt_4py) * dr if i_gt_4py is not None else None
