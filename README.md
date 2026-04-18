@@ -125,20 +125,24 @@
 
 ### 1. 数据加载与预处理
 
-**入口文件**: `lib/datasets/voc/snake.py` / `lib/datasets/coco/snake.py`
+**入口文件**: `lib/datasets/dataset_catalog.py`
+
+项目使用 **COCO 格式 JSON 标注** + 图像目录的数据结构：
 
 ```python
-# 数据目录结构
-data_path/
-├── images/           # 原始图像
-│   ├── 0001.png
-│   └── ...
-├── masks/            # 分割掩码
-│   ├── 0001_mask_1.png   # 实例1
-│   ├── 0001_mask_2.png   # 实例2
-│   └── ...
-└── train_list.txt    # 训练样本列表
+# dataset_catalog.py 中的条目示例
+{
+    'data_root': 'path/to/images/',          # 图像目录
+    'ann_file': 'path/to/annotations.json',   # COCO 格式标注
+}
 ```
+
+实际数据路径在 `dataset_catalog.py` 中配置。当前本机 BTCV 数据位于:
+- 训练: `/mnt/sdb1/leijh/DiffusionSnake/Datasets/BTCV/btcv_png_new_snake`
+- 测试: `/mnt/sdb1/leijh/DiffusionSnake/Datasets/BTCV/btcv_png_test_new_snake`
+
+> 注意: `dataset_catalog.py` 中仍保留部分旧机器路径 (`/home/medteam/Zhrch/...`)，
+> 迁移数据时需同步更新。
 
 **数据处理流程**:
 
@@ -457,13 +461,10 @@ loss = det_loss * det_weight + diff_loss * diff_weight
 # 扩散损失
 diff_loss = MSE(eps_pred, eps_gt)  # 噪声预测误差
 
-# 可选: 平滑损失 / 曲率损失
-# smooth_loss: 惩罚相邻顶点间的剧烈变化
-# curv_loss: 惩罚轮廓曲率过大
-if smooth_loss:
-    loss += smooth_weight * compute_smoothness(pred_disp)
-if curv_loss:
-    loss += curv_weight * compute_curvature(pred_disp)
+# 可选: 平滑损失 / 曲率损失 (默认权重为 0，需在配置中显式开启)
+# smooth_loss: Laplacian 平滑，惩罚相邻顶点间的剧烈变化
+# curv_loss: 二阶导数损失，惩罚轮廓曲率过大
+# 开启方式: 在配置文件的 loss_scales 中设置 smooth > 0 或 curv > 0
 ```
 
 #### 5.3 GRPO 强化学习训练 (实验性)
@@ -528,22 +529,62 @@ def run_inference(model, batch):
     draw_results(orig_img, pred_poly, i_it_py, gt_poly)
 ```
 
-#### 5.3 边缘感知平滑后处理
+#### 5.3 自适应曲率平滑后处理
 
 **入口文件**: `edge_smoothing.py`, `scripts/infer_v3_with_smoothing.py`
 
-扩散模型输出轮廓后，可通过 curvature-based 平滑进行后处理：
+扩散模型输出轮廓后，可通过 **曲率自适应平滑** 消除锯齿状边缘，同时保留尖角特征。
 
-- **平坦区域**：施加较强平滑消除锯齿
-- **尖锐转角**：保留角点特征，不过度模糊
-- 支持单独对 V3 系列模型输出进行平滑
+**核心机制**: 根据每个顶点的局部曲率自动调节平滑强度。
+
+```python
+class EdgeAwareSmoothing:
+    def compute_curvature(self, contour):
+        # 环形二阶差分近似曲率 (使用 torch.roll)
+        d1 = contour - torch.roll(contour, 1, dims=1)
+        d2 = d1 - torch.roll(d1, 1, dims=1)
+        return torch.norm(d2, dim=-1, keepdim=True)
+
+    def smooth(self, contour):
+        curvature = self.compute_curvature(contour)
+        # 关键公式: 高曲率 → 低平滑权重; 平坦 → 高平滑权重
+        smooth_weight = torch.exp(-curvature / self.curvature_threshold)
+        # 局部平滑: (prev + 2*contour + next) / 4
+        smoothed = (torch.roll(contour, 1, dims=1)
+                    + 2 * contour
+                    + torch.roll(contour, -1, dims=1)) / 4
+        return smooth_weight * smoothed + (1 - smooth_weight) * contour
+```
+
+> 以上为简化示意，完整实现见 `edge_smoothing.py`。
+
+**行为示意**:
+
+```
+轮廓顶点曲率分布:
+   平坦区域  ───────  尖角 ^  ───────  平坦区域
+   smooth_weight≈0.9    smooth_weight≈0.01   smooth_weight≈0.9
+
+效果:
+   平坦处强力消除锯齿    尖角几乎不碰          平坦处强力消除锯齿
+```
+
+**使用**:
 
 ```bash
-# 带平滑的 V3 推理
+# 带自适应平滑的 V3 推理
 python scripts/infer_v3_with_smoothing.py --ckpt <path>
-# 或单独测试平滑模块
+
+# 单独测试平滑效果（可调 curvature_threshold，默认 5.0）
 python verify_edge_smoothing.py
 ```
+
+**参数说明**:
+
+| 参数 | 默认值 | 说明 |
+|------|--------|------|
+| `curvature_threshold` | 5.0 | 越小越激进平滑（高曲区也受影响） |
+| `iterations` | 2 | 平滑迭代次数 |
 
 #### 5.4 单样本过拟合训练
 
@@ -658,20 +699,31 @@ class DiTDenoiserV3_3:
 
 ### V3.5: 傅里叶空间扩散 (最新)
 
-**入口文件**: `lib/networks/diffusion/dit_denoiser_v3_5.py`
+**入口文件**: `lib/networks/diffusion/dit_denoiser_v3_5.py`, `lib/networks/diffusion/pretrain_evolution.py`
 
 不再在 128 个顶点坐标上直接扩散，而是将轮廓变换到傅里叶空间（K=16 个复系数），扩散过程在频域进行：
 
 ```python
+# Evolution wrapper 中的变换 (pretrain_evolution.py)
+def disp_to_fourier(self, disp):
+    # 空间坐标 [N, 128, 2] → 傅里叶系数 [N, K, 4]
+    coeffs = torch.fft.rfft(disp, n=K, dim=1)
+    coeffs = torch.cat([coeffs.real, coeffs.imag], dim=-1)
+    return coeffs
+
+def fourier_to_disp(self, coeffs):
+    # 傅里叶系数 → IFFT → 空间坐标
+    real = coeffs[..., :2]
+    imag = coeffs[..., 2:]
+    complex_coeffs = real + 1j * imag
+    return torch.fft.irfft(complex_coeffs, n=128, dim=1)
+
+# DiTDenoiserV3_5 在傅里叶空间操作 (接收已变换的系数)
 class DiTDenoiserV3_5:
-    def forward(self, x, context, t_emb):
-        # 1. 空间坐标 → FFT → 16 个复系数
-        coeffs = torch.fft.rfft(x, n=K, dim=1)
-        # 2. 在傅里叶空间做扩散去噪
-        coeffs_pred = self.fourier_denoiser(coeffs, context, t_emb)
-        # 3. IFFT → 空间坐标输出
-        x_pred = torch.fft.irfft(coeffs_pred, n=128, dim=1)
-        return x_pred
+    def forward(self, x_t, context, t_emb):
+        # x_t 已经是傅里叶系数 [N, K, 4]
+        # 纯注意力网络，无任何 FFT 操作
+        return self.fourier_denoiser(x_t, context, t_emb)
 ```
 
 优势：天然保证输出轮廓平滑（高频分量被截断），无需后处理。
@@ -819,21 +871,23 @@ python verify_octagon_v3.py
 
 ## 可视化
 
-训练/推理过程自动生成可视化结果:
+训练/推理过程自动生成可视化结果 (目录名含时间戳):
 
 ```
 visual/
-├── octagon_comparison.png      # 单实例八边形对比
-├── octagon_multi_boxes.png     # 多实例八边形效果
-├── v3_clean_eval/              # 当前 V3 推理结果
+├── v3_clean_eval/                # 当前 V3 推理结果
 │   └── CLEAN_v3_*.png
 │       ├── GT: 蓝色
 │       ├── Init: 黄色
 │       └── Pred: 红色
-├── diffusion_one_sample/       # 训练过程可视化
-├── v3_smoothing_eval/          # V3 + 平滑推理结果
-├── single_overfit_comparison/  # 单样本过拟合各版本对比
-└── fourier_smooth_eval/        # V3.5 傅里叶平滑结果
+├── edge_aware_postprocess_*/     # 自适应曲率平滑结果
+├── fourier_smooth_test/          # V3.5 傅里叶平滑测试
+├── fourier_postprocess_*/        # V3.5 傅里叶后处理
+├── single_sample_all_models/     # 单样本多版本对比
+├── fourier_normal_single_sample_*/  # V3.5 单样本结果
+├── fourier_stronger_v3_*/        # V3.5 强化实验
+├── single_sample_normal_latest_*/   # 最新单样本结果
+└── training_sample_*_zoomed.png  # 训练样本局部放大
 ```
 
 ---

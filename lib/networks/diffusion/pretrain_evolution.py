@@ -327,27 +327,24 @@ class DiffusionEvolution(nn.Module):
 
     def normalize_disp_fourier(self, fourier_coeff: torch.Tensor) -> torch.Tensor:
         """Normalize Fourier coefficients to roughly [-1, 1].
-        Uses the spatial displacement range to derive a scale for Fourier coefficients.
-        Since FFT preserves energy (Parseval's theorem), the Fourier coefficient
-        magnitudes scale with the spatial displacement magnitude.
+        torch.fft.rfft output scales with N (num_points): DC = sum of values,
+        k-th harmonic ≈ amplitude × N/2.  So the correct scale for Fourier
+        coefficients is  spatial_range × num_points / 2.
         """
         if not self._has_disp_stats():
             return fourier_coeff
-        # Use the max absolute spatial range as the Fourier scale
         spatial_range = (self._disp_max - self._disp_min).clamp_min(1e-12)
-        # Fourier coefficients scale ~ spatial_range * num_points / 2
-        # But we want [-1, 1], so divide by an empirical scale
-        # DC component (k=0) ~ mean displacement * N, others ~ amplitude * N/2
-        scale = spatial_range.max().to(fourier_coeff.device, fourier_coeff.dtype)
-        return fourier_coeff / (scale + 1e-8)
+        # Account for FFT scaling factor (N/2)
+        fft_scale = spatial_range.max().to(fourier_coeff.device, fourier_coeff.dtype) * (self.num_points / 2.0)
+        return fourier_coeff / (fft_scale + 1e-8)
 
     def denormalize_disp_fourier(self, fourier_norm: torch.Tensor) -> torch.Tensor:
         """Denormalize Fourier coefficients back to original scale."""
         if not self._has_disp_stats():
             return fourier_norm
         spatial_range = (self._disp_max - self._disp_min).clamp_min(1e-12)
-        scale = spatial_range.max().to(fourier_norm.device, fourier_norm.dtype)
-        return fourier_norm * (scale + 1e-8)
+        fft_scale = spatial_range.max().to(fourier_norm.device, fourier_norm.dtype) * (self.num_points / 2.0)
+        return fourier_norm * (fft_scale + 1e-8)
     
     def configure_snake(self, res_layers=7, fusion_dim=256):
         """Configure Snake backbone parameters"""
@@ -448,6 +445,153 @@ class DiffusionEvolution(nn.Module):
         mask[:k + 1] = True
         freq[:, ~mask, :] = 0
         return torch.fft.irfft(freq, n=N, dim=1)
+
+    @staticmethod
+    def _fill_outlier_points(disp: torch.Tensor, outlier_mask: torch.Tensor, fill_iters: int = 2) -> torch.Tensor:
+        """Replace sharp outlier points by circular interpolation from valid neighbors."""
+        if fill_iters <= 0 or not outlier_mask.any():
+            return disp
+
+        corrected = disp.clone()
+        B, N, _ = disp.shape
+
+        for _ in range(fill_iters):
+            for b in range(B):
+                mask = outlier_mask[b]
+                if not mask.any():
+                    continue
+                if int((~mask).sum().item()) < 2:
+                    continue
+
+                outlier_idx = torch.nonzero(mask, as_tuple=False).flatten().tolist()
+                for idx in outlier_idx:
+                    left = idx
+                    right = idx
+
+                    found_left = False
+                    for _step in range(N):
+                        left = (left - 1) % N
+                        if not mask[left]:
+                            found_left = True
+                            break
+
+                    found_right = False
+                    for _step in range(N):
+                        right = (right + 1) % N
+                        if not mask[right]:
+                            found_right = True
+                            break
+
+                    if not (found_left and found_right):
+                        continue
+
+                    left_dist = (idx - left) % N
+                    right_dist = (right - idx) % N
+                    denom = left_dist + right_dist
+                    if denom <= 0:
+                        continue
+
+                    left_w = right_dist / denom
+                    right_w = left_dist / denom
+                    corrected[b, idx] = corrected[b, left] * left_w + corrected[b, right] * right_w
+
+        return corrected
+
+    @staticmethod
+    def _frequency_weights(num_freq: int, k: int, low_gain: float, device, dtype) -> torch.Tensor:
+        """Smooth weighting that keeps low frequencies and suppresses high ones."""
+        weights = torch.ones(num_freq, device=device, dtype=dtype)
+        if k <= 0:
+            return weights.view(1, -1, 1)
+
+        cutoff = min(max(int(k), 1), num_freq - 1)
+        idx = torch.arange(num_freq, device=device, dtype=dtype)
+
+        # Gentle boost for low frequencies, DC kept unchanged.
+        if cutoff >= 1:
+            low_idx = idx[:cutoff + 1]
+            low_scale = 1.0 + float(low_gain) * (1.0 - low_idx / float(cutoff + 1))
+            weights[:cutoff + 1] = low_scale
+            weights[0] = 1.0
+
+        # Smooth Gaussian falloff for high frequencies.
+        if cutoff + 1 < num_freq:
+            sigma = max(float(cutoff) * 0.75, 1.0)
+            tail = idx[cutoff + 1:] - float(cutoff)
+            weights[cutoff + 1:] = torch.exp(-((tail / sigma) ** 2)).clamp_min(0.05)
+
+        return weights.view(1, -1, 1)
+
+    @classmethod
+    def hybrid_postprocess(
+        cls,
+        disp: torch.Tensor,
+        k: int,
+        low_gain: float = 0.15,
+        outlier_z: float = 2.5,
+        neighbor_span: int = 1,
+        fill_iters: int = 2,
+        blend: float = 0.85,
+    ) -> torch.Tensor:
+        """Hybrid cleanup: outlier interpolation + tapered low-frequency emphasis."""
+        if k <= 0:
+            return disp
+
+        if disp.numel() == 0:
+            return disp
+
+        center = disp
+        if neighbor_span > 1:
+            acc = center.clone()
+            count = 1.0
+            for shift in range(1, neighbor_span + 1):
+                acc = acc + torch.roll(center, shifts=shift, dims=1) + torch.roll(center, shifts=-shift, dims=1)
+                count += 2.0
+            center = acc / count
+
+        left = torch.roll(center, shifts=1, dims=1)
+        right = torch.roll(center, shifts=-1, dims=1)
+        linear = 0.5 * (left + right)
+        dev = torch.norm(center - linear, dim=-1)
+        curv = torch.norm(left - 2.0 * center + right, dim=-1)
+        score = dev + 0.5 * curv
+
+        med = score.median(dim=1, keepdim=True).values
+        mad = (score - med).abs().median(dim=1, keepdim=True).values.clamp_min(1e-6)
+        z_score = (score - med) / (1.4826 * mad)
+        outlier_mask = z_score > outlier_z
+
+        corrected = cls._fill_outlier_points(center, outlier_mask, fill_iters=fill_iters)
+
+        freq = torch.fft.rfft(corrected, dim=1)
+        weights = cls._frequency_weights(
+            num_freq=freq.shape[1],
+            k=k,
+            low_gain=low_gain,
+            device=disp.device,
+            dtype=corrected.dtype,
+        )
+        filtered = torch.fft.irfft(freq * weights, n=disp.shape[1], dim=1)
+        blend = float(max(0.0, min(1.0, blend)))
+        return blend * filtered + (1.0 - blend) * corrected
+
+    def _apply_postprocess(self, disp: torch.Tensor) -> torch.Tensor:
+        hybrid_k = int(getattr(global_cfg, 'hybrid_postprocess_k', 0))
+        if hybrid_k > 0:
+            return self.hybrid_postprocess(
+                disp,
+                k=hybrid_k,
+                low_gain=float(getattr(global_cfg, 'hybrid_postprocess_low_gain', 0.15)),
+                outlier_z=float(getattr(global_cfg, 'hybrid_postprocess_outlier_z', 2.5)),
+                neighbor_span=int(getattr(global_cfg, 'hybrid_postprocess_neighbor_span', 1)),
+                fill_iters=int(getattr(global_cfg, 'hybrid_postprocess_fill_iters', 2)),
+                blend=float(getattr(global_cfg, 'hybrid_postprocess_blend', 0.85)),
+            )
+
+        smooth_k = int(getattr(global_cfg, 'fourier_smooth_k', 0))
+        if smooth_k > 0:
+            return self.fourier_smooth(disp, smooth_k)
+        return disp
 
     def disp_to_fourier(self, disp):
         """Convert (N, 128, 2) displacement to (N, K, 4) Fourier coefficients.
@@ -692,17 +836,11 @@ class DiffusionEvolution(nn.Module):
                         cnn_feature, i_it_py, c_it_py, py_ind,
                         num_iter_steps=iter_steps, fractions=fractions, ddim_steps=ddim_steps,
                     )
-                    # V3.5: Fourier low-pass post-processing
-                    smooth_k = getattr(global_cfg, 'fourier_smooth_k', 0)
-                    if smooth_k > 0:
-                        disp = self.fourier_smooth(disp, smooth_k)
+                    disp = self._apply_postprocess(disp)
                     ret.update({'disp': disp, 'py': i_it_py + disp})
                 else:
                     disp = self.sample_disp(cnn_feature, i_it_py, c_it_py, py_ind, steps=50)
-                    # V3.5: Fourier low-pass post-processing
-                    smooth_k = getattr(global_cfg, 'fourier_smooth_k', 0)
-                    if smooth_k > 0:
-                        disp = self.fourier_smooth(disp, smooth_k)
+                    disp = self._apply_postprocess(disp)
                     ret.update({
                         'disp': disp,
                         'py': i_it_py + disp

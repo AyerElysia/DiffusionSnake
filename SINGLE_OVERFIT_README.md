@@ -13,12 +13,14 @@
 - `btcv_diffusion_dit_v3_1_single_overfit.yaml` - V3.1, GPU 6
 - `btcv_diffusion_dit_v3_2_single_overfit.yaml` - V3.2, GPU 6
 - `btcv_diffusion_dit_v3_4_single_overfit.yaml` - V3.4, GPU 7, 1W epoch
+- `btcv_diffusion_dit_v3_6_single_overfit.yaml` - V3.6, GPU 0, Flow Matching + V3 query + iterative refinement
 
 ## GPU分配
 
 - **GPU 5**: V2.0, V2.1, V2.2 (串行运行)
 - **GPU 6**: V2.3, V3.1, V3.2 (串行运行)
 - **GPU 7**: V3.0 (已在运行), V3.4（单样本）
+- **GPU 0**: V3.6（单样本）
 
 ## 启动脚本
 
@@ -40,6 +42,9 @@ bash run_gpu6_overfit.sh
 
 # 只启动GPU 7上的任务
 bash run_gpu7_overfit.sh
+
+# 启动GPU 0上的 V3.6
+bash run_gpu0_v3_6_overfit.sh
 ```
 
 ### 单独启动某个版本
@@ -62,6 +67,7 @@ CUDA_VISIBLE_DEVICES=5 python diffusion_train.py
 - `v3_1_single_overfit_gpu6.log`
 - `v3_2_single_overfit_gpu6.log`
 - `v3_4_single_overfit_gpu7.log`
+- `v3_6_single_overfit_gpu0.log`
 
 ## 模型输出目录
 
@@ -74,6 +80,7 @@ CUDA_VISIBLE_DEVICES=5 python diffusion_train.py
 - `data/model/btcv_diffusion_dit_v3_1_single_overfit_gpu6/`
 - `data/model/btcv_diffusion_dit_v3_2_single_overfit_gpu6/`
 - `data/model/btcv_diffusion_dit_v3_4_single_overfit_gpu7/`
+- `data/outputs/btcv_diffusion_dit_v3_6_single_overfit/`
 
 ## 训练参数
 

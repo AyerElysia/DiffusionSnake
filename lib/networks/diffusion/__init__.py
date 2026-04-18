@@ -20,7 +20,7 @@ def make_evolution(use_grpo=False, **kwargs):
     Returns:
         An instance of Evolution module
     """
-    if kwargs.get('use_flow_matching', False):
+    if kwargs.get('use_flow_matching', False) or kwargs.get('use_dit_v3_6', False):
         from .flow_matching_evolution import FlowMatchingEvolution
         return FlowMatchingEvolution(
             state_dim=kwargs.get('state_dim', 128),

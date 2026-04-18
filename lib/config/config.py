@@ -55,6 +55,7 @@ cfg.use_dit_v3_1 = False
 cfg.use_dit_v3_2 = False
 cfg.use_dit_v3_3 = False
 cfg.use_dit_v3_4 = False
+cfg.use_dit_v3_6 = False
 cfg.circular_conv_kernel = 5
 cfg.use_flow_matching = False
 cfg.flow_ode_steps = 10
@@ -71,6 +72,14 @@ cfg.iterative_ddim_steps = 20
 
 # V3.5: Fourier low-pass post-processing
 cfg.fourier_smooth_k = 0  # 0=disabled, >0=keep lowest K freq components per side
+
+# V3.4/V3.6: Hybrid post-processing for jagged contour cleanup
+cfg.hybrid_postprocess_k = 0
+cfg.hybrid_postprocess_low_gain = 0.15
+cfg.hybrid_postprocess_outlier_z = 2.5
+cfg.hybrid_postprocess_neighbor_span = 1
+cfg.hybrid_postprocess_fill_iters = 2
+cfg.hybrid_postprocess_blend = 0.85
 
 # V3.5: Fourier-space diffusion
 cfg.use_dit_v3_5 = False

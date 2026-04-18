@@ -49,6 +49,10 @@ class Network(nn.Module):
         if use_diffusion:
             # 延迟导入，避免与 diffusion.evolution -> snake.snake 的循环依赖
             from lib.networks.diffusion import make_evolution
+            use_flow_matching = bool(
+                getattr(cfg, 'use_flow_matching', False)
+                or getattr(cfg, 'use_dit_v3_6', False)
+            )
             self.gcn = make_evolution(
                 use_grpo=getattr(cfg, 'use_grpo', False),
                 state_dim=128,
@@ -64,7 +68,7 @@ class Network(nn.Module):
                 use_dit_v2_1=getattr(cfg, 'use_dit_v2_1', False),
                 use_dit_v2_2=getattr(cfg, 'use_dit_v2_2', False),
                 use_dit_v2_3=getattr(cfg, 'use_dit_v2_3', False),
-                use_flow_matching=getattr(cfg, 'use_flow_matching', False),
+                use_flow_matching=use_flow_matching,
                 flow_ode_steps=getattr(cfg, 'flow_ode_steps', 10),
                 dit_num_layers=getattr(cfg, 'dit_num_layers', 6),
                 dit_num_heads=getattr(cfg, 'dit_num_heads', 8),
@@ -238,5 +242,4 @@ class Network(nn.Module):
 def get_network(num_layers, heads, head_conv=256, down_ratio=4, det_dir=''):
     network = Network(num_layers, heads, head_conv, down_ratio, det_dir)
     return network
-
 

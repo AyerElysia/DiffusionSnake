@@ -33,9 +33,26 @@ class FlowMatchingEvolution(nn.Module):
         self.loss_weight = loss_weight
         self.loss_type = loss_type
         self.ode_steps = ode_steps
+        self.use_iterative_refinement = bool(
+            getattr(global_cfg, 'use_iterative_refinement', False)
+            or getattr(global_cfg, 'use_dit_v3_4', False)
+        )
+        self.use_fourier_smooth = int(getattr(global_cfg, 'fourier_smooth_k', 0))
 
+        # V3.6: V3 global query + iterative refinement + Flow Matching
+        if getattr(global_cfg, 'use_dit_v3_6', False):
+            from .dit_denoiser_v3_6 import DiTFlowMatchingV3_6
+            print(f"[FlowMatchingEvolution] Using DiT Flow Network V3.6 "
+                  f"(V3 global query + iterative refinement, ODE steps={ode_steps})")
+            self.denoiser = DiTFlowMatchingV3_6(
+                state_dim=dit_state_dim,
+                feature_dim=feature_dim,
+                num_layers=dit_num_layers,
+                num_heads=dit_num_heads,
+                num_points=num_points,
+            )
         # V3.2: Efficient Self+Cross Attention with Flow Matching
-        if getattr(global_cfg, 'use_dit_v3_2', False):
+        elif getattr(global_cfg, 'use_dit_v3_2', False):
             from .dit_denoiser_v3_2 import DiTFlowMatchingV3_2
             print(f"[FlowMatchingEvolution] Using DiT Flow Network V3.2 "
                   f"(Self+Cross + Patchify, ODE steps={ode_steps})")
@@ -123,6 +140,18 @@ class FlowMatchingEvolution(nn.Module):
         scale = (self._disp_max - self._disp_min).clamp_min(1e-12)
         return (disp_norm + 1.0) * 0.5 * scale.to(disp_norm.device, disp_norm.dtype) + self._disp_min.to(disp_norm.device, disp_norm.dtype)
 
+    @staticmethod
+    def fourier_smooth(disp: torch.Tensor, k: int) -> torch.Tensor:
+        """Apply a Fourier low-pass filter to contour displacement."""
+        if k <= 0:
+            return disp
+        _, n, _ = disp.shape
+        freq = torch.fft.rfft(disp, dim=1)
+        mask = torch.zeros(freq.shape[1], device=disp.device, dtype=torch.bool)
+        mask[:k + 1] = True
+        freq[:, ~mask, :] = 0
+        return torch.fft.irfft(freq, n=n, dim=1)
+
     def predict_velocity(self, cnn_feature, i_it_py, c_it_py, sampled_feat, py_ind, x_t, t_continuous):
         """
         包装接口：预测速度场 V_t
@@ -138,6 +167,32 @@ class FlowMatchingEvolution(nn.Module):
         v_pred, L = self.denoiser(cnn_feature, sampled_feat, x_t, t_scaled, adj, polys=i_it_py, py_ind=py_ind)
         return v_pred, L
 
+    def _sample_disp_from_sampled_feat(
+        self,
+        cnn_feature,
+        i_it_py,
+        c_it_py,
+        py_ind,
+        sampled_feat,
+        steps=None,
+    ) -> torch.Tensor:
+        if steps is None:
+            steps = self.ode_steps
+
+        device = i_it_py.device
+        N = i_it_py.size(0)
+        x_t = torch.randn_like(i_it_py)
+        dt = 1.0 / steps
+        for i in range(steps):
+            t_val = i * dt
+            t_tensor = torch.full((N,), t_val, device=device, dtype=torch.float32)
+            v_pred, _ = self.predict_velocity(
+                cnn_feature, i_it_py, c_it_py, sampled_feat, py_ind, x_t, t_tensor
+            )
+            x_t = x_t + v_pred * dt
+
+        return self.denormalize_disp(x_t)
+
     def sample_disp(self, cnn_feature, i_it_py, c_it_py, py_ind, steps=None) -> torch.Tensor:
         """
         Euler ODE Solver for Flow Matching
@@ -149,24 +204,53 @@ class FlowMatchingEvolution(nn.Module):
         N = i_it_py.size(0)
         h, w = cnn_feature.size(2), cnn_feature.size(3)
         
-        # x_0 = 标准正态分布噪声 (归场化尺度)
-        x_t = torch.randn_like(i_it_py)
-        
         # 推理时：先进行一次特征采样
         sampled_feat = snake_gcn_utils.get_gcn_feature(cnn_feature, i_it_py, py_ind, h, w)
+        return self._sample_disp_from_sampled_feat(
+            cnn_feature, i_it_py, c_it_py, py_ind, sampled_feat, steps=steps
+        )
 
-        dt = 1.0 / steps
-        for i in range(steps):
-            t_val = i * dt
-            t_tensor = torch.full((N,), t_val, device=device, dtype=torch.float32)
-            
-            # 这里的特征是基于原始初始轮廓采样的
-            v_pred, _ = self.predict_velocity(cnn_feature, i_it_py, c_it_py, sampled_feat, py_ind, x_t, t_tensor)
-            
-            x_t = x_t + v_pred * dt
+    def sample_disp_iterative(
+        self,
+        cnn_feature,
+        i_it_py,
+        c_it_py,
+        py_ind,
+        num_iter_steps=3,
+        fractions=None,
+        ode_steps=None,
+    ):
+        """V3.4-style iterative refinement for Flow Matching."""
+        if fractions is None:
+            fractions = [1.0 / (num_iter_steps - i) for i in range(num_iter_steps)]
+        if ode_steps is None:
+            ode_steps = self.ode_steps
 
-        disp_pred = self.denormalize_disp(x_t)
-        return disp_pred
+        N, P, _ = i_it_py.shape
+        device = i_it_py.device
+        if N == 0:
+            return torch.zeros((0, P, 2), device=device, dtype=i_it_py.dtype)
+
+        current_contour = i_it_py.clone()
+        total_disp = torch.zeros(N, P, 2, device=device, dtype=i_it_py.dtype)
+        h, w = cnn_feature.size(2), cnn_feature.size(3)
+
+        for step_idx in range(num_iter_steps):
+            sampled_feat = snake_gcn_utils.get_gcn_feature(cnn_feature, current_contour, py_ind, h, w)
+            disp = self._sample_disp_from_sampled_feat(
+                cnn_feature,
+                current_contour,
+                c_it_py,
+                py_ind,
+                sampled_feat,
+                steps=ode_steps,
+            )
+            frac = fractions[step_idx]
+            applied_disp = disp * frac
+            current_contour = current_contour + applied_disp
+            total_disp = total_disp + applied_disp
+
+        return total_disp
 
     def forward(self, output: Dict[str, Any], cnn_feature: torch.Tensor, batch: Dict[str, Any]) -> Dict[str, Any]:
         ret = {}
@@ -201,7 +285,21 @@ class FlowMatchingEvolution(nn.Module):
             d2 = (i_init_train_py[:, :1, :] - i_gt_py).pow(2).sum(-1)
             i_gt_py = torch.stack([torch.roll(i_gt_py[i], -int(d2[i].argmin().item()), 0) for i in range(i_gt_py.size(0))], 0)
 
-            x1 = self.normalize_disp(i_gt_py - i_init_train_py)
+            x1_raw = i_gt_py - i_init_train_py
+
+            if self.use_iterative_refinement:
+                iter_steps = int(getattr(global_cfg, 'iterative_num_steps', 3))
+                full_disp = x1_raw.clone()
+                B = x1_raw.size(0)
+                situations = torch.randint(0, iter_steps, (B,), device=device)
+                for sit in range(1, iter_steps):
+                    mask = (situations == sit)
+                    if mask.any():
+                        frac = sit / iter_steps
+                        i_init_train_py[mask] = i_init_train_py[mask] + full_disp[mask] * frac
+                        x1_raw[mask] = full_disp[mask] * (1.0 - frac)
+
+            x1 = self.normalize_disp(x1_raw)
             N = x1.size(0)
 
             # --- Flow Matching Core ---
@@ -241,8 +339,27 @@ class FlowMatchingEvolution(nn.Module):
                 if i_it_py.numel() == 0:
                     disp = torch.zeros_like(i_it_py)
                     ret.update({'disp': disp, 'py': i_it_py})
+                elif self.use_iterative_refinement:
+                    iter_steps = int(getattr(global_cfg, 'iterative_num_steps', 3))
+                    fractions = list(getattr(global_cfg, 'iterative_fractions', []))
+                    if not fractions:
+                        fractions = [1.0 / (iter_steps - i) for i in range(iter_steps)]
+                    disp = self.sample_disp_iterative(
+                        cnn_feature,
+                        i_it_py,
+                        c_it_py,
+                        py_ind,
+                        num_iter_steps=iter_steps,
+                        fractions=fractions,
+                        ode_steps=self.ode_steps,
+                    )
+                    if self.use_fourier_smooth > 0:
+                        disp = self.fourier_smooth(disp, self.use_fourier_smooth)
+                    ret.update({'disp': disp, 'py': i_it_py + disp})
                 else:
                     disp = self.sample_disp(cnn_feature, i_it_py, c_it_py, py_ind, steps=self.ode_steps)
+                    if self.use_fourier_smooth > 0:
+                        disp = self.fourier_smooth(disp, self.use_fourier_smooth)
                     ret.update({
                         'disp': disp,
                         'py': i_it_py + disp
