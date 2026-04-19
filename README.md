@@ -2,6 +2,14 @@
 
 端到端的医学图像分割框架，融合 **YOLO 检测** + **扩散模型轮廓演化**。支持多种 DiT 去噪器版本和初始化策略。
 
+## V2 归档状态（2026-04-19）
+
+V2 系列网络、配置和专用脚本已从主线移出并封存在：
+`archive/v2_legacy_2026-04-19/snapshot/`
+
+恢复说明见：
+`archive/v2_legacy_2026-04-19/README.md`
+
 ---
 
 ## 目录
@@ -861,10 +869,9 @@ python verify_octagon_v3.py
 | `compute_disp_stats.py` | 位移场统计计算 |
 | `compute_octagon_stats.py` | 八边形初始化统计 |
 | `analyze_init_quality.py` | 初始化轮廓质量分析 |
-| `test_fourier_smooth.py` | V3.5 傅里叶平滑测试 |
-| `test_v3_5_inference.py` | V3.5 推理测试 |
+| `test/test_fourier_smooth.py` | V3.5 傅里叶平滑测试 |
+| `test/test_v3_5_inference.py` | V3.5 推理测试 |
 | `sync_logs_to_wandb.py` | JSON 日志同步至 WandB |
-| `tools/crf/crf_postprocessor.py` | CRF 后处理模块 |
 | `lib/networks/vision_mamba2/` | Vision Mamba2 集成 |
 
 ---

@@ -26,36 +26,25 @@ voc_scale_range = np.arange(0.6, 1.4, 0.1)
 box_center = False
 center_scope = False
 
-def is_v2_family():
-    return any([
-        getattr(cfg, 'use_dit_v2', False),
-        getattr(cfg, 'use_dit_v2_1', False),
-        getattr(cfg, 'use_dit_v2_2', False),
-        getattr(cfg, 'use_dit_v2_3', False),
-    ])
-
-
 def is_v3_family():
     return any([
         getattr(cfg, 'use_dit_v3', False),
         getattr(cfg, 'use_dit_v3_1', False),
         getattr(cfg, 'use_dit_v3_2', False),
+        getattr(cfg, 'use_dit_v3_3', False),
+        getattr(cfg, 'use_dit_v3_4', False),
+        getattr(cfg, 'use_dit_v3_5', False),
+        getattr(cfg, 'use_dit_v3_6', False),
     ])
 
 
 def get_box_init_mode():
     if is_v3_family():
         return 'octagon'
-    if is_v2_family():
-        return 'box'
     return 'quadrangle'
 
 
 def get_evolve_init_mode():
-    if is_v3_family():
-        return 'octagon'
-    if is_v2_family():
-        return 'box'
     return 'octagon'
 
 

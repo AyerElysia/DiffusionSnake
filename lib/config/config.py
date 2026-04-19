@@ -46,10 +46,6 @@ cfg.diffusion_loss_weight = 1.0
 cfg.diffusion_disp_norm = False
 cfg.diffusion_disp_stats = ''
 cfg.use_dit_denoiser = False
-cfg.use_dit_v2 = False
-cfg.use_dit_v2_1 = False
-cfg.use_dit_v2_2 = False
-cfg.use_dit_v2_3 = False
 cfg.use_dit_v3 = False
 cfg.use_dit_v3_1 = False
 cfg.use_dit_v3_2 = False
@@ -59,7 +55,6 @@ cfg.use_dit_v3_6 = False
 cfg.circular_conv_kernel = 5
 cfg.use_flow_matching = False
 cfg.flow_ode_steps = 10
-cfg.use_hybrid = False
 cfg.dit_num_layers = 6
 cfg.dit_num_heads = 8
 cfg.dit_state_dim = 256
@@ -84,6 +79,7 @@ cfg.hybrid_postprocess_blend = 0.85
 # V3.5: Fourier-space diffusion
 cfg.use_dit_v3_5 = False
 cfg.fourier_k = 16  # number of Fourier coefficients (K)
+cfg.fourier_disp_stats = ''  # path to Fourier-domain mean/std stats JSON
 
 # YOLO/NMS related toggles
 cfg.use_nms_for_snake = True

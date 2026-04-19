@@ -1,3 +1,6 @@
+import importlib.util
+from pathlib import Path
+
 from lib.config import cfg, args
 
 
@@ -92,8 +95,14 @@ def run_demo():
     from tools import demo
     demo.demo()
 
+
 def run_test_medical():
-    from tools import test_medical
+    test_file = Path(__file__).resolve().parent / 'test' / 'test_medical.py'
+    spec = importlib.util.spec_from_file_location('test_medical', test_file)
+    if spec is None or spec.loader is None:
+        raise ImportError(f'无法加载测试脚本: {test_file}')
+    test_medical = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(test_medical)
     test_medical.TEST()
 
 

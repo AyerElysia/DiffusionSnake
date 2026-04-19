@@ -1,12 +1,13 @@
-# V3.5 single-sample overfit config for BTCV
-# Fourier-space diffusion: denoiser operates on K=16 Fourier coefficients
+# V3.7 single-sample overfit config
+# Anti-burr enhancement: circular conv smoothing + Laplacian regularisation + spectral loss
+# Based on V3.6 (V3.0 learnable query + V3.4 iterative refinement + Flow Matching)
 
 model: 'sbd'
 network: 'ro_34'
 task: 'snake'
-model_dir: "data/outputs/btcv_diffusion_dit_v3_5_single_overfit"
+model_dir: "data/outputs/btcv_diffusion_dit_v3_7_single_overfit"
 
-gpus: [0]
+gpus: [2]
 resume: false
 
 train_or_test: train
@@ -17,14 +18,14 @@ train:
     per_contour: false
 
     optim: 'adamw'
-    lr: 5e-5
+    lr: 1e-4
     milestones: (80, 120)
     gamma: 0.5
     batch_size: 1
     gradient_accumulation_steps: 1
     gradient_clip: 1.0
     weight_decay: 0.01
-    warmup_steps: 100
+    warmup_steps: 50
 
     epoch: 10000
     num_workers: 0
@@ -46,20 +47,38 @@ use_gt_det: false
 loss_scales: {det: 0, ex: 1.0, py: 1.2}
 
 use_diffusion_evolution: true
-diffusion_timesteps: 1000
-use_ddim_inference: true
+use_flow_matching: true
+flow_ode_steps: 50
 diffusion_loss_weight: 1.0
 diffusion_loss_type: 'adaptive'
 diffusion_disp_norm: true
 diffusion_disp_stats: "data/stats/btcv_disp_stats_octagon.json"
 
-# V3.5: Fourier-space diffusion
-use_dit_v3_5: true
-fourier_k: 16
-fourier_disp_stats: "data/stats/btcv_fourier_stats_K16_single_overfit.json"
+# V3.7: Anti-burr denoiser
+use_dit_v3_7: true
 dit_num_layers: 6
 dit_num_heads: 8
 dit_state_dim: 256
+
+# V3.7 specific: circular conv smoothing
+v3_7_smooth_kernel: 9
+v3_7_num_smooth_layers: 2
+v3_7_laplacian_weight: 0.1
+
+# V3.7 specific: spectral loss decomposition
+v3_7_spectral_loss_k: 16
+v3_7_hf_loss_weight: 0.1
+
+# V3.7 specific: per-step ODE smoothing during inference
+v3_7_ode_smooth_k: 12
+
+# V3.4-style iterative refinement
+use_iterative_refinement: true
+iterative_num_steps: 3
+iterative_fractions: [0.3333, 0.5, 1.0]
+
+# Final output post-process
+fourier_smooth_k: 12
 
 use_grpo: false
 heads: {'ct_hm': 9, 'wh': 2}

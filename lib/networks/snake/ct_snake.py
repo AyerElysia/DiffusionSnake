@@ -64,10 +64,6 @@ class Network(nn.Module):
                 loss_type=getattr(cfg, 'diffusion_loss_type', 'adaptive'),
                 # DiT 去噪器参数
                 use_dit_denoiser=getattr(cfg, 'use_dit_denoiser', False),
-                use_dit_v2=getattr(cfg, 'use_dit_v2', False),
-                use_dit_v2_1=getattr(cfg, 'use_dit_v2_1', False),
-                use_dit_v2_2=getattr(cfg, 'use_dit_v2_2', False),
-                use_dit_v2_3=getattr(cfg, 'use_dit_v2_3', False),
                 use_flow_matching=use_flow_matching,
                 flow_ode_steps=getattr(cfg, 'flow_ode_steps', 10),
                 dit_num_layers=getattr(cfg, 'dit_num_layers', 6),
@@ -242,4 +238,3 @@ class Network(nn.Module):
 def get_network(num_layers, heads, head_conv=256, down_ratio=4, det_dir=''):
     network = Network(num_layers, heads, head_conv, down_ratio, det_dir)
     return network
-

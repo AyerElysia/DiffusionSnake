@@ -41,7 +41,7 @@ V3.0 单样本过拟合 10k epoch 后的轮廓出现严重毛边。根因分析�
   - 新增 `fourier_smooth()` 静态方法
   - 在标准推理和迭代推理分支中集成
 - **配置**: `lib/config/config.py` → `fourier_smooth_k = 0`（0=禁用）
-- **测试脚本**: `test_fourier_smooth.py`
+- **测试脚本**: `test/test_fourier_smooth.py`
 - **测试配置**: `configs/btcv_diffusion_dit_v3_5_test_smooth.yaml`
 
 ### 2.3 测试结果
@@ -175,7 +175,7 @@ DiTDenoiserV3_5
 | `lib/networks/diffusion/dit_denoiser_v3_5.py` | V3.5 傅里叶空间去噪器 |
 | `configs/btcv_diffusion_dit_v3_5_single_overfit.yaml` | V3.5 单样本过拟合配置 |
 | `configs/btcv_diffusion_dit_v3_5_test_smooth.yaml` | Phase 1 后处理测试配置 |
-| `test_fourier_smooth.py` | Phase 1 测试脚本 |
+| `test/test_fourier_smooth.py` | Phase 1 测试脚本 |
 | `notion/jagged_edge_analysis_20260416.md` | 毛边根因分析 |
 | `notion/fourier_smooth_phase1_eval_20260416.md` | Phase 1 评估 |
 | `plan/v3_5_fourier_smooth_plan_20260416.md` | V3.5 改进方案 |

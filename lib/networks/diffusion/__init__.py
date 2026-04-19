@@ -3,8 +3,6 @@ from .ct_snake import get_network as get_ro
 from .pretrain_evolution import DiffusionEvolution
 from .grpo_evolution import GRPOEvolution
 from .dit_denoiser import DiTDenoiser
-from .dit_denoiser_v2 import DiTDenoiserV2
-from .dit_denoiser_v2_2 import DiTDenoiserV2_2
 
 _network_factory = {
     'ro': get_ro
@@ -35,7 +33,11 @@ def make_evolution(use_grpo=False, **kwargs):
         )
     if use_grpo:
         return GRPOEvolution(**kwargs)
-    return DiffusionEvolution(**kwargs)
+    diffusion_kwargs = dict(kwargs)
+    diffusion_kwargs.pop('use_flow_matching', None)
+    diffusion_kwargs.pop('flow_ode_steps', None)
+    diffusion_kwargs.pop('use_dit_v3_6', None)
+    return DiffusionEvolution(**diffusion_kwargs)
 
 def get_network(cfg):
     arch = cfg.network

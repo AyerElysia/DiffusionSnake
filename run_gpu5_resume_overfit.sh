@@ -16,8 +16,7 @@ run_one() {
     CUDA_VISIBLE_DEVICES=5 python -u diffusion_train.py --cfg_file "${cfg}" resume True > "${log_file}" 2>&1
 }
 
-run_one "configs/btcv_diffusion_dit_v2_single_overfit.yaml" "logs/v2_0_single_overfit_resume_gpu5.log"
-run_one "configs/btcv_diffusion_dit_v2_1_single_overfit.yaml" "logs/v2_1_single_overfit_resume_gpu5.log"
-run_one "configs/btcv_diffusion_dit_v2_2_single_overfit.yaml" "logs/v2_2_single_overfit_resume_gpu5.log"
+run_one "configs/btcv_diffusion_dit_v3_1_single_overfit.yaml" "logs/v3_1_single_overfit_resume_gpu5.log"
+run_one "configs/btcv_diffusion_dit_v3_3a_single_overfit.yaml" "logs/v3_3a_single_overfit_resume_gpu5.log"
 
 echo "All GPU 5 resume jobs finished."

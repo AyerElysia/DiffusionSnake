@@ -12,7 +12,10 @@ import matplotlib.pyplot as plt
 from pathlib import Path
 
 # 添加项目路径
-sys.path.insert(0, '/mnt/sdb1/leijh/DiffusionSnake/DiffusionSnake-12-30')
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
+os.chdir(PROJECT_ROOT)
 
 # 设置配置文件
 os.environ['CFG_FILE'] = 'configs/btcv_diffusion_dit_v3.yaml'

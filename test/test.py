@@ -1,5 +1,18 @@
 import sys
-sys.argv.extend(['--cfg_file', 'configs/sbd_snake.yaml', 'ct_score', '0.4', 'train_or_test', 'test'])
+from pathlib import Path
+
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
+
+sys.argv.extend([
+    '--cfg_file',
+    str(PROJECT_ROOT / 'configs' / 'sbd_snake.yaml'),
+    'ct_score',
+    '0.4',
+    'train_or_test',
+    'test',
+])
 
 from run import run_test_medical
 # import debugpy

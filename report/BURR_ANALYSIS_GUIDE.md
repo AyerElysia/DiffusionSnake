@@ -8,7 +8,7 @@
 
 ```bash
 cd /mnt/sdb1/leijh/DiffusionSnake/DiffusionSnake-12-30
-bash test_burr_analysis.sh
+bash test/test_burr_analysis.sh
 ```
 
 这会分析第0个样本，生成所有可视化结果。
@@ -195,7 +195,7 @@ for _ in range(n-1):
 
 1. **先运行测试**
    ```bash
-   bash test_burr_analysis.sh
+   bash test/test_burr_analysis.sh
    ```
 
 2. **查看第一个样本的结果**
@@ -219,7 +219,7 @@ for _ in range(n-1):
 - `analyze_point_order.py` - 点序分析模块
 - `edge_smoothing.py` - 平滑后处理模块（已有）
 - `run_burr_analysis.sh` - 批量运行脚本
-- `test_burr_analysis.sh` - 快速测试脚本
+- `test/test_burr_analysis.sh` - 快速测试脚本
 - `BURR_ANALYSIS_README.md` - 详细文档
 
 ## 注意事项

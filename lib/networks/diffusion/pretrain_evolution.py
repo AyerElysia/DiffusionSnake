@@ -12,9 +12,6 @@ import json
 
 from .snake_denoiser import SnakeDenoiser
 from .dit_denoiser import DiTDenoiser
-from .dit_denoiser_v2 import DiTDenoiserV2
-from .dit_denoiser_v2_2 import DiTDenoiserV2_2
-from .dit_denoiser_v2_2_hybrid import DiTDenoiserV2_2Hybrid
 from .dit_denoiser_v3 import DiTDenoiserV3
 from .dit_denoiser_v3_1 import DiTDenoiserV3_1
 from .dit_denoiser_v3_3 import DiTDenoiserV3_3  # NEW
@@ -45,13 +42,12 @@ def remap_legacy_state_dict(sd: dict) -> dict:
     return new_sd
 
 
-def _select_denoiser_type(global_cfg, use_dit_v2, use_dit_v2_1, use_dit_v2_2,
-                          use_dit_denoiser, use_hybrid=False):
+def _select_denoiser_type(global_cfg, use_dit_denoiser):
     """Determine denoiser type from config flags with clear precedence.
 
     Returns:
-        str: One of 'dit_v3_3', 'dit_v3_2', 'dit_v3_1', 'dit_v3', 'dit_v2_2_hybrid', 'dit_v2_2',
-             'dit_v2_1', 'dit_v2', 'dit_v1', 'snake'
+        str: One of 'dit_v3_5', 'dit_v3_3', 'dit_v3_2', 'dit_v3_1',
+             'dit_v3', 'dit_v1', 'snake'
     """
     if getattr(global_cfg, 'use_dit_v3_5', False):
         return 'dit_v3_5'
@@ -63,14 +59,6 @@ def _select_denoiser_type(global_cfg, use_dit_v2, use_dit_v2_1, use_dit_v2_2,
         return 'dit_v3_1'
     elif getattr(global_cfg, 'use_dit_v3', False):
         return 'dit_v3'
-    elif use_dit_v2_2:
-        if use_hybrid or getattr(global_cfg, 'use_hybrid', False):
-            return 'dit_v2_2_hybrid'
-        return 'dit_v2_2'
-    elif use_dit_v2_1:
-        return 'dit_v2_1'
-    elif use_dit_v2:
-        return 'dit_v2'
     elif use_dit_denoiser:
         return 'dit_v1'
     else:
@@ -95,12 +83,6 @@ class DiffusionEvolution(nn.Module):
         fusion_dim: int = 256,
         use_vm2: bool = True,
         use_dit_denoiser: bool = False,
-        use_dit_v2: bool = False,         # 新增：是否使用 DiT V2 (全面升级版)
-        use_dit_v2_1: bool = False,       # 新增：是否使用 DiT V2.1 (CNN Anchor Pooling 版)
-        use_dit_v2_2: bool = False,       # 新增：是否使用 DiT V2.2 (MM-DiT Patchify 版)
-        use_dit_v2_3: bool = False,       # 新增：是否使用 DiT V2.3
-        use_flow_matching: bool = False,  # 新增：是否使用 Flow Matching
-        flow_ode_steps: int = 10,         # Flow Matching ODE 步数
         dit_num_layers: int = 6,
         dit_num_heads: int = 8,
         dit_state_dim: int = 256,
@@ -119,10 +101,7 @@ class DiffusionEvolution(nn.Module):
             logger.info("[DiffusionEvolution] V3.4 iterative refinement enabled")
 
         # Determine denoiser type with clear precedence
-        denoiser_type = _select_denoiser_type(
-            global_cfg, use_dit_v2, use_dit_v2_1, use_dit_v2_2,
-            use_dit_denoiser, use_hybrid=getattr(global_cfg, 'use_hybrid', False)
-        )
+        denoiser_type = _select_denoiser_type(global_cfg, use_dit_denoiser)
 
         # V3.5: Fourier-space diffusion config
         self.use_fourier_diffusion = (denoiser_type == 'dit_v3_5')
@@ -182,41 +161,6 @@ class DiffusionEvolution(nn.Module):
                 num_heads=dit_num_heads,
                 num_points=num_points,
             )
-        elif denoiser_type == 'dit_v2_2_hybrid':
-            logger.info("[DiffusionEvolution] Using HYBRID DiT Denoiser V2.2 (Odd-Even Injection)")
-            self.denoiser = DiTDenoiserV2_2Hybrid(
-                state_dim=dit_state_dim,
-                feature_dim=feature_dim,
-                num_layers=dit_num_layers,
-                num_heads=dit_num_heads,
-                num_points=num_points,
-            )
-        elif denoiser_type == 'dit_v2_2':
-            logger.info(
-                f"[DiffusionEvolution] Using DiT Denoiser V2.2 (MM-DiT Patchify) "
-                f"(layers={dit_num_layers}, heads={dit_num_heads}, dim={dit_state_dim})"
-            )
-            self.denoiser = DiTDenoiserV2_2(
-                state_dim=dit_state_dim,
-                feature_dim=feature_dim,
-                num_layers=dit_num_layers,
-                num_heads=dit_num_heads,
-                num_points=num_points,
-            )
-        elif denoiser_type in ('dit_v2_1', 'dit_v2'):
-            ver = "V2.1 (Anchor Pool)" if denoiser_type == 'dit_v2_1' else "V2"
-            logger.info(
-                f"[DiffusionEvolution] Using DiT Denoiser {ver} "
-                f"(layers={dit_num_layers}, heads={dit_num_heads}, dim={dit_state_dim})"
-            )
-            self.denoiser = DiTDenoiserV2(
-                state_dim=dit_state_dim,
-                feature_dim=feature_dim,
-                num_layers=dit_num_layers,
-                num_heads=dit_num_heads,
-                num_points=num_points,
-                use_v2_1=(denoiser_type == 'dit_v2_1'),
-            )
         elif denoiser_type == 'dit_v1':
             logger.info("[DiffusionEvolution] Using DiT Denoiser V1")
             self.denoiser = DiTDenoiser(
@@ -272,6 +216,11 @@ class DiffusionEvolution(nn.Module):
         self._disp_max = None
         self._load_disp_stats(getattr(global_cfg, 'diffusion_disp_stats', ''))
 
+        # Fourier-domain statistics for V3.5 normalization
+        self._fourier_mean = None
+        self._fourier_std = None
+        self._load_fourier_stats(getattr(global_cfg, 'fourier_disp_stats', ''))
+
     def _load_disp_stats(self, stats_path: str) -> None:
         if (not self._disp_norm_enabled) or (not stats_path):
             return
@@ -306,6 +255,41 @@ class DiffusionEvolution(nn.Module):
             self._disp_norm_enabled = False
             raise
 
+    def _load_fourier_stats(self, stats_path: str) -> None:
+        """Load Fourier-domain normalization statistics (mean/std)."""
+        if not stats_path:
+            return
+        try:
+            if not os.path.exists(stats_path):
+                logger.warning(f"Fourier stats file not found: {stats_path}, will use spatial-based normalization")
+                return
+            with open(stats_path, 'r') as f:
+                s = json.load(f)
+            mean_val = float(s.get('fourier_global_mean', 0.0))
+            std_val = float(s.get('fourier_global_std', 1.0))
+            if std_val < 1e-8:
+                logger.warning(f"Fourier std too small ({std_val}), skipping Fourier stats")
+                return
+            fourier_mean = torch.tensor(mean_val, dtype=torch.float32)
+            fourier_std = torch.tensor(std_val, dtype=torch.float32)
+            for attr in ('_fourier_mean', '_fourier_std'):
+                if hasattr(self, attr) and not isinstance(getattr(self, attr, None), torch.Tensor):
+                    try:
+                        delattr(self, attr)
+                    except Exception:
+                        pass
+            self.register_buffer('_fourier_mean', fourier_mean)
+            self.register_buffer('_fourier_std', fourier_std)
+            logger.info(f"[DiffusionEvolution] Loaded Fourier stats: mean={mean_val:.4f}, std={std_val:.4f}")
+        except Exception as e:
+            logger.warning(f"Failed to load Fourier stats: {e}")
+
+    def _has_fourier_stats(self) -> bool:
+        return (
+            isinstance(getattr(self, '_fourier_mean', None), torch.Tensor)
+            and isinstance(getattr(self, '_fourier_std', None), torch.Tensor)
+        )
+
     def _has_disp_stats(self) -> bool:
         return (
             self._disp_norm_enabled
@@ -326,20 +310,26 @@ class DiffusionEvolution(nn.Module):
         return (disp_norm + 1.0) * 0.5 * scale.to(disp_norm.device, disp_norm.dtype) + self._disp_min.to(disp_norm.device, disp_norm.dtype)
 
     def normalize_disp_fourier(self, fourier_coeff: torch.Tensor) -> torch.Tensor:
-        """Normalize Fourier coefficients to roughly [-1, 1].
-        torch.fft.rfft output scales with N (num_points): DC = sum of values,
-        k-th harmonic ≈ amplitude × N/2.  So the correct scale for Fourier
-        coefficients is  spatial_range × num_points / 2.
+        """Normalize Fourier coefficients for diffusion.
+        Uses Fourier-domain statistics (mean/std) when available for proper
+        standardization. Falls back to spatial-range-based scaling otherwise.
         """
+        if self._has_fourier_stats():
+            mean = self._fourier_mean.to(fourier_coeff.device, fourier_coeff.dtype)
+            std = self._fourier_std.to(fourier_coeff.device, fourier_coeff.dtype)
+            return (fourier_coeff - mean) / std
         if not self._has_disp_stats():
             return fourier_coeff
         spatial_range = (self._disp_max - self._disp_min).clamp_min(1e-12)
-        # Account for FFT scaling factor (N/2)
         fft_scale = spatial_range.max().to(fourier_coeff.device, fourier_coeff.dtype) * (self.num_points / 2.0)
         return fourier_coeff / (fft_scale + 1e-8)
 
     def denormalize_disp_fourier(self, fourier_norm: torch.Tensor) -> torch.Tensor:
         """Denormalize Fourier coefficients back to original scale."""
+        if self._has_fourier_stats():
+            mean = self._fourier_mean.to(fourier_norm.device, fourier_norm.dtype)
+            std = self._fourier_std.to(fourier_norm.device, fourier_norm.dtype)
+            return fourier_norm * std + mean
         if not self._has_disp_stats():
             return fourier_norm
         spatial_range = (self._disp_max - self._disp_min).clamp_min(1e-12)

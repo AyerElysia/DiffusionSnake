@@ -19,11 +19,9 @@ launch() {
     echo "Started ${session} on GPU ${gpu}: ${cfg}"
 }
 
-launch "v2_resume_gpu5" 5 "configs/btcv_diffusion_dit_v2_single_overfit.yaml" "logs/v2_single_overfit_resume_gpu5.log"
-launch "v2_1_resume_gpu5" 5 "configs/btcv_diffusion_dit_v2_1_single_overfit.yaml" "logs/v2_1_single_overfit_resume_gpu5.log"
-launch "v2_2_resume_gpu5" 5 "configs/btcv_diffusion_dit_v2_2_single_overfit.yaml" "logs/v2_2_single_overfit_resume_gpu5.log"
-launch "v2_3_resume_gpu6" 6 "configs/btcv_diffusion_dit_v2_3_single_overfit_gpu6.yaml" "logs/v2_3_single_overfit_resume_gpu6.log"
-launch "v3_1_resume_gpu7" 7 "configs/btcv_diffusion_dit_v3_1_single_overfit.yaml" "logs/v3_1_single_overfit_resume_gpu7.log"
-launch "v3_2_resume_gpu7" 7 "configs/btcv_diffusion_dit_v3_2_single_overfit.yaml" "logs/v3_2_single_overfit_resume_gpu7.log"
+launch "v3_1_resume_gpu5" 5 "configs/btcv_diffusion_dit_v3_1_single_overfit.yaml" "logs/v3_1_single_overfit_resume_gpu5.log"
+launch "v3_2_resume_gpu6" 6 "configs/btcv_diffusion_dit_v3_2_single_overfit.yaml" "logs/v3_2_single_overfit_resume_gpu6.log"
+launch "v3_4_resume_gpu7" 7 "configs/btcv_diffusion_dit_v3_4_single_overfit.yaml" "logs/v3_4_single_overfit_resume_gpu7.log"
+launch "v3_6_resume_gpu0" 0 "configs/btcv_diffusion_dit_v3_6_single_overfit.yaml" "logs/v3_6_single_overfit_resume_gpu0.log"
 
 echo "All unfinished single-sample runs have been launched."

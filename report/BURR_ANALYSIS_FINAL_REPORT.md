@@ -317,7 +317,7 @@ disp = core.gcn.sample_disp(..., steps=100)  # 从50改为100
 ### 快速测试
 ```bash
 cd /mnt/sdb1/leijh/DiffusionSnake/DiffusionSnake-12-30
-bash test_burr_analysis.sh
+bash test/test_burr_analysis.sh
 ```
 
 ### 批量分析

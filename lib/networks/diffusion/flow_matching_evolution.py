@@ -39,8 +39,26 @@ class FlowMatchingEvolution(nn.Module):
         )
         self.use_fourier_smooth = int(getattr(global_cfg, 'fourier_smooth_k', 0))
 
+        # V3.7: Anti-burr enhancement (circular conv + Laplacian + spectral loss)
+        if getattr(global_cfg, 'use_dit_v3_7', False):
+            from .dit_denoiser_v3_7 import DiTFlowMatchingV3_7
+            _smooth_k = int(getattr(global_cfg, 'v3_7_smooth_kernel', 9))
+            _n_smooth = int(getattr(global_cfg, 'v3_7_num_smooth_layers', 2))
+            _lap_w = float(getattr(global_cfg, 'v3_7_laplacian_weight', 0.1))
+            print(f"[FlowMatchingEvolution] Using DiT Flow Network V3.7 "
+                  f"(Anti-burr, smooth_k={_smooth_k}, lap_w={_lap_w}, ODE steps={ode_steps})")
+            self.denoiser = DiTFlowMatchingV3_7(
+                state_dim=dit_state_dim,
+                feature_dim=feature_dim,
+                num_layers=dit_num_layers,
+                num_heads=dit_num_heads,
+                num_points=num_points,
+                smooth_kernel_size=_smooth_k,
+                num_smooth_layers=_n_smooth,
+                laplacian_weight=_lap_w,
+            )
         # V3.6: V3 global query + iterative refinement + Flow Matching
-        if getattr(global_cfg, 'use_dit_v3_6', False):
+        elif getattr(global_cfg, 'use_dit_v3_6', False):
             from .dit_denoiser_v3_6 import DiTFlowMatchingV3_6
             print(f"[FlowMatchingEvolution] Using DiT Flow Network V3.6 "
                   f"(V3 global query + iterative refinement, ODE steps={ode_steps})")
@@ -63,28 +81,29 @@ class FlowMatchingEvolution(nn.Module):
                 num_heads=dit_num_heads,
                 num_points=num_points,
             )
-        # V2.3 Hybrid: Joint Attention with Odd-Even Injection
-        elif getattr(global_cfg, 'use_hybrid', False):
-            from .dit_denoiser_v2_3_hybrid import DiTFlowMatchingHybrid
-            print(f"[FlowMatchingEvolution] Using HYBRID Flow Network V2.3 (Odd-Even Injection)")
-            self.denoiser = DiTFlowMatchingHybrid(
-                state_dim=dit_state_dim,
-                feature_dim=feature_dim,
-                num_layers=dit_num_layers,
-                num_heads=dit_num_heads,
-                num_points=num_points,
-            )
-        # V2.3 Default: Joint Attention MM-DiT
+        # Default fallback after V2 archive: use V3.2 flow denoiser.
         else:
-            from .dit_denoiser_v2_3 import DiTFlowMatchingV2_3
-            print(f"[FlowMatchingEvolution] Using DiT Flow Network V2.3 (MM-DiT Joint)")
-            self.denoiser = DiTFlowMatchingV2_3(
+            from .dit_denoiser_v3_2 import DiTFlowMatchingV3_2
+            print(f"[FlowMatchingEvolution] Using default DiT Flow Network V3.2 "
+                  f"(Self+Cross + Patchify, ODE steps={ode_steps})")
+            self.denoiser = DiTFlowMatchingV3_2(
                 state_dim=dit_state_dim,
                 feature_dim=feature_dim,
                 num_layers=dit_num_layers,
                 num_heads=dit_num_heads,
                 num_points=num_points,
             )
+
+        # V3.7: per-step ODE smoothing
+        self._ode_smooth_k = int(getattr(global_cfg, 'v3_7_ode_smooth_k', 0))
+        # V3.7: spectral loss decomposition
+        self._spectral_loss_k = int(getattr(global_cfg, 'v3_7_spectral_loss_k', 0))
+        self._hf_loss_weight = float(getattr(global_cfg, 'v3_7_hf_loss_weight', 0.1))
+        # V3.7.3: low-noise flow matching (default 1.0 = standard)
+        self._flow_noise_scale = float(getattr(global_cfg, 'flow_noise_scale', 1.0))
+        # V3.7.3: inference averaging
+        self._infer_avg_samples = int(getattr(global_cfg, 'infer_avg_samples', 0))
+        self._infer_noise_scale = float(getattr(global_cfg, 'infer_noise_scale', -1.0))
 
         # CMAM 先验参数保留 (以防外部调用)
         self.compute_L = True
@@ -162,8 +181,7 @@ class FlowMatchingEvolution(nn.Module):
         # 将 t_[0,1] 转换到类似于 1~1000 以供 time_embedder 分辨
         t_scaled = t_continuous * 1000.0
         
-        # DiT V2.3: 核心调用，务必传入 sampled_feat
-        # 对应 DiTFlowMatchingV2_3.forward(cnn_feature, sampled_feat, x_t, t_scaled, ...)
+        # Flow denoiser 核心调用，务必传入 sampled_feat
         v_pred, L = self.denoiser(cnn_feature, sampled_feat, x_t, t_scaled, adj, polys=i_it_py, py_ind=py_ind)
         return v_pred, L
 
@@ -175,13 +193,17 @@ class FlowMatchingEvolution(nn.Module):
         py_ind,
         sampled_feat,
         steps=None,
+        noise_scale=None,
     ) -> torch.Tensor:
         if steps is None:
             steps = self.ode_steps
+        if noise_scale is None:
+            ns = self._infer_noise_scale
+            noise_scale = self._flow_noise_scale if ns < 0 else ns
 
         device = i_it_py.device
         N = i_it_py.size(0)
-        x_t = torch.randn_like(i_it_py)
+        x_t = torch.randn_like(i_it_py) * noise_scale
         dt = 1.0 / steps
         for i in range(steps):
             t_val = i * dt
@@ -190,12 +212,16 @@ class FlowMatchingEvolution(nn.Module):
                 cnn_feature, i_it_py, c_it_py, sampled_feat, py_ind, x_t, t_tensor
             )
             x_t = x_t + v_pred * dt
+            # V3.7: per-step ODE Fourier smoothing
+            if self._ode_smooth_k > 0:
+                x_t = self.fourier_smooth(x_t, self._ode_smooth_k)
 
         return self.denormalize_disp(x_t)
 
     def sample_disp(self, cnn_feature, i_it_py, c_it_py, py_ind, steps=None) -> torch.Tensor:
         """
-        Euler ODE Solver for Flow Matching
+        Euler ODE Solver for Flow Matching.
+        V3.7.3: supports multi-trajectory averaging via infer_avg_samples config.
         """
         if steps is None:
             steps = self.ode_steps
@@ -206,6 +232,16 @@ class FlowMatchingEvolution(nn.Module):
         
         # 推理时：先进行一次特征采样
         sampled_feat = snake_gcn_utils.get_gcn_feature(cnn_feature, i_it_py, py_ind, h, w)
+
+        avg_n = self._infer_avg_samples
+        if avg_n > 1:
+            all_disps = []
+            for _ in range(avg_n):
+                d = self._sample_disp_from_sampled_feat(
+                    cnn_feature, i_it_py, c_it_py, py_ind, sampled_feat, steps=steps)
+                all_disps.append(d)
+            return torch.stack(all_disps).mean(dim=0)
+
         return self._sample_disp_from_sampled_feat(
             cnn_feature, i_it_py, c_it_py, py_ind, sampled_feat, steps=steps
         )
@@ -304,18 +340,28 @@ class FlowMatchingEvolution(nn.Module):
 
             # --- Flow Matching Core ---
             t = torch.rand(N, device=device).view(N, 1, 1)
-            x0 = torch.randn_like(x1)
+            x0 = torch.randn_like(x1) * self._flow_noise_scale
             x_t = (1.0 - t) * x0 + t * x1
 
             # --- 特征采样 & 预测 ---
             sampled_feat_curr = snake_gcn_utils.get_gcn_feature(cnn_feature, i_init_train_py, py_ind, h, w)
-            v_pred, _ = self.predict_velocity(cnn_feature, i_init_train_py, c_init_train_py, sampled_feat_curr, py_ind, x_t, t.view(-1))
+            v_pred, L_reg = self.predict_velocity(cnn_feature, i_init_train_py, c_init_train_py, sampled_feat_curr, py_ind, x_t, t.view(-1))
 
             # 5. 计算目标速度 V_target = X_1 - X_0
             v_target = x1 - x0
 
-            # 6. Flow Matching Loss
-            loss = F.mse_loss(v_pred, v_target, reduction='mean')
+            # 6. Flow Matching Loss (V3.7: optional spectral decomposition)
+            if self._spectral_loss_k > 0 and v_pred.size(1) > self._spectral_loss_k * 2:
+                v_pred_lf = self.fourier_smooth(v_pred, self._spectral_loss_k)
+                v_target_lf = self.fourier_smooth(v_target, self._spectral_loss_k)
+                loss_lf = F.mse_loss(v_pred_lf, v_target_lf, reduction='mean')
+                loss_hf = F.mse_loss(v_pred - v_pred_lf, v_target - v_target_lf, reduction='mean')
+                loss = loss_lf + self._hf_loss_weight * loss_hf
+            else:
+                loss = F.mse_loss(v_pred, v_target, reduction='mean')
+
+            # Add denoiser regularisation (Laplacian from V3.7, zero for others)
+            loss = loss + L_reg
 
             ret.update({
                 'diff_loss': loss,

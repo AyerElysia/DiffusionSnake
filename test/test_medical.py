@@ -14,9 +14,6 @@ from lib.visualizers import make_visualizer
 import sys
 import torch.nn.functional as F
 import re
-from tools.crf.crf_integration import CRFDataConverter
-from tools.crf.crf_postprocessor import CRFPostProcessor
-from tools.crf.build_crf_mat import collect_for_train, collect_for_test
 
 # 230
 TRAIN_IDS = [0, 1, 2, 3, 5, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 20, 21, 22, 23, 24, 25, 27, 28, 30, 31, 33, 34, 35, 36, 37, 38, 39, 41, 42, 43, 45, 46, 47, 48, 50, 51, 52, 53, 54, 55, 56, 57, 60, 61, 62, 63, 64, 65, 66, 67, 68, 69, 70, 72, 73, 74, 75, 77, 78, 79, 80, 81, 82, 83, 84, 85, 86, 87, 88, 89, 90, 91, 93, 94, 97, 98, 99, 100, 102, 103, 105, 106, 107, 108, 109, 110, 111, 113, 114, 117, 118, 120, 121, 122, 123, 124, 125, 126, 127, 128, 129, 130, 133, 135, 136, 137, 138, 139, 140, 141, 143, 144, 145, 147, 148, 149, 150, 151, 152, 153, 154, 155, 156, 157, 158, 159, 160, 163, 166, 168, 169, 170, 171, 174, 175, 177, 178, 179, 180, 181, 182, 183, 184, 185, 186, 187, 188, 189, 190, 191, 193, 194, 195, 196, 197, 198, 199, 200, 202, 203, 204, 208, 210, 212, 215, 216, 217, 218, 219, 221, 222, 223, 224, 225, 226, 227, 228]
@@ -648,13 +645,6 @@ def TEST():
         63: (0, 30, 200)     
         }
 
-    # 初始化CRF后处理器
-    crf_converter = CRFDataConverter()
-    crf_postprocessor = CRFPostProcessor()
-    # 伪代码：在你的测试/训练遍历里收集
-    train_samples = []
-    test_samples = []
-
     for batch, img_path in tqdm.tqdm(dataset):
         img_name = img_path.split('/')[-1]
         img = cv2.imread(img_path)
@@ -672,22 +662,6 @@ def TEST():
             #     for cls, count in zip(unique_classes, counts):
             #         print(f"  类别 {int(cls)}: {count} 个检测结果")
 
-
-            # # === 新增：CRF后处理 ===
-            # if detection.shape[1] > 0:  # 确保有检测结果
-            #     # 提取特征
-            #     features = crf_converter.extract_features_from_detection(detection, poly[-1])
-                
-            #     # 应用CRF修正
-            #     corrected_detection, corrected_poly = crf_postprocessor.apply_crf_correction(
-            #         detection, poly[-1], features)
-                
-            #     # 使用修正后的结果
-            #     detection = corrected_detection
-            #     poly = [corrected_poly]  # 保持原有格式
-                       
-            
-    
             # ===== 评估 =====
             # 预测实例掩码与类别
             # 处理GT掩码，按类别分组
@@ -729,13 +703,6 @@ def TEST():
             #         print(f"poly {i} convert label from {detection[0, i, 5]+1} to {label}")
             #         detection[0, i, 5] = label
                 
-    #         # 每张图推理后:
-    #         train_samples.append({'detection': detection})  # 训练集
-    #         test_samples.append({'detection': detection, 'rpn': None})  # 测试集
-    # # 跑完后保存
-    # collect_for_train(train_samples, '/mnt/sdb1/leijh/EnergySnake1/EnergeSnake1/tools/crf/rpn_and_detections_train0.mat', max_dets=20)
-    # collect_for_test(test_samples, '/mnt/sdb1/leijh/EnergySnake1/EnergeSnake1/tools/crf/rpn_and_detections_test0.mat', max_rois=100, max_dets=100)
-            
             # 如果没有找到按类别分组的掩码，使用原始方式
             if not gt_masks:
                 for maskpath in mask_paths:

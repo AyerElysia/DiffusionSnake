@@ -1,12 +1,15 @@
-# V3.5 single-sample overfit config for BTCV
-# Fourier-space diffusion: denoiser operates on K=16 Fourier coefficients
+# V3.7.5 single-sample overfit config
+# MOST AGGRESSIVE: noise_scale ≈ 0 → velocity field becomes direct displacement prediction
+# With ODE 1 step: x(1) = 0 + v(0,0)*1 = v(0,0) = x_1 (exact!)
+# This degenerates flow matching into pure supervised regression
+# Expected: fastest convergence, highest potential IoU
 
 model: 'sbd'
 network: 'ro_34'
 task: 'snake'
-model_dir: "data/outputs/btcv_diffusion_dit_v3_5_single_overfit"
+model_dir: "data/outputs/btcv_diffusion_dit_v3_7_5_single_overfit"
 
-gpus: [0]
+gpus: [4]
 resume: false
 
 train_or_test: train
@@ -17,7 +20,7 @@ train:
     per_contour: false
 
     optim: 'adamw'
-    lr: 5e-5
+    lr: 3e-4
     milestones: (80, 120)
     gamma: 0.5
     batch_size: 1
@@ -28,7 +31,7 @@ train:
 
     epoch: 10000
     num_workers: 0
-    save_ep: 500
+    save_ep: 200
 
 test:
     dataset: 'BtcvMini'
@@ -46,20 +49,39 @@ use_gt_det: false
 loss_scales: {det: 0, ex: 1.0, py: 1.2}
 
 use_diffusion_evolution: true
-diffusion_timesteps: 1000
-use_ddim_inference: true
+use_flow_matching: true
+flow_ode_steps: 1
 diffusion_loss_weight: 1.0
 diffusion_loss_type: 'adaptive'
 diffusion_disp_norm: true
 diffusion_disp_stats: "data/stats/btcv_disp_stats_octagon.json"
 
-# V3.5: Fourier-space diffusion
-use_dit_v3_5: true
-fourier_k: 16
-fourier_disp_stats: "data/stats/btcv_fourier_stats_K16_single_overfit.json"
+# V3.7 architecture (anti-burr circular conv)
+use_dit_v3_7: true
 dit_num_layers: 6
 dit_num_heads: 8
 dit_state_dim: 256
+
+# Circular conv smoothing
+v3_7_smooth_kernel: 9
+v3_7_num_smooth_layers: 2
+v3_7_laplacian_weight: 0.005
+
+# Plain MSE loss
+v3_7_spectral_loss_k: 0
+v3_7_hf_loss_weight: 0.1
+v3_7_ode_smooth_k: 0
+
+# === V3.7.5: near-zero noise = direct regression ===
+flow_noise_scale: 0.001
+
+# Inference: deterministic (zero noise, 1 ODE step)
+infer_avg_samples: 1
+infer_noise_scale: 0.0
+
+# No iterative refinement
+use_iterative_refinement: false
+fourier_smooth_k: 0
 
 use_grpo: false
 heads: {'ct_hm': 9, 'wh': 2}

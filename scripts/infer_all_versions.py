@@ -3,7 +3,7 @@ import sys, os; sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(
 """
 Full-Version Comparison Inference Script (DiT-Snake Ensemble)
 -------------------------------------------------------------
-自动化遍历 V1~V3 所有版本，并对同一个样本进行扩散演化对比。
+自动化遍历 V3 系列版本，并对同一个样本进行扩散演化对比。
 """
 import os
 import sys
@@ -16,8 +16,9 @@ from pathlib import Path
 
 # 默认配置文件引导 (防止 lib.config 找不到默认项)
 _THIS_DIR = os.path.dirname(__file__)
+_REPO_ROOT = os.path.abspath(os.path.join(_THIS_DIR, '..'))
 if not os.environ.get('CFG_FILE'):
-    os.environ['CFG_FILE'] = os.path.join(_THIS_DIR, 'configs', 'btcv_diffusion_dit_v3.yaml')
+    os.environ['CFG_FILE'] = os.path.join(_REPO_ROOT, 'configs', 'btcv_diffusion_dit_v3.yaml')
 
 from lib.config import cfg, args
 from lib.networks import make_network
@@ -50,7 +51,7 @@ def load_version_model(cfg_path):
     
     # 自动定位权重
     cfg_stem = Path(cfg_path).stem
-    ckpt_path = os.path.join(_THIS_DIR, 'data', 'outputs', cfg_stem, 'checkpoints', 'latest.pt')
+    ckpt_path = os.path.join(_REPO_ROOT, 'data', 'outputs', cfg_stem, 'checkpoints', 'latest.pt')
     
     if os.path.exists(ckpt_path):
         print(f"[*] Loading {cfg_stem} from: {ckpt_path}")
@@ -112,11 +113,12 @@ def run_inference(model, device, version_cfg, batch):
 def main():
     # 1. 扫描所有配置文件
     configs = [
-        'configs/btcv_diffusion_dit_v2.yaml',
-        'configs/btcv_diffusion_dit_v2_1.yaml',
-        'configs/btcv_diffusion_dit_v2_2.yaml',
-        'configs/btcv_diffusion_dit_v2_3.yaml',
-        'configs/btcv_diffusion_dit_v3.yaml'
+        os.path.join(_REPO_ROOT, 'configs', 'btcv_diffusion_dit_v3.yaml'),
+        os.path.join(_REPO_ROOT, 'configs', 'btcv_diffusion_dit_v3_1.yaml'),
+        os.path.join(_REPO_ROOT, 'configs', 'btcv_diffusion_dit_v3_2.yaml'),
+        os.path.join(_REPO_ROOT, 'configs', 'btcv_diffusion_dit_v3_4.yaml'),
+        os.path.join(_REPO_ROOT, 'configs', 'btcv_diffusion_dit_v3_5_single_overfit.yaml'),
+        os.path.join(_REPO_ROOT, 'configs', 'btcv_diffusion_dit_v3_6_single_overfit.yaml'),
     ]
     
     # 2. 预先随机挑选一个样本
@@ -130,7 +132,7 @@ def main():
     img_item = batch_raw['orig_img'][0]
     orig_img = to_numpy(img_item).astype(np.uint8)
     
-    save_dir = os.path.join(_THIS_DIR, 'visual', 'all_version_comparison')
+    save_dir = os.path.join(_REPO_ROOT, 'visual', 'all_version_comparison')
     os.makedirs(save_dir, exist_ok=True)
     ts = datetime.datetime.now().strftime('%m%d_%H%M')
     

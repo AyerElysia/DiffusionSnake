@@ -10,30 +10,6 @@ from pathlib import Path
 # 模型配置列表
 MODELS = [
     {
-        'name': 'V2.0',
-        'cfg': 'configs/btcv_diffusion_dit_v2_single_overfit.yaml',
-        'ckpt': 'data/outputs/btcv_diffusion_dit_v2_single_overfit/checkpoints/latest.pt',
-        'output': 'visual/v2_0_single_overfit_infer'
-    },
-    {
-        'name': 'V2.1',
-        'cfg': 'configs/btcv_diffusion_dit_v2_1_single_overfit.yaml',
-        'ckpt': 'data/outputs/btcv_diffusion_dit_v2_1_single_overfit/checkpoints/latest.pt',
-        'output': 'visual/v2_1_single_overfit_infer'
-    },
-    {
-        'name': 'V2.2',
-        'cfg': 'configs/btcv_diffusion_dit_v2_2_single_overfit.yaml',
-        'ckpt': 'data/outputs/btcv_diffusion_dit_v2_2_single_overfit/checkpoints/latest.pt',
-        'output': 'visual/v2_2_single_overfit_infer'
-    },
-    {
-        'name': 'V2.3',
-        'cfg': 'configs/btcv_diffusion_dit_v2_3_single_overfit_gpu6.yaml',
-        'ckpt': 'data/outputs/btcv_diffusion_dit_v2_3_single_overfit_gpu6/checkpoints/latest.pt',
-        'output': 'visual/v2_3_single_overfit_infer'
-    },
-    {
         'name': 'V3.1',
         'cfg': 'configs/btcv_diffusion_dit_v3_1_single_overfit.yaml',
         'ckpt': 'data/outputs/btcv_diffusion_dit_v3_1_single_overfit/checkpoints/latest.pt',
@@ -44,6 +20,24 @@ MODELS = [
         'cfg': 'configs/btcv_diffusion_dit_v3_2_single_overfit.yaml',
         'ckpt': 'data/outputs/btcv_diffusion_dit_v3_2_single_overfit/checkpoints/latest.pt',
         'output': 'visual/v3_2_single_overfit_infer'
+    },
+    {
+        'name': 'V3.4',
+        'cfg': 'configs/btcv_diffusion_dit_v3_4_single_overfit.yaml',
+        'ckpt': 'data/outputs/btcv_diffusion_dit_v3_4_single_overfit/checkpoints/latest.pt',
+        'output': 'visual/v3_4_single_overfit_infer'
+    },
+    {
+        'name': 'V3.5',
+        'cfg': 'configs/btcv_diffusion_dit_v3_5_single_overfit.yaml',
+        'ckpt': 'data/outputs/btcv_diffusion_dit_v3_5_single_overfit/checkpoints/latest.pt',
+        'output': 'visual/v3_5_single_overfit_infer'
+    },
+    {
+        'name': 'V3.6',
+        'cfg': 'configs/btcv_diffusion_dit_v3_6_single_overfit.yaml',
+        'ckpt': 'data/outputs/btcv_diffusion_dit_v3_6_single_overfit/checkpoints/latest.pt',
+        'output': 'visual/v3_6_single_overfit_infer'
     },
 ]
 

@@ -1,0 +1,94 @@
+# V3.7.3 single-sample overfit config
+# Key innovation: LOW-NOISE flow matching (noise_scale=0.1)
+# - Makes velocity field nearly constant (v ≈ x_1), MUCH easier to learn
+# - Aligned inference: noise_scale=0.1 + multi-trajectory averaging + few ODE steps
+# - CircularConv smoothing for anti-burr
+# - Plain MSE loss for accuracy
+
+model: 'sbd'
+network: 'ro_34'
+task: 'snake'
+model_dir: "data/outputs/btcv_diffusion_dit_v3_7_3_single_overfit"
+
+gpus: [0]
+resume: false
+
+train_or_test: train
+
+train:
+    dataset: 'BtcvMini'
+    data_path: '/mnt/sdb1/leijh/DiffusionSnake/Datasets/BTCV/btcv_png_single_overfit'
+    per_contour: false
+
+    optim: 'adamw'
+    lr: 3e-4
+    milestones: (80, 120)
+    gamma: 0.5
+    batch_size: 1
+    gradient_accumulation_steps: 1
+    gradient_clip: 1.0
+    weight_decay: 0.01
+    warmup_steps: 100
+
+    epoch: 20000
+    num_workers: 0
+    save_ep: 1000
+
+test:
+    dataset: 'BtcvMini'
+    batch_size: 1
+    img_path: '/mnt/sdb1/leijh/DiffusionSnake/Datasets/BTCV/btcv_png_single_overfit'
+    epoch: -1
+
+use_nms_for_snake: true
+det_conf_thresh: 0.01
+det_iou_thresh: 0.45
+det_max_det: 100
+per_class_nms: true
+use_gt_det: false
+
+loss_scales: {det: 0, ex: 1.0, py: 1.2}
+
+use_diffusion_evolution: true
+use_flow_matching: true
+flow_ode_steps: 10
+diffusion_loss_weight: 1.0
+diffusion_loss_type: 'adaptive'
+diffusion_disp_norm: true
+diffusion_disp_stats: "data/stats/btcv_disp_stats_octagon.json"
+
+# V3.7 architecture (anti-burr circular conv)
+use_dit_v3_7: true
+dit_num_layers: 6
+dit_num_heads: 8
+dit_state_dim: 256
+
+# Circular conv smoothing
+v3_7_smooth_kernel: 9
+v3_7_num_smooth_layers: 2
+v3_7_laplacian_weight: 0.01
+
+# Plain MSE loss (no spectral decomposition)
+v3_7_spectral_loss_k: 0
+v3_7_hf_loss_weight: 0.1
+
+# No per-step ODE smoothing (low noise doesn't need it)
+v3_7_ode_smooth_k: 0
+
+# === V3.7.3 KEY INNOVATION: low-noise flow matching ===
+flow_noise_scale: 0.1
+
+# === V3.7.3 inference: multi-trajectory averaging ===
+infer_avg_samples: 50
+infer_noise_scale: 0.1
+
+# Disable iterative refinement (proven to hurt performance)
+use_iterative_refinement: false
+
+# No Fourier post-process (low noise + averaging = smooth enough)
+fourier_smooth_k: 0
+
+use_grpo: false
+heads: {'ct_hm': 9, 'wh': 2}
+segm_or_bbox: 'segm'
+use_diffusion_trainer: true
