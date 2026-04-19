@@ -1,12 +1,14 @@
-# V3.6 single-sample overfit config
-# V3.0 learnable query + V3.4 iterative refinement + Flow Matching
+# V3.7.7 single-sample overfit config
+# Same as V3.7.6 (pure direct regression) but WITHOUT circular conv smoothing
+# Uses V3.6 (standard DiT) architecture to test if anti-burr layers help or hurt
+# Hypothesis: for pure regression, smoothing might limit precision
 
 model: 'sbd'
 network: 'ro_34'
 task: 'snake'
-model_dir: "data/outputs/btcv_diffusion_dit_v3_6_single_overfit"
+model_dir: "data/outputs/btcv_diffusion_dit_v3_7_7_single_overfit"
 
-gpus: [0]
+gpus: [2]
 resume: false
 
 train_or_test: train
@@ -17,14 +19,14 @@ train:
     per_contour: false
 
     optim: 'adamw'
-    lr: 5e-5
-    milestones: (80, 120)
+    lr: 5e-4
+    milestones: (3000, 6000, 8000)
     gamma: 0.5
     batch_size: 1
     gradient_accumulation_steps: 1
     gradient_clip: 1.0
-    weight_decay: 0.01
-    warmup_steps: 100
+    weight_decay: 0.05
+    warmup_steps: 50
 
     epoch: 10000
     num_workers: 0
@@ -47,27 +49,29 @@ loss_scales: {det: 0, ex: 1.0, py: 1.2}
 
 use_diffusion_evolution: true
 use_flow_matching: true
-flow_ode_steps: 10
-flow_noise_scale: 1.0
-flow_train_noise_scale: 0.0
+flow_ode_steps: 1
 diffusion_loss_weight: 1.0
 diffusion_loss_type: 'adaptive'
 diffusion_disp_norm: true
 diffusion_disp_stats: "data/stats/btcv_disp_stats_octagon.json"
 
-# V3.6: V3.0-style learnable query backbone
-use_dit_v3_6: true
+# Standard V3.6 architecture (NO circular conv)
+use_dit_v3_7: false
 dit_num_layers: 6
 dit_num_heads: 8
 dit_state_dim: 256
 
-# V3.4-style iterative refinement
-use_iterative_refinement: true
-iterative_num_steps: 3
-iterative_fractions: [0.3333, 0.5, 1.0]
+# === V3.7.7: PURE DIRECT REGRESSION (no smoothing) ===
+flow_noise_scale: 0.0
+flow_fix_t0: true
 
-# Final output post-process
-fourier_smooth_k: 12
+# Inference: deterministic single-step
+infer_avg_samples: 1
+infer_noise_scale: 0.0
+
+# No iterative refinement, no post-processing
+use_iterative_refinement: false
+fourier_smooth_k: 0
 
 use_grpo: false
 heads: {'ct_hm': 9, 'wh': 2}

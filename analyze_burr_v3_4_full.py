@@ -246,6 +246,10 @@ def run_full_image_inference(model, device, batch, save_dir):
         disp = core.gcn.sample_disp(cnn_feature, i_it_py, c_it_py, py_ind, steps=50)
         pred_polys = (i_it_py + disp).cpu().numpy() * dr
 
+        # 保存原始预测轮廓（用于后续分析）
+        np.save(os.path.join(save_dir, 'pred_contours_raw.npy'), pred_polys)
+        print(f"  [✔] 保存原始预测: {os.path.join(save_dir, 'pred_contours_raw.npy')}")
+
         # 平滑后处理
         smoothed_polys = []
         for poly in pred_polys:

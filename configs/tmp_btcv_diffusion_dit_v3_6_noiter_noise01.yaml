@@ -1,5 +1,5 @@
-# V3.6 single-sample overfit config
-# V3.0 learnable query + V3.4 iterative refinement + Flow Matching
+# Temporary debug config for V3.6 inference stability check
+# Based on btcv_diffusion_dit_v3_6_single_overfit.yaml
 
 model: 'sbd'
 network: 'ro_34'
@@ -48,28 +48,26 @@ loss_scales: {det: 0, ex: 1.0, py: 1.2}
 use_diffusion_evolution: true
 use_flow_matching: true
 flow_ode_steps: 10
-flow_noise_scale: 1.0
-flow_train_noise_scale: 0.0
 diffusion_loss_weight: 1.0
 diffusion_loss_type: 'adaptive'
 diffusion_disp_norm: true
 diffusion_disp_stats: "data/stats/btcv_disp_stats_octagon.json"
 
-# V3.6: V3.0-style learnable query backbone
 use_dit_v3_6: true
 dit_num_layers: 6
 dit_num_heads: 8
 dit_state_dim: 256
 
-# V3.4-style iterative refinement
-use_iterative_refinement: true
-iterative_num_steps: 3
-iterative_fractions: [0.3333, 0.5, 1.0]
+# Debug changes:
+use_iterative_refinement: false
+flow_noise_scale: 0.1
+infer_noise_scale: 0.1
+infer_avg_samples: 1
 
-# Final output post-process
 fourier_smooth_k: 12
 
 use_grpo: false
 heads: {'ct_hm': 9, 'wh': 2}
 segm_or_bbox: 'segm'
 use_diffusion_trainer: true
+

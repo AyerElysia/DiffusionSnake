@@ -133,11 +133,19 @@ def infer_one(model, device, sample, out_path):
                 fractions = list(getattr(cfg, 'iterative_fractions', []))
                 if not fractions:
                     fractions = [1.0 / (iter_steps - i) for i in range(iter_steps)]
-                ddim_steps = int(getattr(cfg, 'iterative_ddim_steps', 20))
-                disp = core.gcn.sample_disp_iterative(
-                    cnn_feature, i_it_py, c_it_py, py_ind,
-                    num_iter_steps=iter_steps, fractions=fractions, ddim_steps=ddim_steps,
-                )
+                # DiffusionEvolution uses `ddim_steps`; FlowMatchingEvolution uses `ode_steps`.
+                if hasattr(core.gcn, 'ode_steps'):
+                    ode_steps = int(getattr(core.gcn, 'ode_steps', getattr(cfg, 'flow_ode_steps', 10)))
+                    disp = core.gcn.sample_disp_iterative(
+                        cnn_feature, i_it_py, c_it_py, py_ind,
+                        num_iter_steps=iter_steps, fractions=fractions, ode_steps=ode_steps,
+                    )
+                else:
+                    ddim_steps = int(getattr(cfg, 'iterative_ddim_steps', 20))
+                    disp = core.gcn.sample_disp_iterative(
+                        cnn_feature, i_it_py, c_it_py, py_ind,
+                        num_iter_steps=iter_steps, fractions=fractions, ddim_steps=ddim_steps,
+                    )
             else:
                 disp = core.gcn.sample_disp(cnn_feature, i_it_py, c_it_py, py_ind)
             k = int(getattr(cfg, 'fourier_smooth_k', 0))

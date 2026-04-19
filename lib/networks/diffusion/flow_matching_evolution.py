@@ -39,23 +39,37 @@ class FlowMatchingEvolution(nn.Module):
         )
         self.use_fourier_smooth = int(getattr(global_cfg, 'fourier_smooth_k', 0))
 
-        # V3.7: Anti-burr enhancement (circular conv + Laplacian + spectral loss)
+        # V3.7: Per-Point Output Head (per-point embedding + per-point linear)
         if getattr(global_cfg, 'use_dit_v3_7', False):
             from .dit_denoiser_v3_7 import DiTFlowMatchingV3_7
-            _smooth_k = int(getattr(global_cfg, 'v3_7_smooth_kernel', 9))
-            _n_smooth = int(getattr(global_cfg, 'v3_7_num_smooth_layers', 2))
-            _lap_w = float(getattr(global_cfg, 'v3_7_laplacian_weight', 0.1))
+            _pt_scale = float(getattr(global_cfg, 'v3_7_point_embed_scale', 0.1))
+            _lap_w = float(getattr(global_cfg, 'v3_7_laplacian_weight', 0.0))
+            _inject_in = bool(getattr(global_cfg, 'v3_7_inject_at_input', False))
+            _inject_out = bool(getattr(global_cfg, 'v3_7_inject_at_output', False))
+            _per_pt = bool(getattr(global_cfg, 'v3_7_use_per_point_head', True))
+            _f64_head = bool(getattr(global_cfg, 'v3_7_use_float64_head', False))
+            _reg_pt = bool(getattr(global_cfg, 'v3_7_use_regularized_per_point', False))
+            _delta_scale = float(getattr(global_cfg, 'v3_7_delta_scale', 0.1))
+            _delta_reg = float(getattr(global_cfg, 'v3_7_delta_reg_weight', 0.001))
             print(f"[FlowMatchingEvolution] Using DiT Flow Network V3.7 "
-                  f"(Anti-burr, smooth_k={_smooth_k}, lap_w={_lap_w}, ODE steps={ode_steps})")
+                  f"(per_point_head={_per_pt}, regularized={_reg_pt}, "
+                  f"float64_head={_f64_head}, "
+                  f"inject_in={_inject_in}, inject_out={_inject_out}, ODE steps={ode_steps})")
             self.denoiser = DiTFlowMatchingV3_7(
                 state_dim=dit_state_dim,
                 feature_dim=feature_dim,
                 num_layers=dit_num_layers,
                 num_heads=dit_num_heads,
                 num_points=num_points,
-                smooth_kernel_size=_smooth_k,
-                num_smooth_layers=_n_smooth,
+                use_per_point_head=_per_pt,
+                use_float64_head=_f64_head,
+                use_regularized_per_point=_reg_pt,
+                delta_scale=_delta_scale,
+                delta_reg_weight=_delta_reg,
+                point_embed_scale=_pt_scale,
                 laplacian_weight=_lap_w,
+                inject_at_input=_inject_in,
+                inject_at_output=_inject_out,
             )
         # V3.6: V3 global query + iterative refinement + Flow Matching
         elif getattr(global_cfg, 'use_dit_v3_6', False):
@@ -101,9 +115,15 @@ class FlowMatchingEvolution(nn.Module):
         self._hf_loss_weight = float(getattr(global_cfg, 'v3_7_hf_loss_weight', 0.1))
         # V3.7.3: low-noise flow matching (default 1.0 = standard)
         self._flow_noise_scale = float(getattr(global_cfg, 'flow_noise_scale', 1.0))
+        # Optional training-only noise scale (fallback to flow_noise_scale)
+        self._flow_train_noise_scale = float(
+            getattr(global_cfg, 'flow_train_noise_scale', self._flow_noise_scale)
+        )
         # V3.7.3: inference averaging
         self._infer_avg_samples = int(getattr(global_cfg, 'infer_avg_samples', 0))
         self._infer_noise_scale = float(getattr(global_cfg, 'infer_noise_scale', -1.0))
+        # V3.7.6: fix t=0 during training (pure direct regression)
+        self._flow_fix_t0 = bool(getattr(global_cfg, 'flow_fix_t0', False))
 
         # CMAM 先验参数保留 (以防外部调用)
         self.compute_L = True
@@ -339,8 +359,11 @@ class FlowMatchingEvolution(nn.Module):
             N = x1.size(0)
 
             # --- Flow Matching Core ---
-            t = torch.rand(N, device=device).view(N, 1, 1)
-            x0 = torch.randn_like(x1) * self._flow_noise_scale
+            if self._flow_fix_t0:
+                t = torch.zeros(N, 1, 1, device=device)
+            else:
+                t = torch.rand(N, device=device).view(N, 1, 1)
+            x0 = torch.randn_like(x1) * self._flow_train_noise_scale
             x_t = (1.0 - t) * x0 + t * x1
 
             # --- 特征采样 & 预测 ---

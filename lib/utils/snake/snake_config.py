@@ -35,6 +35,7 @@ def is_v3_family():
         getattr(cfg, 'use_dit_v3_4', False),
         getattr(cfg, 'use_dit_v3_5', False),
         getattr(cfg, 'use_dit_v3_6', False),
+        getattr(cfg, 'use_dit_v3_8', False),
     ])
 
 
@@ -52,8 +53,9 @@ init = get_box_init_mode()
 evolve_init = get_evolve_init_mode()
 
 init_poly_num = 40
-poly_num = 128
-gt_poly_num = 128
+# Allow poly_num to be configured via cfg, default to 128 for backward compatibility
+poly_num = getattr(cfg, 'poly_num', 128)
+gt_poly_num = getattr(cfg, 'gt_poly_num', 128)
 spline_num = 10
 
 adj_num = 4

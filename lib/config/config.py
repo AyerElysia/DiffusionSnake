@@ -52,12 +52,18 @@ cfg.use_dit_v3_2 = False
 cfg.use_dit_v3_3 = False
 cfg.use_dit_v3_4 = False
 cfg.use_dit_v3_6 = False
+cfg.use_dit_v3_8 = False
 cfg.circular_conv_kernel = 5
 cfg.use_flow_matching = False
 cfg.flow_ode_steps = 10
+cfg.flow_train_noise_scale = 1.0
 cfg.dit_num_layers = 6
 cfg.dit_num_heads = 8
 cfg.dit_state_dim = 256
+
+# Contour point configuration (default 128, can be overridden per version)
+cfg.poly_num = 128
+cfg.gt_poly_num = 128
 
 # V3.4: Multi-step iterative refinement
 cfg.use_iterative_refinement = False
