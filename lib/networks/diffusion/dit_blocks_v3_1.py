@@ -134,8 +134,14 @@ class DiTBlockV3_1(nn.Module):
         nn.init.constant_(self.adaLN_modulation[-1].weight, 0)
         nn.init.constant_(self.adaLN_modulation[-1].bias, 0)
 
-    def _self_attention(self, x: torch.Tensor) -> torch.Tensor:
-        """Self-attention with QK-Norm and CyclicRoPE."""
+    def _self_attention(self, x: torch.Tensor, point_mask: Optional[torch.Tensor] = None) -> torch.Tensor:
+        """
+        Self-attention with QK-Norm and CyclicRoPE.
+
+        Args:
+            x: (N, P, D) point features
+            point_mask: (N, P) V3.10: point validity mask (1=valid, 0=padding)
+        """
         N, P, D = x.shape
         H = self.num_heads
         hd = self.head_dim
@@ -148,7 +154,22 @@ class DiTBlockV3_1(nn.Module):
         k = self.rope.apply_rotary(self.qk_norm(k))
 
         attn = (q @ k.transpose(-2, -1)) * self.scale
+
+        # V3.10: Apply attention mask if provided
+        if point_mask is not None:
+            # point_mask: [N, P] where 1=valid, 0=padding
+            # Create attention mask: [N, 1, 1, P] for broadcasting to [N, H, P, P]
+            # We want to mask out attention TO padding positions (columns)
+            attn_mask = point_mask.unsqueeze(1).unsqueeze(2)  # [N, 1, 1, P]
+            # Mask out invalid positions with large negative value
+            attn = attn.masked_fill(attn_mask == 0, float('-inf'))
+
         attn = attn.softmax(dim=-1)
+
+        # Handle NaN from softmax of all -inf (all padding row)
+        if point_mask is not None:
+            attn = torch.nan_to_num(attn, nan=0.0)
+
         out = (attn @ v).transpose(1, 2).contiguous().view(N, P, D)
         return self.sa_out_proj(out)
 
@@ -176,12 +197,14 @@ class DiTBlockV3_1(nn.Module):
         x: torch.Tensor,
         image_context: torch.Tensor,
         t_emb: torch.Tensor,
+        point_mask: Optional[torch.Tensor] = None,  # V3.10: add point mask
     ) -> torch.Tensor:
         """
         Args:
             x:             (N, P, dim) - Snake point features
             image_context: (N, L, dim) - Image patch tokens (from Patchify)
             t_emb:         (N, dim)    - Time embedding
+            point_mask:    (N, P)      - V3.10: Point validity mask (1=valid, 0=padding)
 
         Returns:
             (N, P, dim)
@@ -191,9 +214,9 @@ class DiTBlockV3_1(nn.Module):
          shift_ca, scale_ca, gate_ca,
          shift_ff, scale_ff, gate_ff) = mod.chunk(9, dim=1)
 
-        # 1. Self-Attention
+        # 1. Self-Attention (with point mask)
         x_sa = modulate(self.norm1(x), shift_sa, scale_sa)
-        x = x + gate_sa.unsqueeze(1) * self._self_attention(x_sa)
+        x = x + gate_sa.unsqueeze(1) * self._self_attention(x_sa, point_mask=point_mask)
 
         # 2. Cross-Attention
         x_ca = modulate(self.norm2(x), shift_ca, scale_ca)

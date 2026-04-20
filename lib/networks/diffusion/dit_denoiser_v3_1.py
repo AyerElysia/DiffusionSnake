@@ -102,6 +102,7 @@ class DiTDenoiserV3_1(nn.Module):
         adj=None,
         polys=None,
         py_ind: torch.Tensor = None,
+        point_mask: torch.Tensor = None,  # V3.10: add point mask
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """
         Forward pass.
@@ -112,6 +113,7 @@ class DiTDenoiserV3_1(nn.Module):
             x_t:          (N, P, 2)       - Noisy displacement
             t:            (N,)            - Timesteps
             py_ind:       (N,)            - Maps each contour to its image index
+            point_mask:   (N, P)          - V3.10: Point validity mask (1=valid, 0=padding)
 
         Returns:
             eps_pred: (N, P, 2) - Predicted noise
@@ -145,9 +147,10 @@ class DiTDenoiserV3_1(nn.Module):
         x = self.point_embed(x_t, sampled_feat)
 
         # Process through DiT Blocks (alternating global/local context)
+        # V3.10: pass point_mask to each layer
         for i, dit_layer in enumerate(self.dit_layers):
             context = global_ctx if (i % 2 == 0) else local_ctx
-            x = dit_layer(x, context, t_emb)
+            x = dit_layer(x, context, t_emb, point_mask=point_mask)
 
         # Final output
         pred = self.final_layer(x, t_emb)

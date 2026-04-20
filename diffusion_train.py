@@ -153,70 +153,90 @@ def main():
     if is_main_process:
         logger.info(f"use_grpo={getattr(cfg, 'use_grpo', None)}")
 
-    # ========== 合并训练集和测试集数据 ==========
-    # 目的：测试模型上限潜力（数据泄露，仅用于实验）
-    logger.info("=" * 60)
-    logger.info("WARNING: Merging train and test datasets for potential testing")
-    logger.info("This is intentional data leakage for model capacity evaluation")
-    logger.info("=" * 60)
-
-    # 创建训练集和测试集的数据加载器
+    # ========== 数据加载策略 ==========
+    # 默认：正常训练，不合并 train/val（避免数据泄露）
+    # 可选：仅在显式开启时合并 train/val，用于上限潜力实验
     train_loader = make_data_loader(cfg, is_train=True, is_distributed=is_distributed)
 
-    # 临时修改配置以加载测试集
-    original_dataset = cfg.train.dataset
-    try:
-        # 将训练数据集名称替换为测试集名称
-        if 'Train' in cfg.train.dataset:
-            test_dataset_name = cfg.train.dataset.replace('Train', 'Val')
-            cfg.train.dataset = test_dataset_name
-            test_loader = make_data_loader(cfg, is_train=True, is_distributed=is_distributed)
-            logger.info(f"Loaded test dataset: {test_dataset_name}")
-        else:
-            test_loader = None
-            logger.warning("Could not determine test dataset name, using train only")
-    finally:
-        # 恢复原始配置
-        cfg.train.dataset = original_dataset
+    merge_train_val = bool(getattr(cfg.train, 'merge_with_val', False))
+    merge_env = os.environ.get('DIFFUSION_MERGE_TRAIN_VAL', '').strip().lower()
+    if merge_env:
+        merge_train_val = merge_env in ('1', 'true', 'yes', 'y', 'on')
 
-    # 合并数据加载器
-    if test_loader is not None:
-        from torch.utils.data import ConcatDataset, DataLoader
-
-        # 获取底层数据集
-        train_dataset = train_loader.dataset
-        test_dataset = test_loader.dataset
-
-        # 合并数据集
-        combined_dataset = ConcatDataset([train_dataset, test_dataset])
-
-        # 兼容通过 batch_sampler 构建的 DataLoader（其 batch_size 可能为 None）
-        inferred_batch_size = getattr(train_loader, 'batch_size', None)
-        if inferred_batch_size is None:
-            inferred_batch_size = getattr(getattr(train_loader, 'batch_sampler', None), 'batch_size', None)
-        if inferred_batch_size is None:
-            inferred_batch_size = int(getattr(cfg.train, 'batch_size', 1))
-
-        inferred_drop_last = getattr(getattr(train_loader, 'batch_sampler', None), 'drop_last', False)
-
-        # 创建新的数据加载器
-        data_loader = DataLoader(
-            combined_dataset,
-            batch_size=int(inferred_batch_size),
-            shuffle=True,
-            num_workers=train_loader.num_workers,
-            collate_fn=train_loader.collate_fn if hasattr(train_loader, 'collate_fn') else None,
-            pin_memory=True,
-            drop_last=bool(inferred_drop_last),
-        )
-
-        logger.info(f"Combined dataset size: {len(combined_dataset)}")
-        logger.info(f"  - Train samples: {len(train_dataset)}")
-        logger.info(f"  - Test samples: {len(test_dataset)}")
-        logger.info(f"  - Total batches per epoch: {len(data_loader)}")
-    else:
+    if not merge_train_val:
+        logger.info("=" * 60)
+        logger.info("Normal training mode: TRAIN split only (no train/val merge)")
+        logger.info("=" * 60)
         data_loader = train_loader
-        logger.info(f"Using train dataset only: {len(train_loader.dataset)} samples")
+        logger.info(f"Train samples: {len(train_loader.dataset)}")
+        logger.info(f"Batches per epoch: {len(data_loader)}")
+    else:
+        logger.info("=" * 60)
+        logger.info("WARNING: Merging train and val datasets (data leakage mode)")
+        logger.info("This mode is for capacity probing only, not normal training")
+        logger.info("=" * 60)
+
+        original_dataset = cfg.train.dataset
+        try:
+            if 'Train' in cfg.train.dataset:
+                test_dataset_name = cfg.train.dataset.replace('Train', 'Val')
+                cfg.train.dataset = test_dataset_name
+                test_loader = make_data_loader(cfg, is_train=True, is_distributed=is_distributed)
+                logger.info(f"Loaded val dataset for merge: {test_dataset_name}")
+            else:
+                test_loader = None
+                logger.warning("Could not infer val dataset name; fallback to train only")
+        finally:
+            cfg.train.dataset = original_dataset
+
+        if test_loader is not None:
+            from torch.utils.data import ConcatDataset, DataLoader
+
+            train_dataset = train_loader.dataset
+            test_dataset = test_loader.dataset
+            combined_dataset = ConcatDataset([train_dataset, test_dataset])
+
+            inferred_batch_size = getattr(train_loader, 'batch_size', None)
+            if inferred_batch_size is None:
+                inferred_batch_size = getattr(getattr(train_loader, 'batch_sampler', None), 'batch_size', None)
+            if inferred_batch_size is None:
+                inferred_batch_size = int(getattr(cfg.train, 'batch_size', 1))
+
+            inferred_drop_last = getattr(getattr(train_loader, 'batch_sampler', None), 'drop_last', False)
+            collate_fn = train_loader.collate_fn if hasattr(train_loader, 'collate_fn') else None
+
+            if is_distributed:
+                combined_sampler = torch.utils.data.distributed.DistributedSampler(
+                    combined_dataset, shuffle=True
+                )
+                combined_batch_sampler = torch.utils.data.sampler.BatchSampler(
+                    combined_sampler, int(inferred_batch_size), bool(inferred_drop_last)
+                )
+                data_loader = DataLoader(
+                    combined_dataset,
+                    batch_sampler=combined_batch_sampler,
+                    num_workers=train_loader.num_workers,
+                    collate_fn=collate_fn,
+                    pin_memory=True,
+                )
+            else:
+                data_loader = DataLoader(
+                    combined_dataset,
+                    batch_size=int(inferred_batch_size),
+                    shuffle=True,
+                    num_workers=train_loader.num_workers,
+                    collate_fn=collate_fn,
+                    pin_memory=True,
+                    drop_last=bool(inferred_drop_last),
+                )
+
+            logger.info(f"Combined dataset size: {len(combined_dataset)}")
+            logger.info(f"  - Train samples: {len(train_dataset)}")
+            logger.info(f"  - Val samples: {len(test_dataset)}")
+            logger.info(f"  - Batches per epoch: {len(data_loader)}")
+        else:
+            data_loader = train_loader
+            logger.info(f"Using train dataset only: {len(train_loader.dataset)} samples")
 
     def move_batch_to_cuda(batch):
         for k in list(batch.keys()):

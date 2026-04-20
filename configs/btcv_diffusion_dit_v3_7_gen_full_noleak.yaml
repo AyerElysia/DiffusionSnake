@@ -1,0 +1,80 @@
+# V3.7 泛化全量训练（正常模式：不泄露）
+
+model: 'sbd'
+network: 'ro_34'
+task: 'snake'
+model_dir: "data/model/btcv_diffusion_dit_v3_7_gen_full_noleak"
+
+gpus: [1, 6, 7]
+resume: false
+
+train_or_test: train
+
+train:
+    dataset: 'BtcvTrain'
+    data_path: '/mnt/sdb1/leijh/DiffusionSnake/Datasets/BTCV/btcv_png_new_snake'
+    per_contour: false
+    merge_with_val: false
+
+    optim: 'adamw'
+    lr: 5e-5
+    milestones: (80, 120)
+    gamma: 0.5
+    batch_size: 8
+    gradient_accumulation_steps: 1
+    gradient_clip: 1.0
+    weight_decay: 0.01
+    warmup_steps: 1000
+
+    epoch: 1000
+    num_workers: 4
+    save_ep: 10
+
+test:
+    dataset: 'BtcvVal'
+    batch_size: 1
+    img_path: '/mnt/sdb1/leijh/DiffusionSnake/Datasets/BTCV/btcv_png_test_new_snake'
+    epoch: -1
+
+use_nms_for_snake: true
+det_conf_thresh: 0.01
+det_iou_thresh: 0.45
+det_max_det: 100
+per_class_nms: true
+use_gt_det: false
+
+loss_scales: {det: 0, ex: 1.0, py: 1.2}
+
+use_diffusion_evolution: true
+use_flow_matching: true
+flow_ode_steps: 3
+flow_noise_scale: 0.2
+flow_train_noise_scale: 0.2
+flow_fix_t0: false
+
+diffusion_loss_weight: 1.0
+diffusion_loss_type: 'adaptive'
+diffusion_disp_norm: true
+diffusion_disp_stats: "data/stats/btcv_disp_stats_octagon.json"
+
+use_dit_v3_7: true
+dit_num_layers: 6
+dit_num_heads: 8
+dit_state_dim: 256
+
+v3_7_use_per_point_head: true
+v3_7_use_regularized_per_point: true
+v3_7_delta_scale: 0.1
+v3_7_delta_reg_weight: 0.001
+v3_7_laplacian_weight: 0.001
+v3_7_spectral_loss_k: 0
+v3_7_hf_loss_weight: 0.1
+v3_7_ode_smooth_k: 0
+
+infer_noise_scale: 0.0
+infer_avg_samples: 1
+
+use_grpo: false
+heads: {'ct_hm': 9, 'wh': 2}
+segm_or_bbox: 'segm'
+use_diffusion_trainer: true

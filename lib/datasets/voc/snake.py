@@ -38,23 +38,55 @@ class Dataset(data.Dataset):
         # ===============================================================================================
         self.train_images_path=[]
         self.train_masks_path=[]
-        list_file = os.path.join(cfg.train.data_path, 'train_list.txt')
-        with open(list_file, 'r', encoding='utf-8') as f:
-            lines = [x.strip() for x in f.readlines() if x.strip()]
+
+        # 按 split 选择数据根目录：训练/验证分离，避免推理误读训练集
+        if str(split).lower() == 'val':
+            data_path = str(getattr(cfg.test, 'img_path', '') or data_root)
+            list_candidates = ['test_list.txt', 'val_list.txt', 'train_list.txt']
+        elif str(split).lower() == 'mini':
+            data_path = str(getattr(cfg.train, 'data_path', '') or data_root)
+            list_candidates = ['mini_list.txt', 'train_list.txt', 'test_list.txt']
+        else:
+            data_path = str(getattr(cfg.train, 'data_path', '') or data_root)
+            list_candidates = ['train_list.txt', 'test_list.txt']
+
+        if not data_path:
+            raise ValueError(f"Empty data path for split={split}")
+
+        list_file = None
+        for name in list_candidates:
+            candidate = os.path.join(data_path, name)
+            if os.path.exists(candidate):
+                list_file = candidate
+                break
+
+        if list_file is not None:
+            with open(list_file, 'r', encoding='utf-8') as f:
+                lines = [x.strip() for x in f.readlines() if x.strip()]
+        else:
+            # 兼容没有 list 文件的目录：按 *_image.png 自动构建样本列表
+            image_files = sorted(glob.glob(os.path.join(data_path, '*_image.png')))
+            if not image_files:
+                raise FileNotFoundError(
+                    f"No list file and no *_image.png found under: {data_path}"
+                )
+            lines = [os.path.basename(p) for p in image_files]
+
         for name in lines:
-            img_png = os.path.join(cfg.train.data_path, name)
+            img_png = name if os.path.isabs(name) else os.path.join(data_path, name)
             if not os.path.exists(img_png):
                 raise FileNotFoundError(f"Image not found: {img_png}")
-            
+
             self.train_images_path.append(img_png)
             base_name = os.path.basename(name).split('_')[0]
-            mask_name = os.path.join(cfg.train.data_path, f"{base_name}_mask")
+            mask_name = os.path.join(data_path, f"{base_name}_mask")
             self.train_masks_path.append(mask_name)  # root only
 
         print('======================')
-        print('训练数据路径：', cfg.train.data_path)
-        print('样本数（来自 train_list.txt）:', len(self.train_images_path))
-        print('列表文件：', list_file)
+        print('数据 split：', split)
+        print('数据路径：', data_path)
+        print('样本数：', len(self.train_images_path))
+        print('列表文件：', list_file if list_file is not None else '<auto-scan>')
         print('======================')
         # for i in range(1, cfg.train.data_num):
         #     self.train_images_path.append(cfg.train.data_path + '{}_image.jpg'.format(i))

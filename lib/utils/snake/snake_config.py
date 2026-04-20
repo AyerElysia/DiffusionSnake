@@ -58,6 +58,14 @@ poly_num = getattr(cfg, 'poly_num', 128)
 gt_poly_num = getattr(cfg, 'gt_poly_num', 128)
 spline_num = 10
 
+# V3.10: 自适应点数配置
+adaptive_points_enabled = getattr(cfg, 'adaptive_points_enabled', False)
+min_points = getattr(cfg, 'min_points', 32)
+max_points = getattr(cfg, 'max_points', 512)
+target_density = getattr(cfg, 'target_density', 2.5)
+round_to_multiple = getattr(cfg, 'round_to_multiple', 8)
+point_strategy = getattr(cfg, 'point_strategy', 'perimeter')
+
 adj_num = 4
 
 train_pred_box = False

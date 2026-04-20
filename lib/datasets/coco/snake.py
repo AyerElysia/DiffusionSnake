@@ -162,11 +162,15 @@ class Dataset(data.Dataset):
         x_max, y_max = np.max(extreme_point[:, 0]), np.max(extreme_point[:, 1])
 
         bbox = [x_min, y_min, x_max, y_max]
+
+        # V3.10: 根据bbox计算自适应点数
+        num_points = self.compute_adaptive_points(bbox)
+
         base_init_poly = snake_voc_utils.get_evolution_init(extreme_point, bbox)
-        img_init_poly = snake_voc_utils.uniformsample(base_init_poly, snake_config.poly_num)
+        img_init_poly = snake_voc_utils.uniformsample(base_init_poly, num_points)
         can_init_poly = snake_voc_utils.img_poly_to_can_poly(img_init_poly, x_min, y_min, x_max, y_max)
 
-        img_gt_poly = snake_voc_utils.uniformsample(poly, len(poly) * snake_config.gt_poly_num)
+        img_gt_poly = snake_voc_utils.uniformsample(poly, len(poly) * num_points)
         tt_idx = np.argmin(np.power(img_gt_poly - img_init_poly[0], 2).sum(axis=1))
         img_gt_poly = np.roll(img_gt_poly, -tt_idx, axis=0)[::len(poly)]
         can_gt_poly = snake_voc_utils.img_poly_to_can_poly(img_gt_poly, x_min, y_min, x_max, y_max)
@@ -175,6 +179,50 @@ class Dataset(data.Dataset):
         can_init_polys.append(can_init_poly)
         img_gt_polys.append(img_gt_poly)
         can_gt_polys.append(can_gt_poly)
+
+    def compute_adaptive_points(self, bbox):
+        """
+        V3.10: 根据bounding box计算自适应点数
+
+        Args:
+            bbox: [x_min, y_min, x_max, y_max]
+
+        Returns:
+            num_points: 自适应点数（8的倍数）
+        """
+        if not hasattr(snake_config, 'adaptive_points_enabled') or not snake_config.adaptive_points_enabled:
+            # 回退到固定点数
+            return snake_config.poly_num
+
+        w = bbox[2] - bbox[0]
+        h = bbox[3] - bbox[1]
+
+        # 获取配置参数
+        target_density = getattr(snake_config, 'target_density', 2.5)
+        min_points = getattr(snake_config, 'min_points', 32)
+        max_points = getattr(snake_config, 'max_points', 512)
+        round_to = getattr(snake_config, 'round_to_multiple', 8)
+        strategy = getattr(snake_config, 'point_strategy', 'perimeter')
+
+        # 根据策略计算基础点数
+        if strategy == 'perimeter':
+            perimeter_estimate = 2 * (w + h)
+            base_points = perimeter_estimate / target_density
+        elif strategy == 'area':
+            area = w * h
+            base_points = np.sqrt(area) * 1.5
+        elif strategy == 'mixed':
+            perimeter_factor = 2 * (w + h) / target_density
+            area_factor = np.sqrt(w * h) * 1.5
+            base_points = 0.6 * perimeter_factor + 0.4 * area_factor
+        else:
+            base_points = 2 * (w + h) / target_density
+
+        # 限制范围并取round_to的倍数
+        num_points = int(np.clip(base_points, min_points, max_points))
+        num_points = ((num_points + round_to - 1) // round_to) * round_to
+
+        return num_points
 
     def prepare_merge(self, is_id, cls_id, cp_id, cp_cls):
         cp_id.append(is_id)

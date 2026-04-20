@@ -175,6 +175,7 @@ class DiTFlowMatchingV3_7(DiTFlowMatchingV3_2):
                  laplacian_weight: float = 0.0,
                  inject_at_input: bool = False,
                  inject_at_output: bool = False,
+                 use_scale_conditioning: bool = False,
                  **kwargs):
         super().__init__(*args, num_points=num_points, **kwargs)
 
@@ -184,6 +185,18 @@ class DiTFlowMatchingV3_7(DiTFlowMatchingV3_2):
         self.inject_at_input = inject_at_input
         self.inject_at_output = inject_at_output
         self.use_per_point_head = use_per_point_head
+        self.use_scale_conditioning = use_scale_conditioning
+
+        # Scale conditioning: embeds log(contour_scale) and adds to t_emb.
+        # Zero-initialized output so it starts as identity (safe for warm start).
+        if use_scale_conditioning:
+            self.scale_embed_net = nn.Sequential(
+                nn.Linear(1, self.state_dim),
+                nn.SiLU(),
+                nn.Linear(self.state_dim, self.state_dim),
+            )
+            nn.init.zeros_(self.scale_embed_net[-1].weight)
+            nn.init.zeros_(self.scale_embed_net[-1].bias)
 
         if use_per_point_head:
             self._shared_final_layer = self.final_layer
@@ -222,6 +235,7 @@ class DiTFlowMatchingV3_7(DiTFlowMatchingV3_2):
         adj=None,
         polys=None,
         py_ind: torch.Tensor = None,
+        contour_scale: torch.Tensor = None,
     ) -> tuple:
         assert x_t.dim() == 3 and x_t.shape[-1] == 2
         assert t.dim() == 1
@@ -240,6 +254,11 @@ class DiTFlowMatchingV3_7(DiTFlowMatchingV3_2):
 
         N, P, _ = x_t.shape
         t_emb = self.time_emb_net(t)
+
+        # Scale conditioning: add log(contour_scale) embedding to t_emb
+        if self.use_scale_conditioning and contour_scale is not None:
+            log_scale = torch.log(contour_scale.view(-1, 1).to(param_dtype) + 1e-6)
+            t_emb = t_emb + self.scale_embed_net(log_scale)
 
         if cnn_feature.dim() == 3:
             cnn_feature = cnn_feature.unsqueeze(0)

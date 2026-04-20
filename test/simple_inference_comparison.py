@@ -87,15 +87,22 @@ def load_model_and_infer(cfg_file, ckpt_path):
 
     # 提取预测轮廓
     if 'py' in output:
-        pred_polys = output['py'][0].cpu().numpy()  # [N, num_points, 2]
+        pred_polys = output['py'].cpu().numpy()  # [N, num_points, 2]
     else:
         pred_polys = None
 
     # 提取GT轮廓
     if 'i_gt_py' in batch:
-        gt_polys = batch['i_gt_py'][0]
+        gt_polys = batch['i_gt_py']
         if isinstance(gt_polys, torch.Tensor):
             gt_polys = gt_polys.cpu().numpy()
+        elif isinstance(gt_polys, list):
+            gt_polys = np.array(gt_polys)
+
+        # batch['i_gt_py'] shape: [batch_size, N, num_points, 2]
+        # 取第一个batch的所有轮廓
+        if len(gt_polys.shape) == 4:
+            gt_polys = gt_polys[0]  # [N, num_points, 2]
     else:
         gt_polys = None
 
@@ -110,8 +117,8 @@ def draw_contours(image, contours, color, thickness=2):
                 poly = poly.cpu().numpy()
             poly = np.array(poly, dtype=np.float32)
             if len(poly.shape) == 2 and poly.shape[1] == 2:
-                poly = poly.astype(np.int32).reshape((-1, 1, 2))
-                cv2.polylines(img, [poly], True, color, thickness)
+                poly_int = poly.astype(np.int32).reshape((-1, 1, 2))
+                cv2.polylines(img, [poly_int], True, color, thickness)
     return img
 
 def calculate_metrics(pred_polys, gt_polys):

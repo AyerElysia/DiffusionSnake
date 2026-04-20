@@ -401,9 +401,12 @@ class DiffusionEvolution(nn.Module):
         return (x_t - am1 * eps) / a
 
     def predict_eps(self, cnn_feature: torch.Tensor, i_it_py: torch.Tensor, c_it_py: torch.Tensor,
-                   py_ind: torch.Tensor, x_t: torch.Tensor, t: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+                   py_ind: torch.Tensor, x_t: torch.Tensor, t: torch.Tensor, batch: dict = None) -> Tuple[torch.Tensor, torch.Tensor]:
         """
         预测噪声：使用去噪器预测当前状态中的噪声分量
+
+        Args:
+            batch: V3.10: batch dictionary containing point_mask
         """
         # 1. 采样局部 GCN 特征 (保留作为 Local Context)
         h, w = cnn_feature.size(2), cnn_feature.size(3)
@@ -412,9 +415,25 @@ class DiffusionEvolution(nn.Module):
         # 2. 构建邻接矩阵 (仅 GCN Denoiser 需要)
         adj = snake_gcn_utils.get_adj_ind(snake_config.adj_num, i_it_py.size(1), i_it_py.device)
 
+        # V3.10: Extract point_mask from batch if available
+        # TODO: Currently disabled due to shape mismatch after prepare_training filtering
+        # Need to propagate point_mask through prepare_training/prepare_testing
+        point_mask = None
+        # if batch is not None and 'point_mask' in batch:
+        #     point_mask_full = batch['point_mask']  # [B, ct_num, P]
+        #     B, ct_num, P = point_mask_full.shape
+        #     point_mask = point_mask_full.view(-1, P)
+        #     if 'meta' in batch and 'ct_01' in batch['meta']:
+        #         ct_01 = batch['meta']['ct_01']
+        #         point_mask = point_mask[ct_01]
+
         # 3. 通过去噪器预测噪声 (使用 denoiser_type 而非 isinstance)
         if self.denoiser_type.startswith('dit'):
-            eps_pred, L = self.denoiser(cnn_feature, gcn_feat, x_t, t, adj, polys=i_it_py, py_ind=py_ind)
+            # Only pass point_mask for V3.10+ which supports it
+            if point_mask is not None and hasattr(self.denoiser, 'supports_point_mask'):
+                eps_pred, L = self.denoiser(cnn_feature, gcn_feat, x_t, t, adj, polys=i_it_py, py_ind=py_ind, point_mask=point_mask)
+            else:
+                eps_pred, L = self.denoiser(cnn_feature, gcn_feat, x_t, t, adj, polys=i_it_py, py_ind=py_ind)
         else:  # snake
             eps_pred, L = self.denoiser(gcn_feat, c_it_py, x_t, t, adj, polys=i_it_py)
 
@@ -628,7 +647,7 @@ class DiffusionEvolution(nn.Module):
         self.scheduler.set_timesteps(steps, device=device)
         for t in self.scheduler.timesteps:
             t_batch = torch.full((N,), t, device=device, dtype=torch.long)
-            eps_pred, _ = self.predict_eps(cnn_feature, i_it_py, c_it_py, py_ind, x, t_batch)
+            eps_pred, _ = self.predict_eps(cnn_feature, i_it_py, c_it_py, py_ind, x, t_batch, batch=None)
             out = self.scheduler.step(model_output=eps_pred, timestep=t, sample=x)
             x = out.prev_sample
         # Convert Fourier coefficients back to displacement
@@ -649,7 +668,7 @@ class DiffusionEvolution(nn.Module):
 
         for t in self.scheduler.timesteps:
             t_batch = torch.full((N,), t, device=device, dtype=torch.long)
-            eps_pred, _ = self.predict_eps(cnn_feature, i_it_py, c_it_py, py_ind, x, t_batch)
+            eps_pred, _ = self.predict_eps(cnn_feature, i_it_py, c_it_py, py_ind, x, t_batch, batch=None)
             out = self.scheduler.step(model_output=eps_pred, timestep=t, sample=x)
             x = out.prev_sample
 
@@ -770,7 +789,7 @@ class DiffusionEvolution(nn.Module):
                 noise = torch.randn_like(x0_combined)
                 x_t = self._add_noise(x0_combined, noise, t)
 
-            eps_pred, _ = self.predict_eps(cnn_feature, contours_combined, c_combined, py_ind_combined, x_t, t)
+            eps_pred, _ = self.predict_eps(cnn_feature, contours_combined, c_combined, py_ind_combined, x_t, t, batch=batch)
             N_orig = i_init_train_py.size(0)
             eps_pred_A1 = eps_pred[0 * N_orig:1 * N_orig]
             noise_A1 = noise[0 * N_orig:1 * N_orig]

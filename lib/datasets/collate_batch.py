@@ -80,17 +80,59 @@ def snake_collator(batch):
     init = {'i_it_4py': i_it_4pys, 'c_it_4py': c_it_4pys, 'i_gt_4py': i_gt_4pys, 'c_gt_4py': c_gt_4pys}
     ret.update(init)
 
-    # evolution
-    i_it_pys = torch.zeros([batch_size, ct_num, snake_config.poly_num, 2], dtype=torch.float)
-    c_it_pys = torch.zeros([batch_size, ct_num, snake_config.poly_num, 2], dtype=torch.float)
-    i_gt_pys = torch.zeros([batch_size, ct_num, snake_config.gt_poly_num, 2], dtype=torch.float)
-    c_gt_pys = torch.zeros([batch_size, ct_num, snake_config.gt_poly_num, 2], dtype=torch.float)
-    if ct_num != 0:
-        i_it_pys[ct_01] = torch.Tensor(sum([b['i_it_py'] for b in truncated], []))
-        c_it_pys[ct_01] = torch.Tensor(sum([b['c_it_py'] for b in truncated], []))
-        i_gt_pys[ct_01] = torch.Tensor(sum([b['i_gt_py'] for b in truncated], []))
-        c_gt_pys[ct_01] = torch.Tensor(sum([b['c_gt_py'] for b in truncated], []))
-    evolution = {'i_it_py': i_it_pys, 'c_it_py': c_it_pys, 'i_gt_py': i_gt_pys, 'c_gt_py': c_gt_pys}
+    # V3.10: evolution with dynamic padding for adaptive points
+    if snake_config.adaptive_points_enabled:
+        # Find max points in this batch
+        max_points = snake_config.poly_num  # default fallback
+        if ct_num != 0:
+            all_polys = sum([b['i_it_py'] for b in truncated], [])
+            if len(all_polys) > 0:
+                max_points = max([poly.shape[0] for poly in all_polys])
+
+        # Allocate tensors with dynamic max_points
+        i_it_pys = torch.zeros([batch_size, ct_num, max_points, 2], dtype=torch.float)
+        c_it_pys = torch.zeros([batch_size, ct_num, max_points, 2], dtype=torch.float)
+        i_gt_pys = torch.zeros([batch_size, ct_num, max_points, 2], dtype=torch.float)
+        c_gt_pys = torch.zeros([batch_size, ct_num, max_points, 2], dtype=torch.float)
+        point_masks = torch.zeros([batch_size, ct_num, max_points], dtype=torch.float)
+
+        if ct_num != 0:
+            # Fill with actual data and create masks
+            batch_idx = 0
+            ct_idx = 0
+            for b in truncated:
+                for i in range(len(b['i_it_py'])):
+                    n_pts = b['i_it_py'][i].shape[0]
+                    i_it_pys[batch_idx, ct_idx, :n_pts] = torch.Tensor(b['i_it_py'][i])
+                    c_it_pys[batch_idx, ct_idx, :n_pts] = torch.Tensor(b['c_it_py'][i])
+                    i_gt_pys[batch_idx, ct_idx, :n_pts] = torch.Tensor(b['i_gt_py'][i])
+                    c_gt_pys[batch_idx, ct_idx, :n_pts] = torch.Tensor(b['c_gt_py'][i])
+                    point_masks[batch_idx, ct_idx, :n_pts] = 1.0
+                    ct_idx += 1
+                    if ct_idx >= ct_num:
+                        ct_idx = 0
+                        batch_idx += 1
+
+        evolution = {
+            'i_it_py': i_it_pys,
+            'c_it_py': c_it_pys,
+            'i_gt_py': i_gt_pys,
+            'c_gt_py': c_gt_pys,
+            'point_mask': point_masks  # V3.10: add point mask
+        }
+    else:
+        # Original fixed-size logic
+        i_it_pys = torch.zeros([batch_size, ct_num, snake_config.poly_num, 2], dtype=torch.float)
+        c_it_pys = torch.zeros([batch_size, ct_num, snake_config.poly_num, 2], dtype=torch.float)
+        i_gt_pys = torch.zeros([batch_size, ct_num, snake_config.gt_poly_num, 2], dtype=torch.float)
+        c_gt_pys = torch.zeros([batch_size, ct_num, snake_config.gt_poly_num, 2], dtype=torch.float)
+        if ct_num != 0:
+            i_it_pys[ct_01] = torch.Tensor(sum([b['i_it_py'] for b in truncated], []))
+            c_it_pys[ct_01] = torch.Tensor(sum([b['c_it_py'] for b in truncated], []))
+            i_gt_pys[ct_01] = torch.Tensor(sum([b['i_gt_py'] for b in truncated], []))
+            c_gt_pys[ct_01] = torch.Tensor(sum([b['c_gt_py'] for b in truncated], []))
+        evolution = {'i_it_py': i_it_pys, 'c_it_py': c_it_pys, 'i_gt_py': i_gt_pys, 'c_gt_py': c_gt_pys}
+
     ret.update(evolution)
 
     # Aggregate YOLO targets if present in samples

@@ -51,10 +51,12 @@ class FlowMatchingEvolution(nn.Module):
             _reg_pt = bool(getattr(global_cfg, 'v3_7_use_regularized_per_point', False))
             _delta_scale = float(getattr(global_cfg, 'v3_7_delta_scale', 0.1))
             _delta_reg = float(getattr(global_cfg, 'v3_7_delta_reg_weight', 0.001))
+            _scale_cond = bool(getattr(global_cfg, 'v3_7_use_scale_conditioning', False))
             print(f"[FlowMatchingEvolution] Using DiT Flow Network V3.7 "
                   f"(per_point_head={_per_pt}, regularized={_reg_pt}, "
                   f"float64_head={_f64_head}, "
-                  f"inject_in={_inject_in}, inject_out={_inject_out}, ODE steps={ode_steps})")
+                  f"inject_in={_inject_in}, inject_out={_inject_out}, "
+                  f"scale_cond={_scale_cond}, ODE steps={ode_steps})")
             self.denoiser = DiTFlowMatchingV3_7(
                 state_dim=dit_state_dim,
                 feature_dim=feature_dim,
@@ -70,6 +72,7 @@ class FlowMatchingEvolution(nn.Module):
                 laplacian_weight=_lap_w,
                 inject_at_input=_inject_in,
                 inject_at_output=_inject_out,
+                use_scale_conditioning=_scale_cond,
             )
         # V3.6: V3 global query + iterative refinement + Flow Matching
         elif getattr(global_cfg, 'use_dit_v3_6', False):

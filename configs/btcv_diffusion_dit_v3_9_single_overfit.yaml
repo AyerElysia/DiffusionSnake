@@ -70,8 +70,8 @@ use_iterative_refinement: true
 iterative_num_steps: 3
 iterative_fractions: [0.3333, 0.5, 1.0]
 
-# Mild final smoothing only
-fourier_smooth_k: 8
+# Final Fourier smoothing
+fourier_smooth_k: 12
 
 use_grpo: false
 heads: {'ct_hm': 9, 'wh': 2}
