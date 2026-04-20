@@ -50,7 +50,7 @@ use_gt_det: false
 # ===== V3.10 自适应点数配置 =====
 adaptive_points_enabled: true
 min_points: 32
-max_points: 512
+max_points: 128
 target_density: 2.5  # 像素/点
 round_to_multiple: 8
 point_strategy: 'perimeter'  # 'perimeter', 'area', 'mixed'
