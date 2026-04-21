@@ -195,7 +195,31 @@ def eval_sample(model, device, batch, ode_steps=10, save_visuals=False, sample_d
         else:
             py_ind = torch.cat([torch.full((num_contours,), i, dtype=torch.long, device=device) for i in range(batch_size)])
 
-        disp = core.gcn.sample_disp(cnn_feature, i_it_py, c_it_py, py_ind, steps=ode_steps)
+        if getattr(core.gcn, 'use_iterative_refinement', False):
+            iter_steps = int(getattr(cfg, 'iterative_num_steps', 3))
+            fractions = list(getattr(cfg, 'iterative_fractions', []))
+            if not fractions:
+                fractions = [1.0 / (iter_steps - i) for i in range(iter_steps)]
+            iter_ode_steps = int(
+                getattr(
+                    cfg,
+                    'iterative_ode_steps',
+                    getattr(cfg, 'iterative_ddim_steps', ode_steps),
+                )
+            )
+            if iter_ode_steps <= 0:
+                iter_ode_steps = ode_steps
+            disp = core.gcn.sample_disp_iterative(
+                cnn_feature,
+                i_it_py,
+                c_it_py,
+                py_ind,
+                num_iter_steps=iter_steps,
+                fractions=fractions,
+                ode_steps=iter_ode_steps,
+            )
+        else:
+            disp = core.gcn.sample_disp(cnn_feature, i_it_py, c_it_py, py_ind, steps=ode_steps)
         fk = int(getattr(cfg, 'fourier_smooth_k', 0))
         if fk > 0:
             from lib.networks.diffusion.flow_matching_evolution import FlowMatchingEvolution

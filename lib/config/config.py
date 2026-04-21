@@ -70,6 +70,7 @@ cfg.use_iterative_refinement = False
 cfg.iterative_num_steps = 3
 cfg.iterative_fractions = [0.3333, 0.5, 1.0]
 cfg.iterative_ddim_steps = 20
+cfg.iterative_ode_steps = 0
 
 # V3.5: Fourier low-pass post-processing
 cfg.fourier_smooth_k = 0  # 0=disabled, >0=keep lowest K freq components per side

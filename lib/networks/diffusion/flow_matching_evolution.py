@@ -637,6 +637,15 @@ class FlowMatchingEvolution(nn.Module):
                     fractions = list(getattr(global_cfg, 'iterative_fractions', []))
                     if not fractions:
                         fractions = [1.0 / (iter_steps - i) for i in range(iter_steps)]
+                    iter_ode_steps = int(
+                        getattr(
+                            global_cfg,
+                            'iterative_ode_steps',
+                            getattr(global_cfg, 'iterative_ddim_steps', self.ode_steps),
+                        )
+                    )
+                    if iter_ode_steps <= 0:
+                        iter_ode_steps = self.ode_steps
                     disp = self.sample_disp_iterative(
                         cnn_feature,
                         i_it_py,
@@ -644,7 +653,7 @@ class FlowMatchingEvolution(nn.Module):
                         py_ind,
                         num_iter_steps=iter_steps,
                         fractions=fractions,
-                        ode_steps=self.ode_steps,
+                        ode_steps=iter_ode_steps,
                     )
                     if self.use_fourier_smooth > 0:
                         disp = self.fourier_smooth(disp, self.use_fourier_smooth)
