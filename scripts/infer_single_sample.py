@@ -13,6 +13,7 @@ _custom_parser = argparse.ArgumentParser(add_help=False)
 _custom_parser.add_argument('--tag', default='', type=str)
 _custom_parser.add_argument('--out_dir', default='', type=str)
 _custom_parser.add_argument('--index', default=0, type=int)
+_custom_parser.add_argument('--annotate_pred_count', default=0, type=int)
 _custom_args, _remaining_argv = _custom_parser.parse_known_args()
 sys.argv = [sys.argv[0]] + _remaining_argv
 
@@ -45,6 +46,23 @@ def draw_poly(img, poly, color, thickness=2):
     if pts.size == 0:
         return
     cv2.polylines(img, [pts], isClosed=True, color=color, thickness=thickness)
+
+
+def annotate_pred_point_counts(img, pred_np, valid_counts=None):
+    for idx, poly in enumerate(pred_np):
+        pts = np.asarray(poly, dtype=np.float32)
+        if pts.ndim != 2 or pts.shape[0] == 0:
+            continue
+        center = pts.mean(axis=0)
+        x = int(np.clip(center[0], 0, img.shape[1] - 1))
+        y = int(np.clip(center[1], 0, img.shape[0] - 1))
+        if valid_counts is not None and idx < len(valid_counts):
+            n_pts = int(valid_counts[idx])
+        else:
+            n_pts = int(pts.shape[0])
+        text = f"#{idx} pts={n_pts}"
+        cv2.putText(img, text, (x, y), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (0, 0, 0), 2, cv2.LINE_AA)
+        cv2.putText(img, text, (x, y), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (255, 255, 255), 1, cv2.LINE_AA)
 
 
 def fourier_low_pass(disp, k):
@@ -115,6 +133,7 @@ def infer_one(model, device, sample, out_path):
         c_it_py = batch['c_it_py'][0][mask]
         i_gt_py = batch['i_gt_py'][0][mask]
         i_gt_4py = batch['i_gt_4py'][0][mask] if 'i_gt_4py' in batch else None
+        point_mask = batch['point_mask'][0][mask] if 'point_mask' in batch else None
         py_ind = torch.zeros((i_it_py.size(0),), dtype=torch.long, device=device)
 
         # V3.5 uses its own Fourier-space forward path.
@@ -167,6 +186,11 @@ def infer_one(model, device, sample, out_path):
         draw_poly(orig_img, poly, (0, 255, 255), thickness=1)
     for poly in pred_np:
         draw_poly(orig_img, poly, (0, 0, 255), thickness=2)
+    if int(_custom_args.annotate_pred_count) > 0:
+        valid_counts = None
+        if point_mask is not None:
+            valid_counts = to_numpy(point_mask).sum(axis=1).astype(np.int32).tolist()
+        annotate_pred_point_counts(orig_img, pred_np, valid_counts=valid_counts)
     if gt4_np is not None:
         for poly in gt4_np:
             draw_poly(orig_img, poly, (255, 0, 255), thickness=1)

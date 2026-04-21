@@ -228,11 +228,12 @@ class Dataset(data.Dataset):
         x_min, y_min = np.min(extreme_point[:, 0]), np.min(extreme_point[:, 1])
         x_max, y_max = np.max(extreme_point[:, 0]), np.max(extreme_point[:, 1])
         bbox = [x_min, y_min, x_max, y_max]
+        num_points = self.compute_adaptive_points(bbox)
         base_init_poly = snake_voc_utils.get_evolution_init(extreme_point, bbox)
-        img_init_poly = snake_voc_utils.uniformsample(base_init_poly, snake_config.poly_num)
+        img_init_poly = snake_voc_utils.uniformsample(base_init_poly, num_points)
         can_init_poly = snake_voc_utils.img_poly_to_can_poly(img_init_poly, x_min, y_min, x_max, y_max)
 
-        img_gt_poly = snake_voc_utils.uniformsample(poly, len(poly) * snake_config.gt_poly_num)
+        img_gt_poly = snake_voc_utils.uniformsample(poly, len(poly) * num_points)
         tt_idx = np.argmin(np.power(img_gt_poly - img_init_poly[0], 2).sum(axis=1))
         img_gt_poly = np.roll(img_gt_poly, -tt_idx, axis=0)[::len(poly)]
         can_gt_poly = snake_voc_utils.img_poly_to_can_poly(img_gt_poly, x_min, y_min, x_max, y_max)
@@ -241,6 +242,35 @@ class Dataset(data.Dataset):
         can_init_polys.append(can_init_poly)
         img_gt_polys.append(img_gt_poly)
         can_gt_polys.append(can_gt_poly)
+
+    def compute_adaptive_points(self, bbox):
+        """Compute contour point count from bbox when adaptive mode is enabled."""
+        if not getattr(snake_config, 'adaptive_points_enabled', False):
+            return int(snake_config.poly_num)
+
+        w = float(bbox[2] - bbox[0])
+        h = float(bbox[3] - bbox[1])
+
+        target_density = float(getattr(snake_config, 'target_density', 2.5))
+        min_points = int(getattr(snake_config, 'min_points', 32))
+        max_points = int(getattr(snake_config, 'max_points', 512))
+        round_to = max(1, int(getattr(snake_config, 'round_to_multiple', 8)))
+        strategy = str(getattr(snake_config, 'point_strategy', 'perimeter'))
+
+        if strategy == 'perimeter':
+            base_points = 2.0 * (w + h) / max(target_density, 1e-6)
+        elif strategy == 'area':
+            base_points = np.sqrt(max(w * h, 0.0)) * 1.5
+        elif strategy == 'mixed':
+            perimeter_factor = 2.0 * (w + h) / max(target_density, 1e-6)
+            area_factor = np.sqrt(max(w * h, 0.0)) * 1.5
+            base_points = 0.6 * perimeter_factor + 0.4 * area_factor
+        else:
+            base_points = 2.0 * (w + h) / max(target_density, 1e-6)
+
+        num_points = int(np.clip(base_points, min_points, max_points))
+        num_points = ((num_points + round_to - 1) // round_to) * round_to
+        return int(min(max(num_points, min_points), max_points))
         
     def prepare_merge(self, is_id, cls_id, cp_id, cp_cls):
         cp_id.append(is_id)

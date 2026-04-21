@@ -127,6 +127,11 @@ class FlowMatchingEvolution(nn.Module):
         self._infer_noise_scale = float(getattr(global_cfg, 'infer_noise_scale', -1.0))
         # V3.7.6: fix t=0 during training (pure direct regression)
         self._flow_fix_t0 = bool(getattr(global_cfg, 'flow_fix_t0', False))
+        # V3.7/V6b-style generalization knobs used by the standalone scripts.
+        self._use_contour_norm = bool(getattr(global_cfg, 'v3_7_use_contour_norm', False))
+        self._flow_zero_x0_prob = float(getattr(global_cfg, 'flow_zero_x0_prob', 0.0))
+        self._flow_t_beta_alpha = float(getattr(global_cfg, 'flow_t_beta_alpha', 1.0))
+        self._flow_t_beta_beta = float(getattr(global_cfg, 'flow_t_beta_beta', 1.0))
 
         # CMAM 先验参数保留 (以防外部调用)
         self.compute_L = True
@@ -183,6 +188,44 @@ class FlowMatchingEvolution(nn.Module):
         return (disp_norm + 1.0) * 0.5 * scale.to(disp_norm.device, disp_norm.dtype) + self._disp_min.to(disp_norm.device, disp_norm.dtype)
 
     @staticmethod
+    def compute_contour_scale(polys: torch.Tensor) -> torch.Tensor:
+        span_x = polys[..., 0].amax(dim=1) - polys[..., 0].amin(dim=1)
+        span_y = polys[..., 1].amax(dim=1) - polys[..., 1].amin(dim=1)
+        contour_scale = torch.maximum(span_x, span_y).clamp_min(1.0)
+        return contour_scale.view(-1, 1, 1)
+
+    def normalize_target_disp(self, disp_raw: torch.Tensor, contour_scale: torch.Tensor) -> torch.Tensor:
+        if self._use_contour_norm:
+            return disp_raw / contour_scale.to(disp_raw.device, disp_raw.dtype)
+        return self.normalize_disp(disp_raw)
+
+    def denormalize_pred_disp(self, disp_pred: torch.Tensor, contour_scale: torch.Tensor) -> torch.Tensor:
+        if self._use_contour_norm:
+            return disp_pred * contour_scale.to(disp_pred.device, disp_pred.dtype)
+        return self.denormalize_disp(disp_pred)
+
+    def sample_train_t(self, n: int, device: torch.device, dtype: torch.dtype) -> torch.Tensor:
+        if self._flow_fix_t0:
+            return torch.zeros(n, 1, 1, device=device, dtype=dtype)
+
+        alpha = max(self._flow_t_beta_alpha, 1e-6)
+        beta = max(self._flow_t_beta_beta, 1e-6)
+        if abs(alpha - 1.0) < 1e-6 and abs(beta - 1.0) < 1e-6:
+            return torch.rand(n, device=device, dtype=dtype).view(n, 1, 1)
+
+        dist = torch.distributions.Beta(alpha, beta)
+        return dist.sample((n,)).to(device=device, dtype=dtype).view(n, 1, 1)
+
+    def sample_train_x0(self, x1: torch.Tensor) -> torch.Tensor:
+        x0 = torch.randn_like(x1) * self._flow_train_noise_scale
+        if self._flow_zero_x0_prob > 0:
+            zero_mask = torch.rand(
+                x1.size(0), 1, 1, device=x1.device, dtype=x1.dtype
+            ) < self._flow_zero_x0_prob
+            x0 = torch.where(zero_mask, torch.zeros_like(x0), x0)
+        return x0
+
+    @staticmethod
     def fourier_smooth(disp: torch.Tensor, k: int) -> torch.Tensor:
         """Apply a Fourier low-pass filter to contour displacement."""
         if k <= 0:
@@ -194,7 +237,17 @@ class FlowMatchingEvolution(nn.Module):
         freq[:, ~mask, :] = 0
         return torch.fft.irfft(freq, n=n, dim=1)
 
-    def predict_velocity(self, cnn_feature, i_it_py, c_it_py, sampled_feat, py_ind, x_t, t_continuous):
+    def predict_velocity(
+        self,
+        cnn_feature,
+        i_it_py,
+        c_it_py,
+        sampled_feat,
+        py_ind,
+        x_t,
+        t_continuous,
+        contour_scale: Optional[torch.Tensor] = None,
+    ):
         """
         包装接口：预测速度场 V_t
         """
@@ -205,7 +258,16 @@ class FlowMatchingEvolution(nn.Module):
         t_scaled = t_continuous * 1000.0
         
         # Flow denoiser 核心调用，务必传入 sampled_feat
-        v_pred, L = self.denoiser(cnn_feature, sampled_feat, x_t, t_scaled, adj, polys=i_it_py, py_ind=py_ind)
+        v_pred, L = self.denoiser(
+            cnn_feature,
+            sampled_feat,
+            x_t,
+            t_scaled,
+            adj,
+            polys=i_it_py,
+            py_ind=py_ind,
+            contour_scale=contour_scale,
+        )
         return v_pred, L
 
     def _sample_disp_from_sampled_feat(
@@ -227,19 +289,28 @@ class FlowMatchingEvolution(nn.Module):
         device = i_it_py.device
         N = i_it_py.size(0)
         x_t = torch.randn_like(i_it_py) * noise_scale
+        contour_scale = self.compute_contour_scale(i_it_py)
+        contour_scale_flat = contour_scale.view(-1)
         dt = 1.0 / steps
         for i in range(steps):
             t_val = i * dt
             t_tensor = torch.full((N,), t_val, device=device, dtype=torch.float32)
             v_pred, _ = self.predict_velocity(
-                cnn_feature, i_it_py, c_it_py, sampled_feat, py_ind, x_t, t_tensor
+                cnn_feature,
+                i_it_py,
+                c_it_py,
+                sampled_feat,
+                py_ind,
+                x_t,
+                t_tensor,
+                contour_scale=contour_scale_flat,
             )
             x_t = x_t + v_pred * dt
             # V3.7: per-step ODE Fourier smoothing
             if self._ode_smooth_k > 0:
                 x_t = self.fourier_smooth(x_t, self._ode_smooth_k)
 
-        return self.denormalize_disp(x_t)
+        return self.denormalize_pred_disp(x_t, contour_scale)
 
     def sample_disp(self, cnn_feature, i_it_py, c_it_py, py_ind, steps=None) -> torch.Tensor:
         """
@@ -358,20 +429,28 @@ class FlowMatchingEvolution(nn.Module):
                         i_init_train_py[mask] = i_init_train_py[mask] + full_disp[mask] * frac
                         x1_raw[mask] = full_disp[mask] * (1.0 - frac)
 
-            x1 = self.normalize_disp(x1_raw)
+            contour_scale = self.compute_contour_scale(i_init_train_py)
+            contour_scale_flat = contour_scale.view(-1)
+            x1 = self.normalize_target_disp(x1_raw, contour_scale)
             N = x1.size(0)
 
             # --- Flow Matching Core ---
-            if self._flow_fix_t0:
-                t = torch.zeros(N, 1, 1, device=device)
-            else:
-                t = torch.rand(N, device=device).view(N, 1, 1)
-            x0 = torch.randn_like(x1) * self._flow_train_noise_scale
+            t = self.sample_train_t(N, device=device, dtype=x1.dtype)
+            x0 = self.sample_train_x0(x1)
             x_t = (1.0 - t) * x0 + t * x1
 
             # --- 特征采样 & 预测 ---
             sampled_feat_curr = snake_gcn_utils.get_gcn_feature(cnn_feature, i_init_train_py, py_ind, h, w)
-            v_pred, L_reg = self.predict_velocity(cnn_feature, i_init_train_py, c_init_train_py, sampled_feat_curr, py_ind, x_t, t.view(-1))
+            v_pred, L_reg = self.predict_velocity(
+                cnn_feature,
+                i_init_train_py,
+                c_init_train_py,
+                sampled_feat_curr,
+                py_ind,
+                x_t,
+                t.view(-1),
+                contour_scale=contour_scale_flat,
+            )
 
             # 5. 计算目标速度 V_target = X_1 - X_0
             v_target = x1 - x0
