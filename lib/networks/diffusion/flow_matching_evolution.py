@@ -16,6 +16,14 @@ class FlowMatchingEvolution(nn.Module):
     Flow Matching (Rectified Flow) Evolution Wrapper
     Replaces DDPM diffusion with continuous vector field prediction.
     """
+    @staticmethod
+    def _detail_feature_multiplier(mode: str) -> int:
+        if mode == 'normal':
+            return 3
+        if mode == 'normal_tangent':
+            return 6
+        raise ValueError(f"Unsupported v3_7_detail_context_mode: {mode}")
+
     def __init__(
         self,
         state_dim: int = 128,
@@ -52,11 +60,15 @@ class FlowMatchingEvolution(nn.Module):
             _delta_scale = float(getattr(global_cfg, 'v3_7_delta_scale', 0.1))
             _delta_reg = float(getattr(global_cfg, 'v3_7_delta_reg_weight', 0.001))
             _scale_cond = bool(getattr(global_cfg, 'v3_7_use_scale_conditioning', False))
+            _detail_ctx = bool(getattr(global_cfg, 'v3_7_use_detail_context', False))
+            _detail_mode = str(getattr(global_cfg, 'v3_7_detail_context_mode', 'normal')).strip().lower()
+            _detail_mult = self._detail_feature_multiplier(_detail_mode) if _detail_ctx else 0
             print(f"[FlowMatchingEvolution] Using DiT Flow Network V3.7 "
                   f"(per_point_head={_per_pt}, regularized={_reg_pt}, "
                   f"float64_head={_f64_head}, "
                   f"inject_in={_inject_in}, inject_out={_inject_out}, "
-                  f"scale_cond={_scale_cond}, ODE steps={ode_steps})")
+                  f"scale_cond={_scale_cond}, detail_ctx={_detail_ctx}, "
+                  f"detail_mode={_detail_mode}, ODE steps={ode_steps})")
             self.denoiser = DiTFlowMatchingV3_7(
                 state_dim=dit_state_dim,
                 feature_dim=feature_dim,
@@ -73,6 +85,8 @@ class FlowMatchingEvolution(nn.Module):
                 inject_at_input=_inject_in,
                 inject_at_output=_inject_out,
                 use_scale_conditioning=_scale_cond,
+                use_detail_context=_detail_ctx,
+                detail_feature_dim=feature_dim * _detail_mult,
             )
         # V3.6: V3 global query + iterative refinement + Flow Matching
         elif getattr(global_cfg, 'use_dit_v3_6', False):
@@ -116,6 +130,12 @@ class FlowMatchingEvolution(nn.Module):
         # V3.7: spectral loss decomposition
         self._spectral_loss_k = int(getattr(global_cfg, 'v3_7_spectral_loss_k', 0))
         self._hf_loss_weight = float(getattr(global_cfg, 'v3_7_hf_loss_weight', 0.1))
+        # V3.7: curvature-aware point weighting for high-curvature detail
+        self._use_curvature_reweight = bool(getattr(global_cfg, 'v3_7_use_curvature_reweight', False))
+        self._curvature_loss_weight = float(getattr(global_cfg, 'v3_7_curvature_loss_weight', 1.0))
+        self._curvature_reweight_power = float(getattr(global_cfg, 'v3_7_curvature_reweight_power', 1.0))
+        self._use_detail_context = bool(getattr(global_cfg, 'v3_7_use_detail_context', False))
+        self._detail_context_mode = str(getattr(global_cfg, 'v3_7_detail_context_mode', 'normal')).strip().lower()
         # V3.7.3: low-noise flow matching (default 1.0 = standard)
         self._flow_noise_scale = float(getattr(global_cfg, 'flow_noise_scale', 1.0))
         # Optional training-only noise scale (fallback to flow_noise_scale)
@@ -225,6 +245,80 @@ class FlowMatchingEvolution(nn.Module):
             x0 = torch.where(zero_mask, torch.zeros_like(x0), x0)
         return x0
 
+    def compute_curvature_weights(self, polys: torch.Tensor) -> torch.Tensor:
+        prev_pt = torch.roll(polys, 1, dims=1)
+        next_pt = torch.roll(polys, -1, dims=1)
+        curvature = (prev_pt - 2.0 * polys + next_pt).norm(dim=-1)
+        curvature_norm = curvature / (curvature.amax(dim=1, keepdim=True) + 1e-6)
+        if self._curvature_reweight_power != 1.0:
+            curvature_norm = curvature_norm.pow(self._curvature_reweight_power)
+        return 1.0 + self._curvature_loss_weight * curvature_norm
+
+    def sample_detail_features(
+        self,
+        cnn_feature: torch.Tensor,
+        img_poly: torch.Tensor,
+        py_ind: torch.Tensor,
+        h: int,
+        w: int,
+        sampled_feat: Optional[torch.Tensor] = None,
+        contour_scale: Optional[torch.Tensor] = None,
+    ) -> Optional[torch.Tensor]:
+        if not self._use_detail_context:
+            return None
+        if img_poly.numel() == 0:
+            channels = cnn_feature.size(1)
+            return cnn_feature.new_zeros((0, channels * 3, 0))
+
+        if sampled_feat is None:
+            sampled_feat = snake_gcn_utils.get_gcn_feature(cnn_feature, img_poly, py_ind, h, w)
+        if contour_scale is None:
+            contour_scale = self.compute_contour_scale(img_poly)
+
+        prev_pt = torch.roll(img_poly, 1, dims=1)
+        next_pt = torch.roll(img_poly, -1, dims=1)
+        tangent = next_pt - prev_pt
+        tangent = tangent / tangent.norm(dim=-1, keepdim=True).clamp_min(1e-6)
+        normal = torch.stack([-tangent[..., 1], tangent[..., 0]], dim=-1)
+
+        contour_scale = contour_scale.to(img_poly.device, img_poly.dtype)
+        radius_1 = torch.clamp(contour_scale / 64.0, min=0.75, max=2.0)
+        radius_2 = torch.clamp(contour_scale / 32.0, min=1.5, max=4.0)
+
+        plus_1 = snake_gcn_utils.get_gcn_feature(cnn_feature, img_poly + normal * radius_1, py_ind, h, w)
+        minus_1 = snake_gcn_utils.get_gcn_feature(cnn_feature, img_poly - normal * radius_1, py_ind, h, w)
+        plus_2 = snake_gcn_utils.get_gcn_feature(cnn_feature, img_poly + normal * radius_2, py_ind, h, w)
+        minus_2 = snake_gcn_utils.get_gcn_feature(cnn_feature, img_poly - normal * radius_2, py_ind, h, w)
+
+        detail_terms = [
+            plus_1 - minus_1,
+            plus_2 - minus_2,
+            0.5 * (plus_1 + minus_1) - sampled_feat,
+        ]
+
+        if self._detail_context_mode == 'normal_tangent':
+            tangent_plus_1 = snake_gcn_utils.get_gcn_feature(
+                cnn_feature, img_poly + tangent * radius_1, py_ind, h, w
+            )
+            tangent_minus_1 = snake_gcn_utils.get_gcn_feature(
+                cnn_feature, img_poly - tangent * radius_1, py_ind, h, w
+            )
+            tangent_plus_2 = snake_gcn_utils.get_gcn_feature(
+                cnn_feature, img_poly + tangent * radius_2, py_ind, h, w
+            )
+            tangent_minus_2 = snake_gcn_utils.get_gcn_feature(
+                cnn_feature, img_poly - tangent * radius_2, py_ind, h, w
+            )
+            detail_terms.extend([
+                tangent_plus_1 - tangent_minus_1,
+                tangent_plus_2 - tangent_minus_2,
+                0.5 * (tangent_plus_1 + tangent_minus_1) - sampled_feat,
+            ])
+        elif self._detail_context_mode != 'normal':
+            raise ValueError(f"Unsupported v3_7_detail_context_mode: {self._detail_context_mode}")
+
+        return torch.cat(detail_terms, dim=1)
+
     @staticmethod
     def fourier_smooth(disp: torch.Tensor, k: int) -> torch.Tensor:
         """Apply a Fourier low-pass filter to contour displacement."""
@@ -243,6 +337,7 @@ class FlowMatchingEvolution(nn.Module):
         i_it_py,
         c_it_py,
         sampled_feat,
+        detail_feat,
         py_ind,
         x_t,
         t_continuous,
@@ -267,6 +362,7 @@ class FlowMatchingEvolution(nn.Module):
             polys=i_it_py,
             py_ind=py_ind,
             contour_scale=contour_scale,
+            detail_feat=detail_feat,
         )
         return v_pred, L
 
@@ -277,6 +373,7 @@ class FlowMatchingEvolution(nn.Module):
         c_it_py,
         py_ind,
         sampled_feat,
+        detail_feat,
         steps=None,
         noise_scale=None,
     ) -> torch.Tensor:
@@ -300,6 +397,7 @@ class FlowMatchingEvolution(nn.Module):
                 i_it_py,
                 c_it_py,
                 sampled_feat,
+                detail_feat,
                 py_ind,
                 x_t,
                 t_tensor,
@@ -326,18 +424,28 @@ class FlowMatchingEvolution(nn.Module):
         
         # 推理时：先进行一次特征采样
         sampled_feat = snake_gcn_utils.get_gcn_feature(cnn_feature, i_it_py, py_ind, h, w)
+        contour_scale = self.compute_contour_scale(i_it_py)
+        detail_feat = self.sample_detail_features(
+            cnn_feature,
+            i_it_py,
+            py_ind,
+            h,
+            w,
+            sampled_feat=sampled_feat,
+            contour_scale=contour_scale,
+        )
 
         avg_n = self._infer_avg_samples
         if avg_n > 1:
             all_disps = []
             for _ in range(avg_n):
                 d = self._sample_disp_from_sampled_feat(
-                    cnn_feature, i_it_py, c_it_py, py_ind, sampled_feat, steps=steps)
+                    cnn_feature, i_it_py, c_it_py, py_ind, sampled_feat, detail_feat, steps=steps)
                 all_disps.append(d)
             return torch.stack(all_disps).mean(dim=0)
 
         return self._sample_disp_from_sampled_feat(
-            cnn_feature, i_it_py, c_it_py, py_ind, sampled_feat, steps=steps
+            cnn_feature, i_it_py, c_it_py, py_ind, sampled_feat, detail_feat, steps=steps
         )
 
     def sample_disp_iterative(
@@ -367,12 +475,23 @@ class FlowMatchingEvolution(nn.Module):
 
         for step_idx in range(num_iter_steps):
             sampled_feat = snake_gcn_utils.get_gcn_feature(cnn_feature, current_contour, py_ind, h, w)
+            contour_scale = self.compute_contour_scale(current_contour)
+            detail_feat = self.sample_detail_features(
+                cnn_feature,
+                current_contour,
+                py_ind,
+                h,
+                w,
+                sampled_feat=sampled_feat,
+                contour_scale=contour_scale,
+            )
             disp = self._sample_disp_from_sampled_feat(
                 cnn_feature,
                 current_contour,
                 c_it_py,
                 py_ind,
                 sampled_feat,
+                detail_feat,
                 steps=ode_steps,
             )
             frac = fractions[step_idx]
@@ -441,11 +560,21 @@ class FlowMatchingEvolution(nn.Module):
 
             # --- 特征采样 & 预测 ---
             sampled_feat_curr = snake_gcn_utils.get_gcn_feature(cnn_feature, i_init_train_py, py_ind, h, w)
+            detail_feat_curr = self.sample_detail_features(
+                cnn_feature,
+                i_init_train_py,
+                py_ind,
+                h,
+                w,
+                sampled_feat=sampled_feat_curr,
+                contour_scale=contour_scale,
+            )
             v_pred, L_reg = self.predict_velocity(
                 cnn_feature,
                 i_init_train_py,
                 c_init_train_py,
                 sampled_feat_curr,
+                detail_feat_curr,
                 py_ind,
                 x_t,
                 t.view(-1),
@@ -456,7 +585,12 @@ class FlowMatchingEvolution(nn.Module):
             v_target = x1 - x0
 
             # 6. Flow Matching Loss (V3.7: optional spectral decomposition)
-            if self._spectral_loss_k > 0 and v_pred.size(1) > self._spectral_loss_k * 2:
+            if self._use_curvature_reweight:
+                gt_poly = i_init_train_py + x1_raw
+                point_weights = self.compute_curvature_weights(gt_poly).to(v_pred.dtype)
+                point_mse = (v_pred - v_target).pow(2).mean(dim=-1)
+                loss = (point_mse * point_weights).mean()
+            elif self._spectral_loss_k > 0 and v_pred.size(1) > self._spectral_loss_k * 2:
                 v_pred_lf = self.fourier_smooth(v_pred, self._spectral_loss_k)
                 v_target_lf = self.fourier_smooth(v_target, self._spectral_loss_k)
                 loss_lf = F.mse_loss(v_pred_lf, v_target_lf, reduction='mean')

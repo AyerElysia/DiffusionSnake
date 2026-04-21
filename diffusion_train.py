@@ -137,6 +137,21 @@ def main():
     if torch.cuda.is_available():
         trainer.network.cuda()
 
+    if bool(getattr(cfg.train, 'detail_context_only', False)):
+        detail_keywords = ('detail_local_proj', 'detail_point_proj')
+        total_params = 0
+        trainable_params = 0
+        for name, param in trainer.network.named_parameters():
+            allow_train = any(keyword in name for keyword in detail_keywords)
+            param.requires_grad = allow_train
+            total_params += int(param.numel())
+            if allow_train:
+                trainable_params += int(param.numel())
+        logger.info(
+            "Detail-context-only fine-tune enabled: "
+            f"trainable_params={trainable_params} / total_params={total_params}"
+        )
+
     if is_distributed:
         _ddp_find_unused = os.environ.get('DDP_FIND_UNUSED_PARAMETERS', '1')
         _ddp_find_unused = str(_ddp_find_unused).strip().lower() in ('1', 'true', 'yes', 'y', 'on')
@@ -339,6 +354,8 @@ def main():
         except Exception:
             return False
 
+    resume_weights_only = bool(getattr(cfg, 'resume_weights_only', False))
+
     if getattr(cfg, 'resume', False):
         candidate = resume_path if resume_path else os.path.join(ckpt_dir, 'latest.pt')
         if candidate and os.path.exists(candidate):
@@ -379,11 +396,15 @@ def main():
                 except RuntimeError as e:
                     logger.error(f"Failed to load model state dict: {e}")
 
-                if 'optimizer' in resume_checkpoint:
+                if (not resume_weights_only) and ('optimizer' in resume_checkpoint):
                     _safe_load_optimizer_state(optimizer, resume_checkpoint['optimizer'])
 
-                resume_step = int(resume_checkpoint.get('step', 0))
-                logger.info(f"Resuming from step {resume_step}")
+                if resume_weights_only:
+                    resume_step = 0
+                    logger.info("Weights-only resume enabled: optimizer, scheduler, and step state were reset.")
+                else:
+                    resume_step = int(resume_checkpoint.get('step', 0))
+                    logger.info(f"Resuming from step {resume_step}")
 
     def _find_jsonl_truncate_pos(jsonl_path: str, keep_step: int):
         """Return byte position to truncate jsonl so that all remaining lines satisfy step <= keep_step."""
@@ -763,7 +784,7 @@ def main():
                     eta_min=float(eta_min),
                     last_epoch=int(global_step - 1),
                 )
-            if isinstance(resume_checkpoint, dict) and 'scheduler' in resume_checkpoint:
+            if (not resume_weights_only) and isinstance(resume_checkpoint, dict) and 'scheduler' in resume_checkpoint:
                 try:
                     scheduler.load_state_dict(resume_checkpoint['scheduler'])
                 except Exception:

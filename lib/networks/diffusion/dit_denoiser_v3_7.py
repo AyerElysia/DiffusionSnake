@@ -176,6 +176,8 @@ class DiTFlowMatchingV3_7(DiTFlowMatchingV3_2):
                  inject_at_input: bool = False,
                  inject_at_output: bool = False,
                  use_scale_conditioning: bool = False,
+                 use_detail_context: bool = False,
+                 detail_feature_dim: int = 192,
                  **kwargs):
         super().__init__(*args, num_points=num_points, **kwargs)
 
@@ -186,6 +188,7 @@ class DiTFlowMatchingV3_7(DiTFlowMatchingV3_2):
         self.inject_at_output = inject_at_output
         self.use_per_point_head = use_per_point_head
         self.use_scale_conditioning = use_scale_conditioning
+        self.use_detail_context = use_detail_context
 
         # Scale conditioning: embeds log(contour_scale) and adds to t_emb.
         # Zero-initialized output so it starts as identity (safe for warm start).
@@ -197,6 +200,22 @@ class DiTFlowMatchingV3_7(DiTFlowMatchingV3_2):
             )
             nn.init.zeros_(self.scale_embed_net[-1].weight)
             nn.init.zeros_(self.scale_embed_net[-1].bias)
+
+        if use_detail_context:
+            self.detail_local_proj = nn.Sequential(
+                nn.Linear(detail_feature_dim, self.state_dim),
+                nn.SiLU(),
+                nn.Linear(self.state_dim, self.state_dim),
+            )
+            self.detail_point_proj = nn.Sequential(
+                nn.Linear(detail_feature_dim, self.state_dim),
+                nn.SiLU(),
+                nn.Linear(self.state_dim, self.state_dim),
+            )
+            nn.init.zeros_(self.detail_local_proj[-1].weight)
+            nn.init.zeros_(self.detail_local_proj[-1].bias)
+            nn.init.zeros_(self.detail_point_proj[-1].weight)
+            nn.init.zeros_(self.detail_point_proj[-1].bias)
 
         if use_per_point_head:
             self._shared_final_layer = self.final_layer
@@ -236,6 +255,7 @@ class DiTFlowMatchingV3_7(DiTFlowMatchingV3_2):
         polys=None,
         py_ind: torch.Tensor = None,
         contour_scale: torch.Tensor = None,
+        detail_feat: torch.Tensor = None,
     ) -> tuple:
         assert x_t.dim() == 3 and x_t.shape[-1] == 2
         assert t.dim() == 1
@@ -249,6 +269,8 @@ class DiTFlowMatchingV3_7(DiTFlowMatchingV3_2):
             x_t = x_t.to(param_dtype)
         if sampled_feat.dtype != param_dtype:
             sampled_feat = sampled_feat.to(param_dtype)
+        if detail_feat is not None and detail_feat.dtype != param_dtype:
+            detail_feat = detail_feat.to(param_dtype)
         if cnn_feature.dtype != param_dtype:
             cnn_feature = cnn_feature.to(param_dtype)
 
@@ -276,6 +298,10 @@ class DiTFlowMatchingV3_7(DiTFlowMatchingV3_2):
 
         local_ctx = self.local_proj(sampled_feat.transpose(1, 2))
         x = self.point_embed(x_t, sampled_feat)
+        if self.use_detail_context and detail_feat is not None:
+            detail_ctx = detail_feat.transpose(1, 2)
+            local_ctx = local_ctx + self.detail_local_proj(detail_ctx)
+            x = x + self.detail_point_proj(detail_ctx)
 
         if self.inject_at_input:
             point_ids = self._point_indices[:P].unsqueeze(0).expand(N, -1)
