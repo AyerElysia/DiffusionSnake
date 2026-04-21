@@ -65,6 +65,8 @@ max_points = getattr(cfg, 'max_points', 512)
 target_density = getattr(cfg, 'target_density', 2.5)
 round_to_multiple = getattr(cfg, 'round_to_multiple', 8)
 point_strategy = getattr(cfg, 'point_strategy', 'perimeter')
+poly_resample_mode = getattr(cfg, 'poly_resample_mode', 'uniform')
+poly_resample_curvature_alpha = getattr(cfg, 'poly_resample_curvature_alpha', 1.5)
 
 adj_num = 4
 

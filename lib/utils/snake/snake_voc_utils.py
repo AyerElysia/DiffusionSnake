@@ -413,6 +413,38 @@ def uniform_sample_init(poly):
     return np.concatenate(polys)
 
 
+def _get_poly_resample_mode():
+    return str(getattr(snake_config, 'poly_resample_mode', 'uniform')).strip().lower()
+
+
+def _get_poly_resample_curvature_alpha():
+    return float(getattr(snake_config, 'poly_resample_curvature_alpha', 1.5))
+
+
+def _compute_edge_weights(pgtnp_px2, edgelen_p):
+    mode = _get_poly_resample_mode()
+    alpha = _get_poly_resample_curvature_alpha()
+    if mode == 'uniform' or alpha <= 0 or len(pgtnp_px2) < 3:
+        return edgelen_p
+
+    prev_px2 = np.roll(pgtnp_px2, 1, axis=0)
+    next_px2 = np.roll(pgtnp_px2, -1, axis=0)
+    prev_vec = pgtnp_px2 - prev_px2
+    next_vec = next_px2 - pgtnp_px2
+
+    prev_norm = np.linalg.norm(prev_vec, axis=1)
+    next_norm = np.linalg.norm(next_vec, axis=1)
+    denom = np.clip(prev_norm * next_norm, a_min=1e-6, a_max=None)
+    cos_theta = np.sum(prev_vec * next_vec, axis=1) / denom
+    cos_theta = np.clip(cos_theta, -1.0, 1.0)
+    turn = np.arccos(cos_theta) / np.pi
+    edge_turn = 0.5 * (turn + np.roll(turn, -1))
+
+    if mode == 'curvature':
+        return edgelen_p * (1.0 + alpha * edge_turn)
+    return edgelen_p
+
+
 def uniformsample(pgtnp_px2, newpnum):
     pnum, cnum = pgtnp_px2.shape
     assert cnum == 2
@@ -420,7 +452,8 @@ def uniformsample(pgtnp_px2, newpnum):
     idxnext_p = (np.arange(pnum, dtype=np.int32) + 1) % pnum
     pgtnext_px2 = pgtnp_px2[idxnext_p]
     edgelen_p = np.sqrt(np.sum((pgtnext_px2 - pgtnp_px2) ** 2, axis=1))
-    edgeidxsort_p = np.argsort(edgelen_p)
+    edgeweight_p = _compute_edge_weights(pgtnp_px2, edgelen_p)
+    edgeidxsort_p = np.argsort(edgeweight_p)
 
     # two cases
     # we need to remove gt points
@@ -434,7 +467,11 @@ def uniformsample(pgtnp_px2, newpnum):
     # we need to add gt points
     # we simply add it uniformly
     else:
-        edgenum = np.round(edgelen_p * newpnum / np.sum(edgelen_p)).astype(np.int32)
+        weight_sum = np.sum(edgeweight_p)
+        if weight_sum <= 1e-6:
+            edgeweight_p = edgelen_p
+            weight_sum = np.sum(edgeweight_p)
+        edgenum = np.round(edgeweight_p * newpnum / weight_sum).astype(np.int32)
         for i in range(pnum):
             if edgenum[i] == 0:
                 edgenum[i] = 1

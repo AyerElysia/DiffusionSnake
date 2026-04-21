@@ -177,6 +177,8 @@ class DiTFlowMatchingV3_7(DiTFlowMatchingV3_2):
                  inject_at_output: bool = False,
                  use_scale_conditioning: bool = False,
                  use_detail_context: bool = False,
+                 use_detail_curve_context: bool = False,
+                 detail_curve_inject_mode: str = 'both',
                  detail_feature_dim: int = 192,
                  **kwargs):
         super().__init__(*args, num_points=num_points, **kwargs)
@@ -189,6 +191,10 @@ class DiTFlowMatchingV3_7(DiTFlowMatchingV3_2):
         self.use_per_point_head = use_per_point_head
         self.use_scale_conditioning = use_scale_conditioning
         self.use_detail_context = use_detail_context
+        self.use_detail_curve_context = use_detail_curve_context
+        self.detail_curve_inject_mode = str(detail_curve_inject_mode).strip().lower()
+        self.use_detail_curve_local = self.detail_curve_inject_mode in ('both', 'local')
+        self.use_detail_curve_point = self.detail_curve_inject_mode in ('both', 'point')
 
         # Scale conditioning: embeds log(contour_scale) and adds to t_emb.
         # Zero-initialized output so it starts as identity (safe for warm start).
@@ -216,6 +222,22 @@ class DiTFlowMatchingV3_7(DiTFlowMatchingV3_2):
             nn.init.zeros_(self.detail_local_proj[-1].bias)
             nn.init.zeros_(self.detail_point_proj[-1].weight)
             nn.init.zeros_(self.detail_point_proj[-1].bias)
+            if use_detail_curve_context:
+                curve_dim = detail_feature_dim * 3
+                self.detail_curve_local_proj = nn.Sequential(
+                    nn.Linear(curve_dim, self.state_dim),
+                    nn.SiLU(),
+                    nn.Linear(self.state_dim, self.state_dim),
+                )
+                self.detail_curve_point_proj = nn.Sequential(
+                    nn.Linear(curve_dim, self.state_dim),
+                    nn.SiLU(),
+                    nn.Linear(self.state_dim, self.state_dim),
+                )
+                nn.init.zeros_(self.detail_curve_local_proj[-1].weight)
+                nn.init.zeros_(self.detail_curve_local_proj[-1].bias)
+                nn.init.zeros_(self.detail_curve_point_proj[-1].weight)
+                nn.init.zeros_(self.detail_curve_point_proj[-1].bias)
 
         if use_per_point_head:
             self._shared_final_layer = self.final_layer
@@ -302,6 +324,16 @@ class DiTFlowMatchingV3_7(DiTFlowMatchingV3_2):
             detail_ctx = detail_feat.transpose(1, 2)
             local_ctx = local_ctx + self.detail_local_proj(detail_ctx)
             x = x + self.detail_point_proj(detail_ctx)
+            if self.use_detail_curve_context:
+                detail_curve_ctx = torch.cat([
+                    torch.roll(detail_ctx, 1, dims=1),
+                    detail_ctx,
+                    torch.roll(detail_ctx, -1, dims=1),
+                ], dim=-1)
+                if self.use_detail_curve_local:
+                    local_ctx = local_ctx + self.detail_curve_local_proj(detail_curve_ctx)
+                if self.use_detail_curve_point:
+                    x = x + self.detail_curve_point_proj(detail_curve_ctx)
 
         if self.inject_at_input:
             point_ids = self._point_indices[:P].unsqueeze(0).expand(N, -1)

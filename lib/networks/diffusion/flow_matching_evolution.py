@@ -61,6 +61,10 @@ class FlowMatchingEvolution(nn.Module):
             _delta_reg = float(getattr(global_cfg, 'v3_7_delta_reg_weight', 0.001))
             _scale_cond = bool(getattr(global_cfg, 'v3_7_use_scale_conditioning', False))
             _detail_ctx = bool(getattr(global_cfg, 'v3_7_use_detail_context', False))
+            _detail_curve_ctx = bool(getattr(global_cfg, 'v3_7_use_detail_curve_context', False))
+            _detail_curve_inject_mode = str(
+                getattr(global_cfg, 'v3_7_detail_curve_inject_mode', 'both')
+            ).strip().lower()
             _detail_mode = str(getattr(global_cfg, 'v3_7_detail_context_mode', 'normal')).strip().lower()
             _detail_mult = self._detail_feature_multiplier(_detail_mode) if _detail_ctx else 0
             print(f"[FlowMatchingEvolution] Using DiT Flow Network V3.7 "
@@ -68,7 +72,9 @@ class FlowMatchingEvolution(nn.Module):
                   f"float64_head={_f64_head}, "
                   f"inject_in={_inject_in}, inject_out={_inject_out}, "
                   f"scale_cond={_scale_cond}, detail_ctx={_detail_ctx}, "
-                  f"detail_mode={_detail_mode}, ODE steps={ode_steps})")
+                  f"detail_curve_ctx={_detail_curve_ctx}, "
+                  f"detail_mode={_detail_mode}, "
+                  f"curve_inject={_detail_curve_inject_mode}, ODE steps={ode_steps})")
             self.denoiser = DiTFlowMatchingV3_7(
                 state_dim=dit_state_dim,
                 feature_dim=feature_dim,
@@ -86,6 +92,8 @@ class FlowMatchingEvolution(nn.Module):
                 inject_at_output=_inject_out,
                 use_scale_conditioning=_scale_cond,
                 use_detail_context=_detail_ctx,
+                use_detail_curve_context=_detail_curve_ctx,
+                detail_curve_inject_mode=_detail_curve_inject_mode,
                 detail_feature_dim=feature_dim * _detail_mult,
             )
         # V3.6: V3 global query + iterative refinement + Flow Matching

@@ -137,18 +137,28 @@ def main():
     if torch.cuda.is_available():
         trainer.network.cuda()
 
-    if bool(getattr(cfg.train, 'detail_context_only', False)):
-        detail_keywords = ('detail_local_proj', 'detail_point_proj')
+    if bool(getattr(cfg.train, 'detail_context_only', False)) or bool(
+        getattr(cfg.train, 'detail_context_head_only', False)
+    ):
+        detail_keywords = (
+            'detail_local_proj',
+            'detail_point_proj',
+            'detail_curve_local_proj',
+            'detail_curve_point_proj',
+        )
+        train_head = bool(getattr(cfg.train, 'detail_context_head_only', False))
         total_params = 0
         trainable_params = 0
         for name, param in trainer.network.named_parameters():
             allow_train = any(keyword in name for keyword in detail_keywords)
+            if train_head and '.final_layer.' in name and '._shared_final_layer.' not in name:
+                allow_train = True
             param.requires_grad = allow_train
             total_params += int(param.numel())
             if allow_train:
                 trainable_params += int(param.numel())
         logger.info(
-            "Detail-context-only fine-tune enabled: "
+            "Detail-context partial fine-tune enabled: "
             f"trainable_params={trainable_params} / total_params={total_params}"
         )
 

@@ -334,12 +334,45 @@ def img_poly_to_can_poly(img_poly):
     return can_poly
 
 
+def _get_poly_resample_mode():
+    return str(getattr(snake_config, 'poly_resample_mode', 'uniform')).strip().lower()
+
+
+def _get_poly_resample_curvature_alpha():
+    return float(getattr(snake_config, 'poly_resample_curvature_alpha', 1.5))
+
+
+def _compute_resample_edge_scores(poly: torch.Tensor) -> torch.Tensor:
+    next_poly = torch.roll(poly, -1, 2)
+    edge_len = (next_poly - poly).pow(2).sum(3).sqrt()
+
+    mode = _get_poly_resample_mode()
+    alpha = _get_poly_resample_curvature_alpha()
+    if mode == 'uniform' or alpha <= 0 or poly.size(2) < 3:
+        return edge_len
+
+    prev_poly = torch.roll(poly, 1, 2)
+    prev_vec = poly - prev_poly
+    next_vec = next_poly - poly
+    prev_norm = prev_vec.pow(2).sum(3).sqrt()
+    next_norm = next_vec.pow(2).sum(3).sqrt()
+    denom = (prev_norm * next_norm).clamp(min=1e-6)
+    cos_theta = (prev_vec * next_vec).sum(3) / denom
+    cos_theta = cos_theta.clamp(min=-1.0, max=1.0)
+    turn = torch.acos(cos_theta) / torch.pi
+    edge_turn = 0.5 * (turn + torch.roll(turn, -1, 2))
+
+    if mode == 'curvature':
+        return edge_len * (1.0 + alpha * edge_turn)
+    return edge_len
+
+
 def uniform_upsample(poly, p_num):  # 初始4边形上采样，不用深究原理过程（有点抽象）
     # 1. assign point number for each edge
     # 2. calculate the coefficient for linear interpolation
     next_poly = torch.roll(poly, -1, 2)
-    edge_len = (next_poly - poly).pow(2).sum(3).sqrt()
-    edge_num = torch.round(edge_len * p_num / torch.sum(edge_len, dim=2)[..., None]).long()
+    edge_score = _compute_resample_edge_scores(poly)
+    edge_num = torch.round(edge_score * p_num / torch.sum(edge_score, dim=2)[..., None].clamp(min=1e-6)).long()
     edge_num = torch.clamp(edge_num, min=1)
     edge_num_sum = torch.sum(edge_num, dim=2)
     edge_idx_sort = torch.argsort(edge_num, dim=2, descending=True)
@@ -387,12 +420,13 @@ def uniform_upsample(poly, p_num):  # 初始4边形上采样，不用深究原�
             pts = poly[b, n]              # [V, 2]
             nxt = torch.roll(pts, -1, dims=0)
             elen = torch.sqrt(torch.sum((nxt - pts) ** 2, dim=1) + 1e-12)  # [V]
-            total = torch.clamp(elen.sum(), min=1e-6)
-            frac = (elen / total) * float(p_num)
+            turn_score = _compute_resample_edge_scores(pts.view(1, 1, V, C))[0, 0]
+            total = torch.clamp(turn_score.sum(), min=1e-6)
+            frac = (turn_score / total) * float(p_num)
             en = torch.clamp(torch.round(frac), min=1).to(torch.int64)      # [V]
             diff = int(p_num - int(en.sum().item()))
             if diff != 0:
-                order = torch.argsort(elen, descending=True)
+                order = torch.argsort(turn_score, descending=True)
                 idx = 0
                 # Distribute residual to the longest edges first
                 while diff != 0:
@@ -416,8 +450,9 @@ def uniform_upsample(poly, p_num):  # 初始4边形上采样，不用深究原�
                 if k == 1:
                     samples.append(start.unsqueeze(0))
                 else:
-                    # Evenly spaced along edge, exclude endpoint to avoid duplicates
-                    t = torch.linspace(0.0, 1.0, steps=int(k), device=device, dtype=dtype)[:-1]
+                    # Sample exactly k points on this edge, including the start point
+                    # and excluding the endpoint to avoid duplicates across edges.
+                    t = torch.linspace(0.0, 1.0, steps=int(k) + 1, device=device, dtype=dtype)[:-1]
                     seg = start[None, :] * (1 - t[:, None]) + end[None, :] * t[:, None]
                     samples.append(seg)
             new_poly = torch.cat(samples, dim=0) if len(samples) else pts[:1]
