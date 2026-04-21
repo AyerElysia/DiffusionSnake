@@ -42,6 +42,13 @@ class Network(nn.Module):
         in_ch = 64 + nc
         self.cnn_proj = nn.Conv2d(in_ch, 64, kernel_size=1, bias=False)
 
+        # V6p: Optional multi-scale feature fusion (P3 at stride=8 adds larger receptive field)
+        # Zero-init so that loading a v6m checkpoint gives identical behavior at startup.
+        self.use_p3_features = bool(getattr(cfg, 'v3_7_use_p3_features', False))
+        if self.use_p3_features:
+            self.cnn_proj_p3 = nn.Conv2d(in_ch, 64, kernel_size=1, bias=False)
+            nn.init.zeros_(self.cnn_proj_p3.weight)
+
         # 选择 Diffusion Evolution（保持与原 snake/ct_snake 兼容：可由 cfg 控制开关）
         use_diffusion = getattr(cfg, 'use_diffusion_evolution', True)
         use_grpo = getattr(cfg, 'use_grpo', False)
@@ -143,6 +150,14 @@ class Network(nn.Module):
         if p2 is None:
             raise RuntimeError("YOLO head features are not available; expected a list with P2 at index 0.")
         cnn_feature = self.cnn_proj(p2)
+
+        # V6p: fuse P3 context (stride=8, larger receptive field) into cnn_feature via zero-init residual
+        if self.use_p3_features:
+            import torch.nn.functional as _F
+            p3 = yolo_feats[1] if isinstance(yolo_feats, (list, tuple)) and len(yolo_feats) > 1 else None
+            if p3 is not None:
+                p3_up = _F.interpolate(p3, size=p2.shape[-2:], mode='bilinear', align_corners=False)
+                cnn_feature = cnn_feature + self.cnn_proj_p3(p3_up)
 
         # 从 YOLO 输出构建 detection (B, N, 6) => [x1,y1,x2,y2,score,cls]
         # 并按配置执行阈值+NMS，确保训练/测试阶段一致地给 Snake 提供精简候选

@@ -95,6 +95,7 @@ class FlowMatchingEvolution(nn.Module):
                 use_detail_curve_context=_detail_curve_ctx,
                 detail_curve_inject_mode=_detail_curve_inject_mode,
                 detail_feature_dim=feature_dim * _detail_mult,
+                use_self_conditioning=bool(getattr(global_cfg, 'v3_7_use_self_conditioning', False)),
             )
         # V3.6: V3 global query + iterative refinement + Flow Matching
         elif getattr(global_cfg, 'use_dit_v3_6', False):
@@ -135,9 +136,13 @@ class FlowMatchingEvolution(nn.Module):
 
         # V3.7: per-step ODE smoothing
         self._ode_smooth_k = int(getattr(global_cfg, 'v3_7_ode_smooth_k', 0))
+        # V6p: ODE solver selection (euler/heun — Heun's method gives 2nd-order accuracy)
+        self._ode_solver = str(getattr(global_cfg, 'v3_7_ode_solver', 'euler')).strip().lower()
         # V3.7: spectral loss decomposition
         self._spectral_loss_k = int(getattr(global_cfg, 'v3_7_spectral_loss_k', 0))
         self._hf_loss_weight = float(getattr(global_cfg, 'v3_7_hf_loss_weight', 0.1))
+        # V6o: endpoint consistency loss — weight on L_endpoint = (1-t)^2 * FM_loss
+        self._endpoint_loss_weight = float(getattr(global_cfg, 'v3_7_endpoint_loss_weight', 0.0))
         # V3.7: curvature-aware point weighting for high-curvature detail
         self._use_curvature_reweight = bool(getattr(global_cfg, 'v3_7_use_curvature_reweight', False))
         self._curvature_loss_weight = float(getattr(global_cfg, 'v3_7_curvature_loss_weight', 1.0))
@@ -160,6 +165,15 @@ class FlowMatchingEvolution(nn.Module):
         self._flow_zero_x0_prob = float(getattr(global_cfg, 'flow_zero_x0_prob', 0.0))
         self._flow_t_beta_alpha = float(getattr(global_cfg, 'flow_t_beta_alpha', 1.0))
         self._flow_t_beta_beta = float(getattr(global_cfg, 'flow_t_beta_beta', 1.0))
+        # V6p: logit-normal t-sampling (SD3-style: t = sigmoid(N(mean, std^2)))
+        # Use v3_7_t_sample_mode='logit_normal' to enable; defaults to uniform
+        self._t_sample_mode = str(getattr(global_cfg, 'v3_7_t_sample_mode', 'uniform')).strip().lower()
+        self._logit_normal_mean = float(getattr(global_cfg, 'v3_7_logit_normal_mean', 0.0))
+        self._logit_normal_std = float(getattr(global_cfg, 'v3_7_logit_normal_std', 1.0))
+        # V6r: self-conditioning — model conditions on its own previous x1 estimate
+        # At training: 50% of steps do a "dry run" first, then condition on that result
+        # At inference: always condition on previous ODE step's x1 prediction
+        self._use_self_conditioning = bool(getattr(global_cfg, 'v3_7_use_self_conditioning', False))
 
         # CMAM 先验参数保留 (以防外部调用)
         self.compute_L = True
@@ -235,6 +249,12 @@ class FlowMatchingEvolution(nn.Module):
     def sample_train_t(self, n: int, device: torch.device, dtype: torch.dtype) -> torch.Tensor:
         if self._flow_fix_t0:
             return torch.zeros(n, 1, 1, device=device, dtype=dtype)
+
+        # V6p: logit-normal sampling (SD3 style) — concentrates t near 0.5 where flow is most nonlinear
+        if self._t_sample_mode == 'logit_normal':
+            eps = torch.randn(n, device=device, dtype=dtype)
+            t = torch.sigmoid(self._logit_normal_mean + self._logit_normal_std * eps)
+            return t.view(n, 1, 1)
 
         alpha = max(self._flow_t_beta_alpha, 1e-6)
         beta = max(self._flow_t_beta_beta, 1e-6)
@@ -350,6 +370,7 @@ class FlowMatchingEvolution(nn.Module):
         x_t,
         t_continuous,
         contour_scale: Optional[torch.Tensor] = None,
+        x_self_cond: Optional[torch.Tensor] = None,
     ):
         """
         包装接口：预测速度场 V_t
@@ -371,6 +392,7 @@ class FlowMatchingEvolution(nn.Module):
             py_ind=py_ind,
             contour_scale=contour_scale,
             detail_feat=detail_feat,
+            x_self_cond=x_self_cond,
         )
         return v_pred, L
 
@@ -397,6 +419,11 @@ class FlowMatchingEvolution(nn.Module):
         contour_scale = self.compute_contour_scale(i_it_py)
         contour_scale_flat = contour_scale.view(-1)
         dt = 1.0 / steps
+
+        use_heun = (self._ode_solver == 'heun')
+        # V6r: self-conditioning state — starts at zero, updated each step
+        x_self_cond = torch.zeros_like(x_t) if self._use_self_conditioning else None
+
         for i in range(steps):
             t_val = i * dt
             t_tensor = torch.full((N,), t_val, device=device, dtype=torch.float32)
@@ -410,8 +437,33 @@ class FlowMatchingEvolution(nn.Module):
                 x_t,
                 t_tensor,
                 contour_scale=contour_scale_flat,
+                x_self_cond=x_self_cond,
             )
-            x_t = x_t + v_pred * dt
+
+            # Update self-conditioning with current x1 estimate
+            if self._use_self_conditioning:
+                x_self_cond = (x_t + (1.0 - t_val) * v_pred).detach()
+
+            if use_heun and i < steps - 1:
+                # Heun's method (2nd-order Runge-Kutta): predictor-corrector
+                x_pred = x_t + v_pred * dt
+                t_next = torch.full((N,), t_val + dt, device=device, dtype=torch.float32)
+                v_pred2, _ = self.predict_velocity(
+                    cnn_feature,
+                    i_it_py,
+                    c_it_py,
+                    sampled_feat,
+                    detail_feat,
+                    py_ind,
+                    x_pred,
+                    t_next,
+                    contour_scale=contour_scale_flat,
+                    x_self_cond=x_self_cond,  # use updated self-cond for corrector step
+                )
+                x_t = x_t + (v_pred + v_pred2) * 0.5 * dt
+            else:
+                x_t = x_t + v_pred * dt
+
             # V3.7: per-step ODE Fourier smoothing
             if self._ode_smooth_k > 0:
                 x_t = self.fourier_smooth(x_t, self._ode_smooth_k)
@@ -493,15 +545,27 @@ class FlowMatchingEvolution(nn.Module):
                 sampled_feat=sampled_feat,
                 contour_scale=contour_scale,
             )
-            disp = self._sample_disp_from_sampled_feat(
-                cnn_feature,
-                current_contour,
-                c_it_py,
-                py_ind,
-                sampled_feat,
-                detail_feat,
-                steps=ode_steps,
-            )
+            # V6o: stochastic TTA ensemble for iterative inference
+            avg_n = self._infer_avg_samples
+            if avg_n > 1:
+                all_disps = []
+                for _ in range(avg_n):
+                    d = self._sample_disp_from_sampled_feat(
+                        cnn_feature, current_contour, c_it_py, py_ind,
+                        sampled_feat, detail_feat, steps=ode_steps,
+                    )
+                    all_disps.append(d)
+                disp = torch.stack(all_disps).mean(dim=0)
+            else:
+                disp = self._sample_disp_from_sampled_feat(
+                    cnn_feature,
+                    current_contour,
+                    c_it_py,
+                    py_ind,
+                    sampled_feat,
+                    detail_feat,
+                    steps=ode_steps,
+                )
             frac = fractions[step_idx]
             applied_disp = disp * frac
             current_contour = current_contour + applied_disp
@@ -577,6 +641,29 @@ class FlowMatchingEvolution(nn.Module):
                 sampled_feat=sampled_feat_curr,
                 contour_scale=contour_scale,
             )
+
+            # V6r: self-conditioning — 50% of training steps use a dry-run prediction
+            x_self_cond = None
+            if self._use_self_conditioning:
+                if torch.rand(1).item() < 0.5:
+                    with torch.no_grad():
+                        v_dry, _ = self.predict_velocity(
+                            cnn_feature,
+                            i_init_train_py,
+                            c_init_train_py,
+                            sampled_feat_curr,
+                            detail_feat_curr,
+                            py_ind,
+                            x_t,
+                            t.view(-1),
+                            contour_scale=contour_scale_flat,
+                            x_self_cond=None,  # dry run always starts unconditioned
+                        )
+                    # Self-cond = current estimate of clean displacement x1
+                    x_self_cond = (x_t + (1.0 - t) * v_dry).detach()
+                else:
+                    x_self_cond = torch.zeros_like(x_t)
+
             v_pred, L_reg = self.predict_velocity(
                 cnn_feature,
                 i_init_train_py,
@@ -587,6 +674,7 @@ class FlowMatchingEvolution(nn.Module):
                 x_t,
                 t.view(-1),
                 contour_scale=contour_scale_flat,
+                x_self_cond=x_self_cond,
             )
 
             # 5. 计算目标速度 V_target = X_1 - X_0
@@ -606,6 +694,14 @@ class FlowMatchingEvolution(nn.Module):
                 loss = loss_lf + self._hf_loss_weight * loss_hf
             else:
                 loss = F.mse_loss(v_pred, v_target, reduction='mean')
+
+            # V6o: endpoint consistency loss
+            # x1_pred = x_t + (1-t)*v_pred  → penalise deviation from x1
+            # Equivalent to (1-t)^2 * MSE(v_pred, v_target), upweighting t≈0
+            if self._endpoint_loss_weight > 0:
+                x1_pred = x_t + (1.0 - t) * v_pred
+                endpoint_loss = F.mse_loss(x1_pred, x1, reduction='mean')
+                loss = loss + self._endpoint_loss_weight * endpoint_loss
 
             # Add denoiser regularisation (Laplacian from V3.7, zero for others)
             loss = loss + L_reg

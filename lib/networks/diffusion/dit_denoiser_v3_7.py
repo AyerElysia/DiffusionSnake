@@ -180,6 +180,7 @@ class DiTFlowMatchingV3_7(DiTFlowMatchingV3_2):
                  use_detail_curve_context: bool = False,
                  detail_curve_inject_mode: str = 'both',
                  detail_feature_dim: int = 192,
+                 use_self_conditioning: bool = False,
                  **kwargs):
         super().__init__(*args, num_points=num_points, **kwargs)
 
@@ -195,6 +196,7 @@ class DiTFlowMatchingV3_7(DiTFlowMatchingV3_2):
         self.detail_curve_inject_mode = str(detail_curve_inject_mode).strip().lower()
         self.use_detail_curve_local = self.detail_curve_inject_mode in ('both', 'local')
         self.use_detail_curve_point = self.detail_curve_inject_mode in ('both', 'point')
+        self.use_self_conditioning = use_self_conditioning
 
         # Scale conditioning: embeds log(contour_scale) and adds to t_emb.
         # Zero-initialized output so it starts as identity (safe for warm start).
@@ -206,6 +208,12 @@ class DiTFlowMatchingV3_7(DiTFlowMatchingV3_2):
             )
             nn.init.zeros_(self.scale_embed_net[-1].weight)
             nn.init.zeros_(self.scale_embed_net[-1].bias)
+
+        # V6r: self-conditioning — model sees its own previous prediction.
+        # Zero-init ensures warm-start safe: starts as identity (no-op).
+        if use_self_conditioning:
+            self.self_cond_proj = nn.Linear(2, self.state_dim, bias=False)
+            nn.init.zeros_(self.self_cond_proj.weight)
 
         if use_detail_context:
             self.detail_local_proj = nn.Sequential(
@@ -278,6 +286,7 @@ class DiTFlowMatchingV3_7(DiTFlowMatchingV3_2):
         py_ind: torch.Tensor = None,
         contour_scale: torch.Tensor = None,
         detail_feat: torch.Tensor = None,
+        x_self_cond: torch.Tensor = None,
     ) -> tuple:
         assert x_t.dim() == 3 and x_t.shape[-1] == 2
         assert t.dim() == 1
@@ -320,6 +329,14 @@ class DiTFlowMatchingV3_7(DiTFlowMatchingV3_2):
 
         local_ctx = self.local_proj(sampled_feat.transpose(1, 2))
         x = self.point_embed(x_t, sampled_feat)
+
+        # V6r: self-conditioning — inject previous step's x1 prediction into point embedding
+        if self.use_self_conditioning:
+            if x_self_cond is None:
+                x_self_cond = torch.zeros_like(x_t)
+            if x_self_cond.dtype != param_dtype:
+                x_self_cond = x_self_cond.to(param_dtype)
+            x = x + self.self_cond_proj(x_self_cond)  # (N, P, D) residual add
         if self.use_detail_context and detail_feat is not None:
             detail_ctx = detail_feat.transpose(1, 2)
             local_ctx = local_ctx + self.detail_local_proj(detail_ctx)

@@ -1,0 +1,119 @@
+# V6p: Multi-scale P3 features + Logit-normal t-sampling + Endpoint loss
+#
+# Key changes vs V6m (building on V6o ideas):
+#   1. v3_7_use_p3_features: true  → zero-init P3 (stride=8) residual added to P2 (stride=4)
+#      Provides larger receptive field for understanding complex/tortuous contours.
+#      Zero-init ensures identical behavior to v6m at startup (safe checkpoint resume).
+#   2. v3_7_t_sample_mode: logit_normal (mean=0, std=1.5)
+#      SD3-style t-sampling: t = sigmoid(N(0, 1.5^2)), concentrates training on t≈0.5
+#      where the velocity field is most nonlinear — improves ODE trajectory quality.
+#   3. v3_7_endpoint_loss_weight: 0.5  → (from v6o) upweights t≈0 predictions.
+#   4. Full model fine-tune from v6m epoch20 with LR=2e-6.
+#
+# Resume from V6m epoch20 (best full-val 0.890066).
+
+model: 'sbd'
+network: 'ro_34'
+task: 'snake'
+model_dir: "data/model/btcv_diffusion_dit_v3_7_v6p_multiscale_logit_normal"
+
+gpus: [4]
+resume: true
+resume_weights_only: true
+
+train_or_test: train
+
+train:
+    dataset: 'BtcvTrain'
+    data_path: '/mnt/sdb1/leijh/DiffusionSnake/Datasets/BTCV/btcv_png_new_snake'
+    per_contour: false
+    merge_with_val: false
+    # Full fine-tune — all params including new cnn_proj_p3
+    detail_context_head_only: false
+
+    optim: 'adamw'
+    lr: 0.000002       # slightly higher than v6o to let P3 branch learn
+    milestones: (40, 60)
+    gamma: 0.5
+    batch_size: 12
+    gradient_accumulation_steps: 1
+    gradient_clip: 1.0
+    weight_decay: 0.01
+    warmup_steps: 20
+    eta_min: 0.0000001
+
+    epoch: 50
+    num_workers: 4
+    save_ep: 1
+
+test:
+    dataset: 'BtcvVal'
+    batch_size: 1
+    img_path: '/mnt/sdb1/leijh/DiffusionSnake/Datasets/BTCV/btcv_png_test_new_snake'
+    epoch: -1
+
+use_nms_for_snake: true
+det_conf_thresh: 0.01
+det_iou_thresh: 0.45
+det_max_det: 100
+per_class_nms: true
+use_gt_det: false
+
+loss_scales: {det: 0, ex: 1.0, py: 1.2}
+
+use_diffusion_evolution: true
+use_flow_matching: true
+flow_ode_steps: 10
+flow_noise_scale: 0.3
+flow_train_noise_scale: 0.3
+flow_fix_t0: false
+
+use_iterative_refinement: true
+iterative_num_steps: 3
+iterative_fractions: [0.3333, 0.5, 1.0]
+iterative_ode_steps: 50
+
+diffusion_loss_weight: 1.0
+diffusion_loss_type: 'adaptive'
+diffusion_disp_norm: true
+diffusion_disp_stats: "data/stats/btcv_disp_stats_octagon.json"
+
+use_dit_v3_7: true
+dit_num_layers: 6
+dit_num_heads: 8
+dit_state_dim: 256
+
+v3_7_use_per_point_head: true
+v3_7_use_regularized_per_point: false
+v3_7_use_scale_conditioning: true
+v3_7_use_detail_context: true
+v3_7_use_detail_curve_context: true
+v3_7_detail_context_mode: 'normal_tangent'
+v3_7_detail_curve_inject_mode: 'point'
+v3_7_delta_scale: 0.1
+v3_7_delta_reg_weight: 0.001
+v3_7_laplacian_weight: 0.0
+v3_7_spectral_loss_k: 0
+v3_7_hf_loss_weight: 0.1
+v3_7_use_curvature_reweight: false
+v3_7_ode_smooth_k: 0
+
+# V6p: Multi-scale P3 feature fusion (zero-init residual)
+v3_7_use_p3_features: true
+
+# V6p: logit-normal t-sampling (SD3 style, concentrates on t≈0.5)
+v3_7_t_sample_mode: logit_normal
+v3_7_logit_normal_mean: 0.0
+v3_7_logit_normal_std: 1.5
+
+# Endpoint consistency loss (from v6o)
+v3_7_endpoint_loss_weight: 0.5
+
+# Stochastic TTA ensemble at inference
+infer_noise_scale: 0.3
+infer_avg_samples: 3
+
+use_grpo: false
+heads: {'ct_hm': 9, 'wh': 2}
+segm_or_bbox: 'segm'
+use_diffusion_trainer: true
