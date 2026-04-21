@@ -48,6 +48,62 @@ def draw_poly(img, poly, color, thickness=2):
     cv2.polylines(img, [pts], isClosed=True, color=color, thickness=thickness)
 
 
+def apply_valid_point_mask(poly_pts, point_mask_row=None):
+    pts = np.asarray(poly_pts, dtype=np.float32)
+    if point_mask_row is None:
+        return pts
+    vm = np.asarray(point_mask_row).astype(np.float32) > 0.5
+    if vm.ndim != 1 or vm.shape[0] != pts.shape[0]:
+        return pts
+    if vm.sum() < 3:
+        return pts
+    return pts[vm]
+
+
+def remove_extreme_points(poly_pts, passes=2, edge_factor=3.0, turn_ratio_thr=2.8, radial_z_thr=3.0):
+    """Suppress isolated spike points by local interpolation on closed polygons."""
+    pts = np.asarray(poly_pts, dtype=np.float32).copy()
+    if pts.ndim != 2 or pts.shape[0] < 6:
+        return pts
+
+    for _ in range(int(max(1, passes))):
+        prev_pts = np.roll(pts, 1, axis=0)
+        next_pts = np.roll(pts, -1, axis=0)
+
+        e_prev = np.linalg.norm(pts - prev_pts, axis=1)
+        e_next = np.linalg.norm(next_pts - pts, axis=1)
+        med_edge = float(np.median(np.concatenate([e_prev, e_next])) + 1e-6)
+
+        chord = np.linalg.norm(next_pts - prev_pts, axis=1) + 1e-6
+        detour_ratio = (e_prev + e_next) / chord
+
+        center = pts.mean(axis=0, keepdims=True)
+        radius = np.linalg.norm(pts - center, axis=1)
+        r_med = float(np.median(radius))
+        r_mad = float(np.median(np.abs(radius - r_med)) + 1e-6)
+        radial_z = np.abs(radius - r_med) / (1.4826 * r_mad + 1e-6)
+
+        long_both = (e_prev > edge_factor * med_edge) & (e_next > edge_factor * med_edge)
+        strong_spike = detour_ratio > turn_ratio_thr
+        radial_out = radial_z > radial_z_thr
+        outlier = (long_both & (strong_spike | radial_out)) | (detour_ratio > (turn_ratio_thr + 1.2))
+        idx = np.where(outlier)[0]
+        if idx.size == 0:
+            break
+        for i in idx:
+            pts[i] = 0.5 * (prev_pts[i] + next_pts[i])
+    return pts
+
+
+def clip_poly(poly_pts, h, w):
+    pts = np.asarray(poly_pts, dtype=np.float32).copy()
+    if pts.ndim != 2 or pts.shape[0] == 0:
+        return pts
+    pts[:, 0] = np.clip(pts[:, 0], 0.0, float(w - 1))
+    pts[:, 1] = np.clip(pts[:, 1], 0.0, float(h - 1))
+    return pts
+
+
 def annotate_pred_point_counts(img, pred_np, valid_counts=None):
     for idx, poly in enumerate(pred_np):
         pts = np.asarray(poly, dtype=np.float32)
@@ -180,17 +236,43 @@ def infer_one(model, device, sample, out_path):
     gt_np = to_numpy(i_gt_py) * dr
     gt4_np = to_numpy(i_gt_4py) * dr if i_gt_4py is not None else None
 
-    for poly in gt_np:
+    point_mask_np = to_numpy(point_mask) if point_mask is not None else None
+    remove_extreme = int(os.environ.get('REMOVE_EXTREME_POINTS', '1')) > 0
+    extreme_passes = int(os.environ.get('EXTREME_PASSES', '2'))
+    edge_factor = float(os.environ.get('EXTREME_EDGE_FACTOR', '3.0'))
+    turn_ratio_thr = float(os.environ.get('EXTREME_TURN_RATIO', '2.8'))
+    radial_z_thr = float(os.environ.get('EXTREME_RADIAL_Z', '3.0'))
+    h_img, w_img = orig_img.shape[:2]
+
+    gt_vis, init_vis, pred_vis = [], [], []
+    for idx in range(pred_np.shape[0]):
+        pm_row = point_mask_np[idx] if point_mask_np is not None and idx < point_mask_np.shape[0] else None
+        gt_poly = apply_valid_point_mask(gt_np[idx], pm_row)
+        init_poly = apply_valid_point_mask(init_np[idx], pm_row)
+        pred_poly = apply_valid_point_mask(pred_np[idx], pm_row)
+        if remove_extreme:
+            pred_poly = remove_extreme_points(
+                pred_poly,
+                passes=extreme_passes,
+                edge_factor=edge_factor,
+                turn_ratio_thr=turn_ratio_thr,
+                radial_z_thr=radial_z_thr,
+            )
+        gt_vis.append(clip_poly(gt_poly, h_img, w_img))
+        init_vis.append(clip_poly(init_poly, h_img, w_img))
+        pred_vis.append(clip_poly(pred_poly, h_img, w_img))
+
+    for poly in gt_vis:
         draw_poly(orig_img, poly, (255, 0, 0), thickness=2)
-    for poly in init_np:
+    for poly in init_vis:
         draw_poly(orig_img, poly, (0, 255, 255), thickness=1)
-    for poly in pred_np:
+    for poly in pred_vis:
         draw_poly(orig_img, poly, (0, 0, 255), thickness=2)
     if int(_custom_args.annotate_pred_count) > 0:
         valid_counts = None
         if point_mask is not None:
             valid_counts = to_numpy(point_mask).sum(axis=1).astype(np.int32).tolist()
-        annotate_pred_point_counts(orig_img, pred_np, valid_counts=valid_counts)
+        annotate_pred_point_counts(orig_img, pred_vis, valid_counts=valid_counts)
     if gt4_np is not None:
         for poly in gt4_np:
             draw_poly(orig_img, poly, (255, 0, 255), thickness=1)

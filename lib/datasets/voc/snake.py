@@ -251,11 +251,19 @@ class Dataset(data.Dataset):
         w = float(bbox[2] - bbox[0])
         h = float(bbox[3] - bbox[1])
 
+        use_threshold = bool(getattr(snake_config, 'adaptive_use_area_threshold', False))
+        strategy = str(getattr(snake_config, 'point_strategy', 'perimeter')).strip().lower()
+        if use_threshold or strategy in ('area_threshold', 'threshold'):
+            area = max(w, 0.0) * max(h, 0.0)
+            area_threshold = float(getattr(snake_config, 'adaptive_area_threshold', 4096.0))
+            small_points = int(getattr(snake_config, 'adaptive_small_points', 64))
+            large_points = int(getattr(snake_config, 'adaptive_large_points', 128))
+            return int(small_points if area < area_threshold else large_points)
+
         target_density = float(getattr(snake_config, 'target_density', 2.5))
         min_points = int(getattr(snake_config, 'min_points', 32))
         max_points = int(getattr(snake_config, 'max_points', 512))
         round_to = max(1, int(getattr(snake_config, 'round_to_multiple', 8)))
-        strategy = str(getattr(snake_config, 'point_strategy', 'perimeter'))
 
         if strategy == 'perimeter':
             base_points = 2.0 * (w + h) / max(target_density, 1e-6)

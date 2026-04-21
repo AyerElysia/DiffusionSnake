@@ -67,6 +67,8 @@ class FlowMatchingEvolution(nn.Module):
             ).strip().lower()
             _detail_mode = str(getattr(global_cfg, 'v3_7_detail_context_mode', 'normal')).strip().lower()
             _detail_mult = self._detail_feature_multiplier(_detail_mode) if _detail_ctx else 0
+            _global_ctx_mode = str(getattr(global_cfg, 'v3_7_global_context_mode', 'patch')).strip().lower()
+            _global_queries = int(getattr(global_cfg, 'v3_7_global_num_queries', 256))
             print(f"[FlowMatchingEvolution] Using DiT Flow Network V3.7 "
                   f"(per_point_head={_per_pt}, regularized={_reg_pt}, "
                   f"float64_head={_f64_head}, "
@@ -74,7 +76,9 @@ class FlowMatchingEvolution(nn.Module):
                   f"scale_cond={_scale_cond}, detail_ctx={_detail_ctx}, "
                   f"detail_curve_ctx={_detail_curve_ctx}, "
                   f"detail_mode={_detail_mode}, "
-                  f"curve_inject={_detail_curve_inject_mode}, ODE steps={ode_steps})")
+                  f"curve_inject={_detail_curve_inject_mode}, "
+                  f"global_ctx={_global_ctx_mode}, global_queries={_global_queries}, "
+                  f"ODE steps={ode_steps})")
             self.denoiser = DiTFlowMatchingV3_7(
                 state_dim=dit_state_dim,
                 feature_dim=feature_dim,
@@ -96,6 +100,8 @@ class FlowMatchingEvolution(nn.Module):
                 detail_curve_inject_mode=_detail_curve_inject_mode,
                 detail_feature_dim=feature_dim * _detail_mult,
                 use_self_conditioning=bool(getattr(global_cfg, 'v3_7_use_self_conditioning', False)),
+                global_context_mode=_global_ctx_mode,
+                global_num_queries=_global_queries,
             )
         # V3.6: V3 global query + iterative refinement + Flow Matching
         elif getattr(global_cfg, 'use_dit_v3_6', False):
@@ -134,6 +140,9 @@ class FlowMatchingEvolution(nn.Module):
                 num_points=num_points,
             )
 
+        # V6s: optimal cyclic alignment — find cyclic shift that minimises total displacement MSE
+        # (greedy nearest-first-point can be far from optimal for tortuous contours)
+        self._optimal_cyclic_align = bool(getattr(global_cfg, 'v3_7_optimal_cyclic_align', False))
         # V3.7: per-step ODE smoothing
         self._ode_smooth_k = int(getattr(global_cfg, 'v3_7_ode_smooth_k', 0))
         # V6p: ODE solver selection (euler/heun — Heun's method gives 2nd-order accuracy)
@@ -603,8 +612,28 @@ class FlowMatchingEvolution(nn.Module):
             if orient_mismatch.any():
                 i_gt_py[orient_mismatch] = torch.flip(i_gt_py[orient_mismatch], dims=[1])
 
-            d2 = (i_init_train_py[:, :1, :] - i_gt_py).pow(2).sum(-1)
-            i_gt_py = torch.stack([torch.roll(i_gt_py[i], -int(d2[i].argmin().item()), 0) for i in range(i_gt_py.size(0))], 0)
+            if self._optimal_cyclic_align:
+                # Optimal cyclic alignment: find shift k* = argmin_k sum||oct[i] - gt[(i+k)%N]||^2
+                # Maximise cross-correlation  ↔  minimise squared displacement
+                # For N=128 and typical batch sizes the O(N^2) loop is fast (<1 ms on GPU).
+                # IMPORTANT: wrap in no_grad to avoid accumulating 128 autograd nodes.
+                N_pts = i_gt_py.size(1)
+                B_a = i_gt_py.size(0)
+                with torch.no_grad():
+                    oct_pts = i_init_train_py.detach()   # (B, N, 2)
+                    gt_pts  = i_gt_py.detach()            # (B, N, 2)
+                    shift_costs = torch.zeros(B_a, N_pts, device=device, dtype=oct_pts.dtype)
+                    for k in range(N_pts):
+                        diff = oct_pts - torch.roll(gt_pts, -k, 1)
+                        shift_costs[:, k] = diff.pow(2).sum(dim=(1, 2))
+                    best_k = shift_costs.argmin(dim=1)  # (B,)
+                i_gt_py = torch.stack(
+                    [torch.roll(i_gt_py[i], -int(best_k[i].item()), 0) for i in range(B_a)], 0
+                )
+            else:
+                # Greedy: align by nearest point to oct[0] only
+                d2 = (i_init_train_py[:, :1, :] - i_gt_py).pow(2).sum(-1)
+                i_gt_py = torch.stack([torch.roll(i_gt_py[i], -int(d2[i].argmin().item()), 0) for i in range(i_gt_py.size(0))], 0)
 
             x1_raw = i_gt_py - i_init_train_py
 

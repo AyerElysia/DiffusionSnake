@@ -64,6 +64,16 @@ cfg.dit_state_dim = 256
 # Contour point configuration (default 128, can be overridden per version)
 cfg.poly_num = 128
 cfg.gt_poly_num = 128
+cfg.adaptive_points_enabled = False
+cfg.min_points = 32
+cfg.max_points = 512
+cfg.target_density = 2.5
+cfg.round_to_multiple = 8
+cfg.point_strategy = 'perimeter'
+cfg.adaptive_use_area_threshold = False
+cfg.adaptive_area_threshold = 4096.0
+cfg.adaptive_small_points = 64
+cfg.adaptive_large_points = 128
 
 # V3.4: Multi-step iterative refinement
 cfg.use_iterative_refinement = False

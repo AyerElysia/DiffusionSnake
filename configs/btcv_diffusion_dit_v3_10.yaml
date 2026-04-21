@@ -49,11 +49,15 @@ use_gt_det: false
 
 # ===== V3.10 自适应点数配置 =====
 adaptive_points_enabled: true
-min_points: 32
+min_points: 64
 max_points: 128
 target_density: 2.5  # 像素/点
 round_to_multiple: 8
-point_strategy: 'perimeter'  # 'perimeter', 'area', 'mixed'
+point_strategy: 'area_threshold'  # 'perimeter', 'area', 'mixed', 'area_threshold'
+adaptive_use_area_threshold: true
+adaptive_area_threshold: 4096.0
+adaptive_small_points: 64
+adaptive_large_points: 128
 
 # ===== 损失权重 =====
 loss_scales:
@@ -79,6 +83,12 @@ use_dit_v3_1: true         # 使用V3.1架构
 dit_num_layers: 6
 dit_num_heads: 8
 dit_state_dim: 256
+
+# ===== 多步迭代（默认开启：训练+推理） =====
+use_iterative_refinement: true
+iterative_num_steps: 3
+iterative_fractions: [0.3333, 0.5, 1.0]
+iterative_ddim_steps: 20
 
 # ===== 系统开关 =====
 use_grpo: false

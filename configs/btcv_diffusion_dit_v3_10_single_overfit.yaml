@@ -45,11 +45,15 @@ use_gt_det: false
 
 # V3.10 adaptive points
 adaptive_points_enabled: true
-min_points: 32
+min_points: 64
 max_points: 128
 target_density: 2.5
 round_to_multiple: 8
-point_strategy: 'perimeter'
+point_strategy: 'area_threshold'
+adaptive_use_area_threshold: true
+adaptive_area_threshold: 4096.0
+adaptive_small_points: 64
+adaptive_large_points: 128
 
 loss_scales: {det: 0, ex: 1.0, py: 1.2}
 
@@ -67,6 +71,12 @@ use_dit_v3_1: true
 dit_num_layers: 6
 dit_num_heads: 8
 dit_state_dim: 256
+
+# V3.10 default: multi-step iterative training + inference
+use_iterative_refinement: true
+iterative_num_steps: 3
+iterative_fractions: [0.3333, 0.5, 1.0]
+iterative_ddim_steps: 20
 
 use_grpo: false
 heads: {'ct_hm': 9, 'wh': 2}

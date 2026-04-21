@@ -18,6 +18,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from .dit_denoiser_v3_2 import DiTFlowMatchingV3_2
+from .dit_blocks import PerceiverCompressor
 from .dit_blocks_v2 import RMSNorm, FinalLayer, modulate
 
 
@@ -181,6 +182,8 @@ class DiTFlowMatchingV3_7(DiTFlowMatchingV3_2):
                  detail_curve_inject_mode: str = 'both',
                  detail_feature_dim: int = 192,
                  use_self_conditioning: bool = False,
+                 global_context_mode: str = 'patch',
+                 global_num_queries: int = 256,
                  **kwargs):
         super().__init__(*args, num_points=num_points, **kwargs)
 
@@ -197,6 +200,20 @@ class DiTFlowMatchingV3_7(DiTFlowMatchingV3_2):
         self.use_detail_curve_local = self.detail_curve_inject_mode in ('both', 'local')
         self.use_detail_curve_point = self.detail_curve_inject_mode in ('both', 'point')
         self.use_self_conditioning = use_self_conditioning
+        self.global_context_mode = str(global_context_mode).strip().lower()
+        self.global_num_queries = int(global_num_queries)
+
+        if self.global_context_mode not in ('patch', 'query'):
+            raise ValueError(
+                f"Unsupported global_context_mode={self.global_context_mode}, expected 'patch' or 'query'"
+            )
+        if self.global_context_mode == 'query':
+            self.global_compressor = PerceiverCompressor(
+                in_dim=self.feature_dim,
+                out_dim=self.state_dim,
+                num_queries=self.global_num_queries,
+            )
+            self.image_embed = None
 
         # Scale conditioning: embeds log(contour_scale) and adds to t_emb.
         # Zero-initialized output so it starts as identity (safe for warm start).
@@ -315,7 +332,10 @@ class DiTFlowMatchingV3_7(DiTFlowMatchingV3_2):
 
         if cnn_feature.dim() == 3:
             cnn_feature = cnn_feature.unsqueeze(0)
-        global_ctx = self.image_embed(cnn_feature)
+        if self.global_context_mode == 'query':
+            global_ctx = self.global_compressor(cnn_feature)
+        else:
+            global_ctx = self.image_embed(cnn_feature)
 
         if py_ind is not None:
             global_ctx = global_ctx[py_ind]

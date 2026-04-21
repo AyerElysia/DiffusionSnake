@@ -400,8 +400,17 @@ class DiffusionEvolution(nn.Module):
         am1 = self._sqrt_one_minus_alphas_cumprod_dev.index_select(0, t).view(-1, 1, 1)
         return (x_t - am1 * eps) / a
 
-    def predict_eps(self, cnn_feature: torch.Tensor, i_it_py: torch.Tensor, c_it_py: torch.Tensor,
-                   py_ind: torch.Tensor, x_t: torch.Tensor, t: torch.Tensor, batch: dict = None) -> Tuple[torch.Tensor, torch.Tensor]:
+    def predict_eps(
+        self,
+        cnn_feature: torch.Tensor,
+        i_it_py: torch.Tensor,
+        c_it_py: torch.Tensor,
+        py_ind: torch.Tensor,
+        x_t: torch.Tensor,
+        t: torch.Tensor,
+        batch: dict = None,
+        point_mask: Optional[torch.Tensor] = None,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
         """
         预测噪声：使用去噪器预测当前状态中的噪声分量
 
@@ -415,22 +424,23 @@ class DiffusionEvolution(nn.Module):
         # 2. 构建邻接矩阵 (仅 GCN Denoiser 需要)
         adj = snake_gcn_utils.get_adj_ind(snake_config.adj_num, i_it_py.size(1), i_it_py.device)
 
-        # V3.10: Extract point_mask from batch if available
-        # TODO: Currently disabled due to shape mismatch after prepare_training filtering
-        # Need to propagate point_mask through prepare_training/prepare_testing
-        point_mask = None
-        # if batch is not None and 'point_mask' in batch:
-        #     point_mask_full = batch['point_mask']  # [B, ct_num, P]
-        #     B, ct_num, P = point_mask_full.shape
-        #     point_mask = point_mask_full.view(-1, P)
-        #     if 'meta' in batch and 'ct_01' in batch['meta']:
-        #         ct_01 = batch['meta']['ct_01']
-        #         point_mask = point_mask[ct_01]
+        # V3.10: extract point_mask from batch when not explicitly provided.
+        if point_mask is None and batch is not None and 'point_mask' in batch and 'ct_01' in batch:
+            try:
+                ct_01 = batch['ct_01'].byte()
+                point_mask = snake_gcn_utils.collect_training(batch['point_mask'], ct_01)
+            except Exception:
+                point_mask = None
+        if point_mask is not None:
+            if point_mask.dim() != 2 or point_mask.shape[0] != i_it_py.shape[0] or point_mask.shape[1] != i_it_py.shape[1]:
+                point_mask = None
+            else:
+                point_mask = point_mask.to(device=i_it_py.device, dtype=i_it_py.dtype)
 
         # 3. 通过去噪器预测噪声 (使用 denoiser_type 而非 isinstance)
         if self.denoiser_type.startswith('dit'):
             # Only pass point_mask for V3.10+ which supports it
-            if point_mask is not None and hasattr(self.denoiser, 'supports_point_mask'):
+            if point_mask is not None and getattr(self.denoiser, 'supports_point_mask', False):
                 eps_pred, L = self.denoiser(cnn_feature, gcn_feat, x_t, t, adj, polys=i_it_py, py_ind=py_ind, point_mask=point_mask)
             else:
                 eps_pred, L = self.denoiser(cnn_feature, gcn_feat, x_t, t, adj, polys=i_it_py, py_ind=py_ind)
@@ -720,6 +730,9 @@ class DiffusionEvolution(nn.Module):
                 c_init_train_py = init['c_it_py'].to(device)
                 i_gt_py = init['i_gt_py'].to(device)
                 py_ind = init['py_ind']
+                point_mask_train = init.get('point_mask', None)
+                if point_mask_train is not None:
+                    point_mask_train = point_mask_train.to(device)
 
                 # 仅保留 A1 路径，不构建 B/C 变体
                 h, w = cnn_feature.size(2), cnn_feature.size(3)
@@ -789,12 +802,31 @@ class DiffusionEvolution(nn.Module):
                 noise = torch.randn_like(x0_combined)
                 x_t = self._add_noise(x0_combined, noise, t)
 
-            eps_pred, _ = self.predict_eps(cnn_feature, contours_combined, c_combined, py_ind_combined, x_t, t, batch=batch)
+            eps_pred, _ = self.predict_eps(
+                cnn_feature,
+                contours_combined,
+                c_combined,
+                py_ind_combined,
+                x_t,
+                t,
+                batch=batch,
+                point_mask=point_mask_train,
+            )
             N_orig = i_init_train_py.size(0)
             eps_pred_A1 = eps_pred[0 * N_orig:1 * N_orig]
             noise_A1 = noise[0 * N_orig:1 * N_orig]
 
-            lossA1 = F.mse_loss(eps_pred_A1, noise_A1, reduction='mean') if eps_pred_A1.numel() > 0 else (cnn_feature.sum() * 0.0)
+            if eps_pred_A1.numel() > 0:
+                mask_A1 = point_mask_train
+                if mask_A1 is not None and mask_A1.shape[:2] == eps_pred_A1.shape[:2]:
+                    mask_A1 = mask_A1.to(dtype=eps_pred_A1.dtype).unsqueeze(-1)
+                    diff_sq = (eps_pred_A1 - noise_A1).pow(2) * mask_A1
+                    denom = (mask_A1.sum() * eps_pred_A1.size(-1)).clamp(min=1.0)
+                    lossA1 = diff_sq.sum() / denom
+                else:
+                    lossA1 = F.mse_loss(eps_pred_A1, noise_A1, reduction='mean')
+            else:
+                lossA1 = (cnn_feature.sum() * 0.0)
             diff_loss = lossA1
 
             # Compute predicted contours for smoothness loss (V3.3)

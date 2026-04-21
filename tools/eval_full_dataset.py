@@ -52,6 +52,13 @@ def poly2mask(ex):
     return img
 
 
+def get_poly_tensor(py_obj):
+    """兼容 py 为 list 或 tensor，统一返回 [N, P, 2] tensor。"""
+    if isinstance(py_obj, list):
+        return py_obj[-1]
+    return py_obj
+
+
 def cal_iou(mask, gtmask):
     jiaoji = mask * gtmask
     bingji = ((mask + gtmask) != 0).astype(np.int16)
@@ -232,8 +239,8 @@ def evaluate(ckpt_path, img_root, save_dir=None):
         with torch.no_grad():
             output = network(batch['inp'], batch)
 
-        poly = output['py']
-        detection = output['detection']
+        poly_tensor = get_poly_tensor(output['py'])
+        detection = output.get('detection', None) if isinstance(output, dict) else None
 
         mask_paths = glob.glob(img_path.replace('_image.png', '_mask') + '*')
         gt_masks, gt_classes = [], []
@@ -258,12 +265,21 @@ def evaluate(ckpt_path, img_root, save_dir=None):
         # 预测掩码
         pred_masks = []
         pred_classes = []
-        if poly[-1].shape[0] > 0:
-            for j in range(poly[-1].shape[0]):
-                single_poly = poly[-1][j:j+1]
+        if poly_tensor.shape[0] > 0:
+            for j in range(poly_tensor.shape[0]):
+                single_poly = poly_tensor[j:j+1]
                 pred_mask = poly2mask(single_poly)
                 pred_masks.append(pred_mask)
-                pred_classes.append(int(detection[0, j, 5]) + 1)
+                # 优先使用检测头类别；若当前网络未输出 detection，则按与 GT 最大 IoU 赋类
+                if detection is not None:
+                    pred_classes.append(int(detection[0, j, 5]) + 1)
+                else:
+                    if len(gt_masks) > 0:
+                        ious = [cal_iou(pred_mask, gm) for gm in gt_masks]
+                        best_idx = int(np.argmax(ious)) if len(ious) > 0 else 0
+                        pred_classes.append(int(gt_classes[best_idx]))
+                    else:
+                        pred_classes.append(1)
 
         pred_mask_combined = np.zeros((512, 512))
         for m in pred_masks:

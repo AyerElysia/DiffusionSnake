@@ -1,0 +1,53 @@
+digraph V37V6B {
+  rankdir=LR;
+  splines=true;
+  fontname="Helvetica";
+  bgcolor="white";
+  nodesep=0.45;
+  ranksep=0.7;
+
+  node [shape=box, style="rounded,filled", fontname="Helvetica", fontsize=11, color="#2B4C7E", fillcolor="#EAF2FF"];
+  edge [color="#4A6FA5", penwidth=1.3, arrowsize=0.8, fontname="Helvetica", fontsize=10];
+
+  input [label="Input Image", fillcolor="#F4F9FF"];
+  yolo [label="YOLOv8-p2 Detector"];
+  nms [label="NMS + Candidate Boxes", fillcolor="#F2FAF4", color="#2C7A4B"];
+  p2 [label="P2 Feature Map"];
+  proj [label="1x1 Conv (cnn_proj)\nChannel -> 64", fillcolor="#FFF8E8", color="#8A6D1F"];
+  init [label="Initial Contour Builder", fillcolor="#F2FAF4", color="#2C7A4B"];
+
+  subgraph cluster_refiner {
+    label="FlowMatchingEvolution (V3.7-v6b)";
+    color="#7A5AA3";
+    style="rounded,dashed";
+    penwidth=1.3;
+    fontname="Helvetica";
+    fontsize=12;
+
+    sample [label="Contour Feature Sampling", fillcolor="#F8F2FF", color="#7A5AA3"];
+    scale [label="Scale Conditioning", fillcolor="#F8F2FF", color="#7A5AA3"];
+    dit [label="DiT Backbone\n(6 layers / 8 heads / 256 dim)", fillcolor="#F8F2FF", color="#7A5AA3"];
+    pph [label="Per-Point Head\n(Independent per point)", fillcolor="#F8F2FF", color="#7A5AA3"];
+    ode [label="ODE Integration (10 steps)", fillcolor="#F8F2FF", color="#7A5AA3"];
+  }
+
+  disp [label="Predicted Displacement (disp)", fillcolor="#FFF3F3", color="#A14A4A"];
+  out [label="Final Contour\nInitial + disp", fillcolor="#FFF3F3", color="#A14A4A"];
+
+  input -> yolo;
+  yolo -> nms;
+  yolo -> p2;
+  p2 -> proj;
+  nms -> init;
+  init -> sample;
+  proj -> sample;
+  init -> scale;
+  sample -> dit;
+  scale -> dit;
+  dit -> pph;
+  pph -> ode;
+  ode -> disp;
+  init -> out [label="Initial", color="#7A7A7A", fontcolor="#7A7A7A"];
+  disp -> out [label="Refine", color="#A14A4A", fontcolor="#A14A4A"];
+}
+

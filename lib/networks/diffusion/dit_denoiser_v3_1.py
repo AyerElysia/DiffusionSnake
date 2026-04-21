@@ -49,6 +49,7 @@ class DiTDenoiserV3_1(nn.Module):
         self.feature_dim = feature_dim
         self.time_dim = time_dim
         self.patch_size = patch_size
+        self.supports_point_mask = True
 
         # 1. Time Embedding
         self.time_emb_net = nn.Sequential(

@@ -50,6 +50,67 @@ def compute_iou(mask_a, mask_b):
     return float(inter) / float(union) if union > 0 else 0.0
 
 
+def apply_valid_point_mask(poly_pts, point_mask_row=None):
+    pts = np.asarray(poly_pts, dtype=np.float32)
+    if point_mask_row is None:
+        return pts
+    vm = np.asarray(point_mask_row).astype(np.float32) > 0.5
+    if vm.ndim != 1 or vm.shape[0] != pts.shape[0]:
+        return pts
+    if vm.sum() < 3:
+        return pts
+    return pts[vm]
+
+
+def remove_extreme_points(poly_pts, passes=2, edge_factor=3.0, turn_ratio_thr=2.8, radial_z_thr=3.0):
+    """Suppress isolated spike points by local interpolation on closed polygons."""
+    pts = np.asarray(poly_pts, dtype=np.float32).copy()
+    if pts.ndim != 2 or pts.shape[0] < 6:
+        return pts, 0
+
+    total_replaced = 0
+    for _ in range(int(max(1, passes))):
+        prev_pts = np.roll(pts, 1, axis=0)
+        next_pts = np.roll(pts, -1, axis=0)
+
+        e_prev = np.linalg.norm(pts - prev_pts, axis=1)
+        e_next = np.linalg.norm(next_pts - pts, axis=1)
+        med_edge = float(np.median(np.concatenate([e_prev, e_next])) + 1e-6)
+
+        chord = np.linalg.norm(next_pts - prev_pts, axis=1) + 1e-6
+        detour_ratio = (e_prev + e_next) / chord
+
+        center = pts.mean(axis=0, keepdims=True)
+        radius = np.linalg.norm(pts - center, axis=1)
+        r_med = float(np.median(radius))
+        r_mad = float(np.median(np.abs(radius - r_med)) + 1e-6)
+        radial_z = np.abs(radius - r_med) / (1.4826 * r_mad + 1e-6)
+
+        long_both = (e_prev > edge_factor * med_edge) & (e_next > edge_factor * med_edge)
+        strong_spike = detour_ratio > turn_ratio_thr
+        radial_out = radial_z > radial_z_thr
+
+        outlier = (long_both & (strong_spike | radial_out)) | (detour_ratio > (turn_ratio_thr + 1.2))
+        idx = np.where(outlier)[0]
+        if idx.size == 0:
+            break
+
+        for i in idx:
+            pts[i] = 0.5 * (prev_pts[i] + next_pts[i])
+        total_replaced += int(idx.size)
+
+    return pts, total_replaced
+
+
+def clip_poly(poly_pts, h, w):
+    pts = np.asarray(poly_pts, dtype=np.float32).copy()
+    if pts.ndim != 2 or pts.shape[0] == 0:
+        return pts
+    pts[:, 0] = np.clip(pts[:, 0], 0.0, float(w - 1))
+    pts[:, 1] = np.clip(pts[:, 1], 0.0, float(h - 1))
+    return pts
+
+
 # ------------------------------------------------------------------ #
 # Model loading (reused from infer_v3_final.py)
 # ------------------------------------------------------------------ #
@@ -186,10 +247,17 @@ def run_inference_iou(model, device, batch, save_dir, ode_steps=50):
             fractions = list(getattr(cfg, 'iterative_fractions', []))
             if not fractions:
                 fractions = [1.0 / (iter_steps - i) for i in range(iter_steps)]
-            disp = core.gcn.sample_disp_iterative(
-                cnn_feature, i_it_py, c_it_py, py_ind,
-                num_iter_steps=iter_steps, fractions=fractions,
-                ode_steps=ode_steps)
+            if hasattr(core.gcn, 'ode_steps'):
+                disp = core.gcn.sample_disp_iterative(
+                    cnn_feature, i_it_py, c_it_py, py_ind,
+                    num_iter_steps=iter_steps, fractions=fractions,
+                    ode_steps=ode_steps)
+            else:
+                ddim_steps = int(getattr(cfg, 'iterative_ddim_steps', 20))
+                disp = core.gcn.sample_disp_iterative(
+                    cnn_feature, i_it_py, c_it_py, py_ind,
+                    num_iter_steps=iter_steps, fractions=fractions,
+                    ddim_steps=ddim_steps)
         else:
             disp = core.gcn.sample_disp(
                 cnn_feature, i_it_py, c_it_py, py_ind, steps=ode_steps)
@@ -204,6 +272,9 @@ def run_inference_iou(model, device, batch, save_dir, ode_steps=50):
         pred_polys = pred_polys_affine.cpu().numpy() * dr
         gt_polys = gt_all.view(-1, P, 2).cpu().numpy() * dr
         init_polys_np = i_it_py.cpu().numpy() * dr
+        point_mask_np = None
+        if 'point_mask' in batch:
+            point_mask_np = batch['point_mask'].detach().cpu().numpy().reshape(-1, P)
 
     # 5. Compute IoU
     if 'orig_img' in batch:
@@ -214,29 +285,80 @@ def run_inference_iou(model, device, batch, save_dir, ode_steps=50):
         img = np.zeros((512, 512, 3), dtype=np.uint8)
 
     H_img, W_img = img.shape[:2]
+    remove_extreme = int(os.environ.get('REMOVE_EXTREME_POINTS', '1')) > 0
+    extreme_passes = int(os.environ.get('EXTREME_PASSES', '2'))
+    edge_factor = float(os.environ.get('EXTREME_EDGE_FACTOR', '3.0'))
+    turn_ratio_thr = float(os.environ.get('EXTREME_TURN_RATIO', '2.8'))
+    radial_z_thr = float(os.environ.get('EXTREME_RADIAL_Z', '3.0'))
+
+    pred_polys_vis = []
+    gt_polys_vis = []
+    init_polys_vis = []
     ious = []
+    replaced_per_contour = []
+    valid_points_per_contour = []
+
     for idx in range(pred_polys.shape[0]):
-        gt_mask = poly_to_mask(gt_polys[idx], H_img, W_img)
-        pred_mask = poly_to_mask(pred_polys[idx], H_img, W_img)
+        pm_row = point_mask_np[idx] if point_mask_np is not None and idx < point_mask_np.shape[0] else None
+        pred_poly = apply_valid_point_mask(pred_polys[idx], pm_row)
+        gt_poly = apply_valid_point_mask(gt_polys[idx], pm_row)
+        init_poly = apply_valid_point_mask(init_polys_np[idx], pm_row)
+
+        replaced_n = 0
+        if remove_extreme:
+            pred_poly, replaced_n = remove_extreme_points(
+                pred_poly,
+                passes=extreme_passes,
+                edge_factor=edge_factor,
+                turn_ratio_thr=turn_ratio_thr,
+                radial_z_thr=radial_z_thr,
+            )
+
+        pred_poly = clip_poly(pred_poly, H_img, W_img)
+        gt_poly = clip_poly(gt_poly, H_img, W_img)
+        init_poly = clip_poly(init_poly, H_img, W_img)
+
+        valid_points_per_contour.append(int(pred_poly.shape[0]))
+        replaced_per_contour.append(int(replaced_n))
+        pred_polys_vis.append(pred_poly)
+        gt_polys_vis.append(gt_poly)
+        init_polys_vis.append(init_poly)
+
+        if pred_poly.shape[0] < 3 or gt_poly.shape[0] < 3:
+            iou = 0.0
+            ious.append(iou)
+            print(f"  Contour {idx}: IoU = {iou:.6f} ({iou*100:.3f}%) | valid_pts={pred_poly.shape[0]} | replaced={replaced_n}")
+            continue
+
+        gt_mask = poly_to_mask(gt_poly, H_img, W_img)
+        pred_mask = poly_to_mask(pred_poly, H_img, W_img)
         iou = compute_iou(pred_mask, gt_mask)
         ious.append(iou)
-        print(f"  Contour {idx}: IoU = {iou:.6f} ({iou*100:.3f}%)")
+        print(f"  Contour {idx}: IoU = {iou:.6f} ({iou*100:.3f}%) | valid_pts={pred_poly.shape[0]} | replaced={replaced_n}")
 
     mean_iou = float(np.mean(ious)) if ious else 0.0
     print(f"\n  ★ Mean IoU = {mean_iou:.6f} ({mean_iou*100:.3f}%)")
 
     # 6. Visualise
     vis = img.copy()
-    for poly in gt_polys:
+    for poly in gt_polys_vis:
+        if poly.shape[0] < 2:
+            continue
         cv2.polylines(vis, [poly.astype(np.int32)], True, (0, 255, 0), 2)
-    for poly in init_polys_np:
+    for poly in init_polys_vis:
+        if poly.shape[0] < 2:
+            continue
         cv2.polylines(vis, [poly.astype(np.int32)], True, (0, 255, 255), 1)
-    for poly in pred_polys:
+    for poly in pred_polys_vis:
+        if poly.shape[0] < 2:
+            continue
         cv2.polylines(vis, [poly.astype(np.int32)], True, (0, 0, 255), 2)
 
     # Add IoU text
     for idx, iou in enumerate(ious):
-        cx, cy = int(pred_polys[idx, :, 0].mean()), int(pred_polys[idx, :, 1].mean())
+        if pred_polys_vis[idx].shape[0] == 0:
+            continue
+        cx, cy = int(pred_polys_vis[idx][:, 0].mean()), int(pred_polys_vis[idx][:, 1].mean())
         cv2.putText(vis, f"IoU:{iou*100:.1f}%", (cx-30, cy),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.4, (255, 255, 255), 1)
 
@@ -251,8 +373,15 @@ def run_inference_iou(model, device, batch, save_dir, ode_steps=50):
         'ode_steps': ode_steps,
         'mean_iou': mean_iou,
         'per_contour_iou': ious,
+        'valid_points_per_contour': valid_points_per_contour,
+        'replaced_extreme_points_per_contour': replaced_per_contour,
         'fourier_smooth_k': fk,
         'use_iterative_refinement': use_iter,
+        'remove_extreme_points': remove_extreme,
+        'extreme_passes': extreme_passes,
+        'extreme_edge_factor': edge_factor,
+        'extreme_turn_ratio': turn_ratio_thr,
+        'extreme_radial_z': radial_z_thr,
     }
     json_path = os.path.join(save_dir, f"v3_7_metrics_{ts}.json")
     with open(json_path, 'w') as f:

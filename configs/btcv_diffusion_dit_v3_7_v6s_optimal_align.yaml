@@ -1,0 +1,117 @@
+# V6s: Optimal cyclic contour alignment + v6o endpoint loss + multistep
+#
+# Key hypothesis: the current greedy (nearest-first-point) GT contour alignment
+# is suboptimal for tortuous contours (e.g. c4/c5 in BTCV), causing the model
+# to learn systematically wrong velocity fields for high-curvature regions.
+#
+# V6s fixes this by finding the cyclic shift k* that minimises total squared
+# displacement sum||oct[i] - gt[(i+k)%N]||^2 for every training sample.
+# For convex contours this is almost identical to the greedy approach.
+# For tortuous contours it can differ by 10-30 points, dramatically reducing
+# the training target displacement and giving cleaner gradient signal.
+#
+# Also incorporates:
+#   - v6o endpoint consistency loss (λ=0.5, helps boundary precision)
+#   - multistep iterative refinement (3×50 ODE, from v6m)
+#   - all v6m architecture features (scale cond, curve context, per-point head)
+#
+# Resume: v6m epoch20 (best full-val 0.890066)
+# Expected: +1-4% IoU from better GT alignment on complex shapes
+
+model: 'sbd'
+network: 'ro_34'
+task: 'snake'
+
+gpus: [0]
+resume: true
+resume_weights_only: true
+
+train_or_test: train
+
+train:
+    dataset: 'BtcvTrain'
+    data_path: '/mnt/sdb1/leijh/DiffusionSnake/Datasets/BTCV/btcv_png_new_snake'
+    per_contour: false
+    merge_with_val: false
+    detail_context_head_only: true
+
+    optim: 'adamw'
+    lr: 0.000005
+    milestones: (80, 120)
+    gamma: 0.5
+    batch_size: 12
+    gradient_accumulation_steps: 1
+    gradient_clip: 1.0
+    weight_decay: 0.01
+    warmup_steps: 20
+    eta_min: 0.0000005
+
+    epoch: 40
+    num_workers: 4
+    save_ep: 1
+
+test:
+    dataset: 'BtcvVal'
+    batch_size: 1
+    img_path: '/mnt/sdb1/leijh/DiffusionSnake/Datasets/BTCV/btcv_png_test_new_snake'
+    epoch: -1
+
+use_nms_for_snake: true
+det_conf_thresh: 0.01
+det_iou_thresh: 0.45
+det_max_det: 100
+per_class_nms: true
+use_gt_det: false
+
+loss_scales: {det: 0, ex: 1.0, py: 1.2}
+
+use_diffusion_evolution: true
+use_flow_matching: true
+flow_ode_steps: 10
+flow_noise_scale: 0.3
+flow_train_noise_scale: 0.3
+flow_fix_t0: false
+
+use_iterative_refinement: true
+iterative_num_steps: 3
+iterative_fractions: [0.3333, 0.5, 1.0]
+iterative_ode_steps: 50
+
+diffusion_loss_weight: 1.0
+diffusion_loss_type: 'adaptive'
+diffusion_disp_norm: true
+diffusion_disp_stats: "data/stats/btcv_disp_stats_octagon.json"
+
+use_dit_v3_7: true
+dit_num_layers: 6
+dit_num_heads: 8
+dit_state_dim: 256
+
+v3_7_use_per_point_head: true
+v3_7_use_regularized_per_point: false
+v3_7_use_scale_conditioning: true
+v3_7_use_detail_context: true
+v3_7_use_detail_curve_context: true
+v3_7_detail_context_mode: 'normal_tangent'
+v3_7_detail_curve_inject_mode: 'point'
+v3_7_delta_scale: 0.1
+v3_7_delta_reg_weight: 0.001
+v3_7_laplacian_weight: 0.0
+v3_7_spectral_loss_k: 0
+v3_7_hf_loss_weight: 0.1
+v3_7_use_curvature_reweight: false
+v3_7_ode_smooth_k: 0
+
+# V6s: optimal cyclic alignment (the key change)
+v3_7_optimal_cyclic_align: true
+
+# V6o: endpoint consistency loss
+v3_7_endpoint_loss_weight: 0.5
+
+infer_noise_scale: 0.0
+infer_avg_samples: 1
+
+use_grpo: false
+heads: {'ct_hm': 9, 'wh': 2}
+segm_or_bbox: 'segm'
+use_diffusion_trainer: true

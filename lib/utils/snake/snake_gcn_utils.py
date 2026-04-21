@@ -172,6 +172,8 @@ def prepare_training(ret, batch):
     init.update({'c_it_py': collect_training(batch['c_it_py'], ct_01)})
     init.update({'i_gt_py': collect_training(batch['i_gt_py'], ct_01)})
     init.update({'c_gt_py': collect_training(batch['c_gt_py'], ct_01)})
+    if 'point_mask' in batch:
+        init.update({'point_mask': collect_training(batch['point_mask'], ct_01)})
 
     ct_num = batch['meta']['ct_num']
     init.update({'4py_ind': torch.cat([torch.full([ct_num[i]], i) for i in range(ct_01.size(0))], dim=0)})
