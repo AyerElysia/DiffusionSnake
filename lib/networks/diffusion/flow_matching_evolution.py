@@ -103,6 +103,18 @@ class FlowMatchingEvolution(nn.Module):
                 global_context_mode=_global_ctx_mode,
                 global_num_queries=_global_queries,
             )
+        # V3.4: keep the original V3 backbone and iterative refinement, only swap to FM
+        elif getattr(global_cfg, 'use_dit_v3_4', False):
+            from .dit_denoiser_v3 import DiTDenoiserV3
+            print(f"[FlowMatchingEvolution] Using DiT Flow Network V3.4 "
+                  f"(V3 backbone + iterative refinement, ODE steps={ode_steps})")
+            self.denoiser = DiTDenoiserV3(
+                state_dim=dit_state_dim,
+                feature_dim=feature_dim,
+                num_layers=dit_num_layers,
+                num_heads=dit_num_heads,
+                num_points=num_points,
+            )
         # V3.6: V3 global query + iterative refinement + Flow Matching
         elif getattr(global_cfg, 'use_dit_v3_6', False):
             from .dit_denoiser_v3_6 import DiTFlowMatchingV3_6

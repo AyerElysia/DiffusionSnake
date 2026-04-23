@@ -29,19 +29,19 @@ class DatasetCatalog(object):
         },
         'BtcvTrain': {
             'id': 'sbd',
-            'data_root': '/home/medteam/Zhrch/Datasets/BTCV/btcv_png_new_snake',
+            'data_root': '/home/medteam/Zhrch/Datasets/BTCV/btcv_png_snake',
             'ann_file': 'dummy_annotations.json',
             'split': 'train'
         },
         'BtcvVal': {
             'id': 'sbd',
-            'data_root': '/home/medteam/Zhrch/Datasets/BTCV/btcv_png_test_new_snake',
+            'data_root': '/home/medteam/Zhrch/Datasets/BTCV/btcv_png_snake',
             'ann_file': 'dummy_annotations.json',
             'split': 'val'
         },
         'BtcvMini': {
             'id': 'sbd',
-            'data_root': '/home/medteam/Zhrch/Datasets/BTCV/btcv_png_new_snake',
+            'data_root': '/home/medteam/Zhrch/Datasets/BTCV/btcv_png_snake',
             'ann_file': 'dummy_annotations.json',
             'split': 'mini'
         },

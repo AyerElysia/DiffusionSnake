@@ -8,13 +8,13 @@ task: 'snake'
 model_dir: "data/model/btcv_diffusion_dit_v3_7_v8_v6bq_optimal_align"
 
 gpus: [2, 3, 4, 5, 6, 7]
-resume: false
+resume: true
 
 train_or_test: train
 
 train:
     dataset: 'BtcvTrain'
-    data_path: '/mnt/sdb1/leijh/DiffusionSnake/Datasets/BTCV/btcv_png_new_snake'
+    data_path: '/home/medteam/Zhrch/Datasets/BTCV/btcv_png_new_snake'
     per_contour: false
     merge_with_val: false
 
@@ -22,7 +22,7 @@ train:
     lr: 5e-5
     milestones: (80, 120)
     gamma: 0.5
-    batch_size: 6
+    batch_size: 12
     gradient_accumulation_steps: 1
     gradient_clip: 1.0
     weight_decay: 0.01
@@ -35,7 +35,7 @@ train:
 test:
     dataset: 'BtcvVal'
     batch_size: 1
-    img_path: '/mnt/sdb1/leijh/DiffusionSnake/Datasets/BTCV/btcv_png_test_new_snake'
+    img_path: '/home/medteam/Zhrch/Datasets/BTCV/btcv_png_test_new_snake'
     epoch: -1
 
 use_nms_for_snake: true
