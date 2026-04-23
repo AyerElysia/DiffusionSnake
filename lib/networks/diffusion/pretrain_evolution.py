@@ -844,7 +844,9 @@ class DiffusionEvolution(nn.Module):
                 'diff_lossA1': lossA1,
                 'diff_loss_total': diff_loss,
                 'diff_loss1': lossA1,
+                'point_mask': point_mask_train,
                 'py_pred': [i_init_train_py],
+                'py': pred_contours,
                 'pred_contours': pred_contours,  # NEW for smoothness loss
             })
             
@@ -860,13 +862,14 @@ class DiffusionEvolution(nn.Module):
 
                 if i_it_py.numel() == 0:
                     disp = torch.zeros_like(i_it_py)
-                    ret.update({'disp': disp, 'py': i_it_py})
+                    ret.update({'disp': disp, 'py': i_it_py, 'py_pred': [i_it_py], 'pred_contours': i_it_py})
                 elif self.use_fourier_diffusion:
                     # V3.5: DDIM sampling in Fourier space
                     disp = self.sample_disp_fourier(
                         cnn_feature, i_it_py, c_it_py, py_ind, steps=50
                     )
-                    ret.update({'disp': disp, 'py': i_it_py + disp})
+                    final_py = i_it_py + disp
+                    ret.update({'disp': disp, 'py': final_py, 'py_pred': [final_py], 'pred_contours': final_py})
                 elif self.use_iterative_refinement:
                     iter_steps = getattr(global_cfg, 'iterative_num_steps', 3)
                     fractions = list(getattr(global_cfg, 'iterative_fractions', []))
@@ -878,13 +881,17 @@ class DiffusionEvolution(nn.Module):
                         num_iter_steps=iter_steps, fractions=fractions, ddim_steps=ddim_steps,
                     )
                     disp = self._apply_postprocess(disp)
-                    ret.update({'disp': disp, 'py': i_it_py + disp})
+                    final_py = i_it_py + disp
+                    ret.update({'disp': disp, 'py': final_py, 'py_pred': [final_py], 'pred_contours': final_py})
                 else:
                     disp = self.sample_disp(cnn_feature, i_it_py, c_it_py, py_ind, steps=50)
                     disp = self._apply_postprocess(disp)
+                    final_py = i_it_py + disp
                     ret.update({
                         'disp': disp,
-                        'py': i_it_py + disp
+                        'py': final_py,
+                        'py_pred': [final_py],
+                        'pred_contours': final_py
                     })
                 
         return ret

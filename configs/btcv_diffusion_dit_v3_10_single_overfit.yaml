@@ -6,7 +6,7 @@ network: 'ro_34'
 task: 'snake'
 model_dir: "data/outputs/btcv_diffusion_dit_v3_10_single_overfit"
 
-gpus: [0]
+gpus: [1]
 resume: false
 
 train_or_test: train

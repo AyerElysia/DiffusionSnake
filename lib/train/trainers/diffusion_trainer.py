@@ -43,6 +43,35 @@ class DiffusionPretrainNetworkWrapper(nn.Module):
                 p.requires_grad = False
             self.net.yolo.eval()
 
+    @staticmethod
+    def _masked_contour_regularizer(contours: torch.Tensor, point_mask: torch.Tensor, kind: str) -> torch.Tensor:
+        """Compute a pointwise contour regularizer on compacted valid points only."""
+        if contours.numel() == 0 or point_mask is None:
+            return contours.sum() * 0.0
+
+        losses = []
+        for contour, mask in zip(contours, point_mask):
+            valid = mask > 0.5
+            if int(valid.sum().item()) < 3:
+                continue
+
+            pts = contour[valid]
+            prev = torch.roll(pts, 1, dims=0)
+            next = torch.roll(pts, -1, dims=0)
+
+            if kind == 'smooth':
+                diff = pts - (prev + next) * 0.5
+            elif kind == 'curv':
+                diff = next - 2.0 * pts + prev
+            else:
+                raise ValueError(f"Unsupported regularizer kind: {kind}")
+
+            losses.append(torch.mean(diff ** 2))
+
+        if not losses:
+            return contours.sum() * 0.0
+        return torch.stack(losses).mean()
+
     def forward(self, batch):
         # 仅调用原网络，保证不会进入 GRPO 分支
         output = self.net(batch['inp'], batch)
@@ -102,23 +131,31 @@ class DiffusionPretrainNetworkWrapper(nn.Module):
         if (not self.freeze_snake) and ('pred_contours' in output):
             smooth_weight = float(self.loss_scales.get('smooth', 0.0))
             curv_weight = float(self.loss_scales.get('curv', 0.0))
+            point_mask = output.get('point_mask', None)
 
             if smooth_weight > 0 or curv_weight > 0:
                 contours = output['pred_contours']  # (N, P, 2)
                 base_contours = output.get('i_it_py', None)
+                masked_contours = None
 
                 # Regularize the predicted correction rather than absolute coordinates.
                 # This keeps the penalty focused on local jaggedness and avoids
                 # over-penalizing the coarse contour geometry itself.
                 if isinstance(base_contours, torch.Tensor) and base_contours.shape == contours.shape:
                     contours = contours - base_contours
+                if isinstance(point_mask, torch.Tensor) and point_mask.dim() == 2 and point_mask.shape[:2] == contours.shape[:2]:
+                    point_mask = point_mask.to(device=contours.device, dtype=contours.dtype)
+                    masked_contours = contours
 
                 # Laplacian smoothness loss
                 if smooth_weight > 0:
-                    prev = torch.roll(contours, 1, dims=1)
-                    next = torch.roll(contours, -1, dims=1)
-                    laplacian = contours - (prev + next) / 2
-                    smooth_loss = torch.mean(laplacian ** 2)
+                    if masked_contours is not None:
+                        smooth_loss = self._masked_contour_regularizer(masked_contours, point_mask, 'smooth')
+                    else:
+                        prev = torch.roll(contours, 1, dims=1)
+                        next = torch.roll(contours, -1, dims=1)
+                        laplacian = contours - (prev + next) / 2
+                        smooth_loss = torch.mean(laplacian ** 2)
                     loss = loss + smooth_weight * smooth_loss
                     scalar_stats.update({
                         'smooth_loss': smooth_loss,
@@ -130,12 +167,15 @@ class DiffusionPretrainNetworkWrapper(nn.Module):
                 # Curvature loss
                 if curv_weight > 0:
                     # Cyclic second-order difference keeps the contour closed.
-                    v2 = (
-                        torch.roll(contours, -1, dims=1)
-                        - 2.0 * contours
-                        + torch.roll(contours, 1, dims=1)
-                    )
-                    curv_loss = torch.mean(v2 ** 2)
+                    if masked_contours is not None:
+                        curv_loss = self._masked_contour_regularizer(masked_contours, point_mask, 'curv')
+                    else:
+                        v2 = (
+                            torch.roll(contours, -1, dims=1)
+                            - 2.0 * contours
+                            + torch.roll(contours, 1, dims=1)
+                        )
+                        curv_loss = torch.mean(v2 ** 2)
                     loss = loss + curv_weight * curv_loss
                     scalar_stats.update({
                         'curv_loss': curv_loss,

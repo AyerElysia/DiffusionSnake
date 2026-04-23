@@ -6,8 +6,9 @@ import os
 import sys
 import torch
 
+_ROOT_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 os.environ['CFG_FILE'] = 'configs/btcv_diffusion_dit_v3_10.yaml'
-sys.path.insert(0, '/mnt/sdb1/leijh/DiffusionSnake/DiffusionSnake-12-30')
+sys.path.insert(0, _ROOT_DIR)
 
 from lib.config import cfg
 from lib.datasets import make_data_loader

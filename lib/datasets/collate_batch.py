@@ -82,7 +82,7 @@ def snake_collator(batch):
 
     # V3.10: evolution with adaptive points + mask
     if snake_config.adaptive_points_enabled:
-        # Use fixed output slots so 64-point contours can use "every-other-point" masks on 128 slots.
+        # Use fixed output slots so 64-point contours can occupy a contiguous prefix and pad the tail.
         max_points = int(max(
             getattr(snake_config, 'poly_num', 128),
             getattr(snake_config, 'max_points', 128),
@@ -106,14 +106,14 @@ def snake_collator(batch):
                     ig_src = torch.as_tensor(b['i_gt_py'][ci], dtype=torch.float)
                     cg_src = torch.as_tensor(b['c_gt_py'][ci], dtype=torch.float)
 
-                    # User rule: for 64-point contours, mark every other slot (0,2,4,...,126).
+                    # V3.10: keep valid 64-point contours as a contiguous prefix.
+                    # This preserves local point order and avoids artificial gaps.
                     if n_pts == small_points and max_points >= (small_points * 2):
-                        interleave_idx = torch.arange(0, small_points * 2, 2, dtype=torch.long)
-                        i_it_pys[bi, ci, interleave_idx] = i_src[:small_points]
-                        c_it_pys[bi, ci, interleave_idx] = c_src[:small_points]
-                        i_gt_pys[bi, ci, interleave_idx] = ig_src[:small_points]
-                        c_gt_pys[bi, ci, interleave_idx] = cg_src[:small_points]
-                        point_masks[bi, ci, interleave_idx] = 1.0
+                        i_it_pys[bi, ci, :small_points] = i_src[:small_points]
+                        c_it_pys[bi, ci, :small_points] = c_src[:small_points]
+                        i_gt_pys[bi, ci, :small_points] = ig_src[:small_points]
+                        c_gt_pys[bi, ci, :small_points] = cg_src[:small_points]
+                        point_masks[bi, ci, :small_points] = 1.0
                     else:
                         valid_n = min(n_pts, max_points)
                         i_it_pys[bi, ci, :valid_n] = i_src[:valid_n]
