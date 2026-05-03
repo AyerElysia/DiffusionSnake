@@ -29,8 +29,8 @@ train:
     warmup_steps: 1000
 
     epoch: 10000
-    num_workers: 4
-    save_ep: 10
+    num_workers: 8
+    save_ep: 20
 
 test:
     dataset: 'BtcvVal'
@@ -81,3 +81,5 @@ segm_or_bbox: 'segm'
 use_diffusion_trainer: true
 
 yolo_model_scale: 's'
+dataloader_persistent_workers: true
+dataloader_prefetch_factor: 4

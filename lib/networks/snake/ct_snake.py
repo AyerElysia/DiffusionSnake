@@ -3,9 +3,10 @@ from .evolve import Evolution
 from lib.utils import net_utils, data_utils
 from lib.utils.snake import snake_decode
 import torch
+import torch.nn.functional as F
 from lib.config import cfg
 import warnings
-from lib.networks.YOLOV8.nn.tasks import DetectionModel, attempt_load_one_weight
+from lib.networks.YOLOV8.nn.tasks import DetectionModel, attempt_load_one_weight, yaml_model_load
 import os
 
 warnings.filterwarnings("ignore")
@@ -20,10 +21,20 @@ class Network(nn.Module):
         # 使用本地 YOLOv8 检测模型替换 DLA，输出检测与特征
         # 选择包含 P2 的结构以获得 stride=4 的特征图，空间大小与原来 DLA 的 136x136 对齐（当输入是 544x544）
         yolo_yaml = 'lib/networks/YOLOV8/cfg/models/v8/yolov8-p2.yaml'
-        nc = heads.get('ct_hm', 1)
-        self.yolo = DetectionModel(cfg=yolo_yaml, ch=3, nc=nc, verbose=False)
+        nc = int(getattr(cfg, 'yolo_num_classes', 0) or heads.get('ct_hm', 1))
+        yolo_cfg = yaml_model_load(yolo_yaml)
+        yolo_scale = str(getattr(cfg, 'yolo_model_scale', '') or '').strip().lower()
+        if yolo_scale:
+            yolo_cfg['scale'] = yolo_scale
+        self.yolo = DetectionModel(cfg=yolo_cfg, ch=3, nc=nc, verbose=False)
         self.freeze_snake = bool(getattr(cfg, 'freeze_snake', False))
         self.freeze_yolo = bool(getattr(cfg, 'freeze_yolo', False))
+
+        try:
+            actual_scale = str(getattr(self.yolo, 'yaml', {}).get('scale', ''))
+            print(f"[YOLO] yaml={yolo_yaml} requested_scale={yolo_scale or 'default'} actual_scale={actual_scale or 'default'} nc={nc}")
+        except Exception:
+            pass
 
         # 加载 YOLO 预训练权重（测试阶段无需加载，统一依赖整体checkpoint；训练可通过开关启用）
         try:
@@ -42,6 +53,14 @@ class Network(nn.Module):
         # YOLO Detect 头拼接后的通道数为 reg_max*4 + nc（默认 reg_max=16 -> 64）
         in_ch = 64 + nc
         self.cnn_proj = nn.Conv2d(in_ch, 64, kernel_size=1, bias=False)
+        self.use_p3_features = bool(
+            getattr(cfg, 'v3_4_use_p3_features', False)
+            or getattr(cfg, 'v3_7_use_p3_features', False)
+        )
+        if self.use_p3_features:
+            self.cnn_proj_p3 = nn.Conv2d(in_ch, 64, kernel_size=1, bias=False)
+            nn.init.zeros_(self.cnn_proj_p3.weight)
+            print("[Snake] P3 feature fusion enabled with zero-init residual.")
 
         # Choose between original evolution and diffusion evolution
         use_diffusion = getattr(cfg, 'use_diffusion_evolution', False)
@@ -78,6 +97,8 @@ class Network(nn.Module):
         # 冻结 Snake 相关模块（只训练 YOLO）
         if self.freeze_snake:
             modules_to_freeze = [self.gcn, self.cnn_proj] if not use_diffusion else [self.cnn_proj]
+            if hasattr(self, 'cnn_proj_p3'):
+                modules_to_freeze.append(self.cnn_proj_p3)
             for m in modules_to_freeze:
                 m.eval()
                 for p in m.parameters():
@@ -152,6 +173,11 @@ class Network(nn.Module):
         if p2 is None:
             raise RuntimeError("YOLO head features are not available; expected a list with P2 at index 0.")
         cnn_feature = self.cnn_proj(p2)
+        if self.use_p3_features:
+            p3 = yolo_feats[1] if isinstance(yolo_feats, (list, tuple)) and len(yolo_feats) > 1 else None
+            if p3 is not None:
+                p3_up = F.interpolate(p3, size=p2.shape[-2:], mode='bilinear', align_corners=False)
+                cnn_feature = cnn_feature + self.cnn_proj_p3(p3_up)
 
         # 从 YOLO 输出构建 detection (B, N, 6) => [x1,y1,x2,y2,score,cls]
         # 并按配置执行阈值+NMS，确保训练/测试阶段一致地给 Snake 提供精简候选

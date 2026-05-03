@@ -35,6 +35,8 @@ cfg.gpus = [0]
 
 # if load the pretrained network
 cfg.resume = True
+cfg.resume_weights_only = False
+cfg.resume_path = ''
 
 # Diffusion/Snake integration switches
 cfg.use_diffusion_evolution = False
@@ -52,6 +54,7 @@ cfg.use_dit_v3_2 = False
 cfg.use_dit_v3_3 = False
 cfg.use_dit_v3_4 = False
 cfg.use_dit_v3_6 = False
+cfg.use_dit_v3_7 = False
 cfg.use_dit_v3_8 = False
 cfg.circular_conv_kernel = 5
 cfg.use_flow_matching = False
@@ -82,6 +85,11 @@ cfg.iterative_fractions = [0.3333, 0.5, 1.0]
 cfg.iterative_ddim_steps = 20
 cfg.iterative_ode_steps = 0
 
+# V3.4-FM detail experiment knobs
+cfg.v3_4_use_p3_features = False
+cfg.v3_4_use_detail_context = False
+cfg.v3_4_detail_context_mode = 'normal'
+
 # V3.5: Fourier low-pass post-processing
 cfg.fourier_smooth_k = 0  # 0=disabled, >0=keep lowest K freq components per side
 
@@ -106,6 +114,12 @@ cfg.det_max_det = 300
 cfg.per_class_nms = True
 cfg.yolo_pretrained = ''
 cfg.load_yolo_pretrained = False
+cfg.yolo_num_classes = 0
+cfg.yolo_model_scale = ''
+cfg.yolo_train_scope = 'head'
+cfg.disable_lr_flip = False
+cfg.dataloader_persistent_workers = True
+cfg.dataloader_prefetch_factor = 4
 
 # demo
 cfg.demo_vis = '/mnt/date/zhangrch/EnergeSnake/zrc_visual/2301/'
@@ -204,6 +218,9 @@ def _infer_default_cfg(args):
         return env_cfg
     script = Path(sys.argv[0]).stem.lower()
     if "grpo_train" in script:
+        btcv_grpo_cfg = Path("configs/btcv_diffusion_dit_v3_1_fm_posttrain.yaml")
+        if btcv_grpo_cfg.exists():
+            return str(btcv_grpo_cfg)
         return "configs/grpo_snake.yaml"
     if "diffusion_train" in script:
         return "configs/diffusion_snake.yaml"

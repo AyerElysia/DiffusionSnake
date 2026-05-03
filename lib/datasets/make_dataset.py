@@ -83,12 +83,23 @@ def make_data_loader(cfg, is_train=True, is_distributed=False, max_iter=-1):
     batch_sampler = make_batch_data_sampler(cfg, sampler, batch_size, drop_last, max_iter)
     num_workers = cfg.train.num_workers
     collator = make_collator(cfg)
+    loader_kwargs = {
+        'batch_sampler': batch_sampler,
+        'num_workers': num_workers,
+        'collate_fn': collator,
+        'pin_memory': True,
+    }
+    if num_workers > 0:
+        loader_kwargs['persistent_workers'] = bool(
+            getattr(cfg, 'dataloader_persistent_workers', True)
+        )
+        prefetch_factor = int(getattr(cfg, 'dataloader_prefetch_factor', 0) or 0)
+        if prefetch_factor > 0:
+            loader_kwargs['prefetch_factor'] = prefetch_factor
+
     data_loader = torch.utils.data.DataLoader(
         dataset,
-        batch_sampler=batch_sampler,
-        num_workers=num_workers,
-        collate_fn=collator,
-        pin_memory=True
+        **loader_kwargs
     )
 
     return data_loader

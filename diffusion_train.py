@@ -17,21 +17,62 @@ from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.optim.lr_scheduler import MultiStepLR, SequentialLR, LinearLR, CosineAnnealingLR
 
 # Configure logging
+'''
+level=logging.INFO
+表示只显示 INFO 及以上级别的信息，比如：
+INFO      普通提示信息
+WARNING   警告
+ERROR     错误
+format='[%(levelname)s] %(message)s'表示输出格式是：[日志级别] 日志内容
+'''
 logging.basicConfig(level=logging.INFO, format='[%(levelname)s] %(message)s')
 logger = logging.getLogger(__name__)
 
 # Training constants
+'''
+GRAD_CLIP_VALUE = 40.0:这个是梯度裁剪阈值。
+训练时如果梯度太大，模型参数更新会非常剧烈，可能导致训练崩掉。后面代码里有：
+torch.nn.utils.clip_grad_value_(trainer.network.parameters(), GRAD_CLIP_VALUE)
+意思是：如果梯度值超过 40.0，就把它限制住。
+
+TIME_SCALE_FACTOR = 1000.0这个是时间换算系数。
+Python 里的 time.time() 计算出来通常是“秒”，代码后面有：
+'time_ms': float(dt * TIME_SCALE_FACTOR)
+所以：秒 × 1000 = 毫秒
+
+DEFAULT_WARMUP_START_FACTOR = 1e-3这个是学习率预热的起始比例。
+1e-3意思是训练刚开始时，学习率先从正常学习率的 0.001 倍 开始，然后慢慢升上去。
+
+DEFAULT_LR_GAMMA = 0.5
+这个是学习率衰减比例。
+如果学习率需要下降，就乘以 0.5，也就是变成原来的一半。
+'''
 GRAD_CLIP_VALUE = 40.0
 TIME_SCALE_FACTOR = 1000.0
 DEFAULT_WARMUP_START_FACTOR = 1e-3
 DEFAULT_LR_GAMMA = 0.5
 
+'''
+尝试导入一些可选工具。
+如果电脑里没有安装，也不要让程序直接崩溃，而是换一种备用方案继续运行。
+
+'''
 try:
-    import wandb
+    import wandb#wandb 是一个训练可视化平台，全名一般叫 Weights & Biases。
 except ImportError:
     wandb = None
     logger.warning("wandb not available, logging will be local only")
-
+'''
+这里尝试从 diffusers 库里面导入学习率调度器。
+diffusers 通常是 HuggingFace 里和扩散模型相关的库。这个项目是 DiffusionSnake，
+所以作者可能原本想用 diffusers 里面的 scheduler。
+get_scheduler 的作用是创建学习率调度器。
+SchedulerType 是学习率调度类型，比如：
+constant：学习率不变
+linear：学习率线性下降
+cosine：学习率按余弦曲线下降
+没有 diffusers 的调度器，那就改用 PyTorch 自带的学习率调度器。
+'''
 try:
     from diffusers.optimization import get_scheduler, SchedulerType
 except ImportError:
@@ -49,10 +90,36 @@ except ImportError:
 # IMPORTANT: lib.config 会在 import 时就解析 argv/环境变量并加载 cfg 文件。
 # 这里不能强行覆盖用户通过环境变量/命令行指定的 cfg。
 # 仅当用户没有设置 CFG_FILE 且没有传 --cfg_file 时，才回退到默认 diffusion 配置。
+'''
+__file__ 表示当前这个 Python 文件的路径
+os.path.dirname(__file__) 表示当前文件所在的文件夹路径。
+sys.argv 是命令行参数列表
+比如你运行：python diffusion_train.py --cfg_file configs/my.yaml
+那么 sys.argv 大概是：
+[
+    "diffusion_train.py",
+    "--cfg_file",
+    "configs/my.yaml"
+]
+.lower()：这句代码把里面所有参数都变成小写，方便后面判断。
+
+优先级：
+1. 命令行 --cfg_file
+2. 环境变量 CFG_FILE
+3. 环境变量 DIFFUSION_CFG_FILE
+4. 默认 configs/diffusion_snake.yaml
+'''
 _THIS_DIR = os.path.dirname(__file__)
+#这句是在拼接默认配置文件路径。
 _DEFAULT_CFG = os.path.join(_THIS_DIR, 'configs', 'diffusion_snake.yaml')
 _argv_lower = [a.lower() for a in sys.argv]
+#用户有没有在命令行里手动指定配置文件？它同时支持两种写法：--cfg_file和：--cfg-file
 _has_cli_cfg = ('--cfg_file' in _argv_lower) or ('--cfg-file' in _argv_lower)
+#如果用户没有通过命令行指定配置文件，
+# 并且用户也没有通过环境变量 CFG_FILE 指定配置文件，
+# 那就进入下面的默认设置。
+# 如果用户设置了 DIFFUSION_CFG_FILE，就用 DIFFUSION_CFG_FILE；
+# 如果用户没设置 DIFFUSION_CFG_FILE，就用默认的 diffusion_snake.yaml。
 if (not _has_cli_cfg) and (not os.environ.get('CFG_FILE')):
     os.environ['CFG_FILE'] = os.environ.get('DIFFUSION_CFG_FILE', _DEFAULT_CFG)
 
@@ -311,6 +378,8 @@ def main():
     resume_json_pos = None
     resume_checkpoint = None
     resume_path = os.environ.get('ONE_SAMPLE_RESUME_PATH', '').strip()
+    if not resume_path:
+        resume_path = str(getattr(cfg, 'resume_path', '') or '').strip()
 
     def _safe_load_optimizer_state(optimizer_obj, opt_state_dict) -> bool:
         """Load optimizer state_dict while dropping states whose tensor shapes mismatch current params.
@@ -364,6 +433,82 @@ def main():
         except Exception:
             return False
 
+    def _safe_load_model_state(model_obj, source_state_dict):
+        """Load checkpoint tensors conservatively, reusing exact matches and overlapping slices when possible."""
+        if not isinstance(source_state_dict, dict):
+            return None
+
+        target_state_dict = model_obj.state_dict()
+        matched_state_dict = {}
+        partially_copied = []
+        skipped_shape = []
+        unexpected = []
+        exact_match_params = 0
+        partial_copy_params = 0
+        skipped_params = 0
+
+        def _build_overlap_tensor(target_tensor, source_tensor):
+            if (not isinstance(target_tensor, torch.Tensor)) or (not isinstance(source_tensor, torch.Tensor)):
+                return None, 0
+            if target_tensor.ndim != source_tensor.ndim or target_tensor.ndim == 0:
+                return None, 0
+
+            overlap_shape = tuple(min(int(s), int(t)) for s, t in zip(source_tensor.shape, target_tensor.shape))
+            if any(dim <= 0 for dim in overlap_shape):
+                return None, 0
+
+            try:
+                patched = target_tensor.detach().cpu().clone()
+                source_cpu = source_tensor.detach().cpu().to(dtype=patched.dtype)
+                overlap_slices = tuple(slice(0, dim) for dim in overlap_shape)
+                patched[overlap_slices] = source_cpu[overlap_slices]
+                overlap_numel = 1
+                for dim in overlap_shape:
+                    overlap_numel *= dim
+                return patched, int(overlap_numel)
+            except Exception:
+                return None, 0
+
+        for key, value in source_state_dict.items():
+            if key not in target_state_dict:
+                unexpected.append(key)
+                continue
+
+            target_value = target_state_dict[key]
+            if not isinstance(value, torch.Tensor) or not isinstance(target_value, torch.Tensor):
+                matched_state_dict[key] = value
+                continue
+
+            if tuple(value.shape) == tuple(target_value.shape):
+                matched_state_dict[key] = value
+                exact_match_params += int(value.numel())
+            else:
+                patched_value, overlap_numel = _build_overlap_tensor(target_value, value)
+                if patched_value is not None and overlap_numel > 0:
+                    matched_state_dict[key] = patched_value
+                    partially_copied.append((key, tuple(value.shape), tuple(target_value.shape), overlap_numel))
+                    partial_copy_params += int(overlap_numel)
+                else:
+                    skipped_shape.append((key, tuple(value.shape), tuple(target_value.shape)))
+                    skipped_params += int(target_value.numel())
+
+        incompatible = model_obj.load_state_dict(matched_state_dict, strict=False)
+        return {
+            'matched_keys': len(matched_state_dict),
+            'exact_match_keys': len(matched_state_dict) - len(partially_copied),
+            'exact_match_params': exact_match_params,
+            'partial_copy_keys': len(partially_copied),
+            'partial_copy_params': partial_copy_params,
+            'matched_params': exact_match_params + partial_copy_params,
+            'partially_copied': partially_copied,
+            'skipped_shape': skipped_shape,
+            'skipped_shape_keys': len(skipped_shape),
+            'skipped_params': skipped_params,
+            'missing_keys': list(getattr(incompatible, 'missing_keys', [])),
+            'unexpected_keys': list(getattr(incompatible, 'unexpected_keys', [])),
+            'unexpected_ckpt_keys': unexpected,
+        }
+
     resume_weights_only = bool(getattr(cfg, 'resume_weights_only', False))
 
     if getattr(cfg, 'resume', False):
@@ -391,18 +536,50 @@ def main():
 
                 try:
                     model_to_load = trainer.network.module if hasattr(trainer.network, 'module') else trainer.network
-                    missing, unexpected = model_to_load.load_state_dict(state_dict, strict=False)
+                    load_report = _safe_load_model_state(model_to_load, state_dict)
+                    if load_report is None:
+                        raise RuntimeError("checkpoint state_dict is not a dict")
 
-                    # Validate critical modules loaded
-                    critical_missing = [k for k in missing if any(x in k for x in ['yolo', 'gcn', 'denoiser'])]
+                    logger.info(
+                        "Partial checkpoint init: "
+                        f"matched_keys={load_report['matched_keys']} "
+                        f"exact_match_keys={load_report['exact_match_keys']} "
+                        f"partial_copy_keys={load_report['partial_copy_keys']} "
+                        f"matched_params={load_report['matched_params']} "
+                        f"exact_match_params={load_report['exact_match_params']} "
+                        f"partial_copy_params={load_report['partial_copy_params']} "
+                        f"skipped_shape_keys={load_report['skipped_shape_keys']} "
+                        f"skipped_params={load_report['skipped_params']} "
+                        f"missing_after_load={len(load_report['missing_keys'])} "
+                        f"unexpected_ckpt_keys={len(load_report['unexpected_ckpt_keys'])}"
+                    )
+
+                    critical_missing = [
+                        k for k in load_report['missing_keys']
+                        if any(x in k for x in ['yolo', 'gcn', 'denoiser'])
+                    ]
+                    if load_report['matched_keys'] == 0:
+                        logger.error("Checkpoint init matched zero parameter tensors.")
                     if critical_missing:
-                        logger.error(f"Critical modules missing from checkpoint: {critical_missing[:10]}")
-                        logger.warning("Training may start from partially initialized weights!")
-
-                    if missing:
-                        logger.warning(f"Missing keys ({len(missing)} total): {missing[:5]}...")
-                    if unexpected:
-                        logger.warning(f"Unexpected keys ({len(unexpected)} total): {unexpected[:5]}...")
+                        logger.warning(
+                            f"Critical modules still partially uninitialized ({len(critical_missing)} keys): "
+                            f"{critical_missing[:10]}..."
+                        )
+                    if load_report['skipped_shape_keys']:
+                        logger.warning(
+                            "Shape-mismatched checkpoint tensors were skipped: "
+                            f"{load_report['skipped_shape'][:5]}..."
+                        )
+                    if load_report['partial_copy_keys']:
+                        logger.info(
+                            "Partially copied checkpoint tensors into larger target shapes: "
+                            f"{load_report['partially_copied'][:5]}..."
+                        )
+                    if load_report['unexpected_ckpt_keys']:
+                        logger.warning(
+                            f"Unexpected checkpoint keys ({len(load_report['unexpected_ckpt_keys'])} total): "
+                            f"{load_report['unexpected_ckpt_keys'][:5]}..."
+                        )
                 except RuntimeError as e:
                     logger.error(f"Failed to load model state dict: {e}")
 
@@ -515,9 +692,14 @@ def main():
                 p.requires_grad = True
             for p in net.cnn_proj.parameters():
                 p.requires_grad = False
+            if hasattr(net, 'cnn_proj_p3'):
+                for p in net.cnn_proj_p3.parameters():
+                    p.requires_grad = False
             for p in net.gcn.parameters():
                 p.requires_grad = False
             net.yolo.train(); net.cnn_proj.eval(); net.gcn.eval()
+            if hasattr(net, 'cnn_proj_p3'):
+                net.cnn_proj_p3.eval()
         elif phase == 'diff':
             # 仅训练Diffusion
             w.freeze_yolo = True
@@ -528,9 +710,14 @@ def main():
                 p.requires_grad = False
             for p in net.cnn_proj.parameters():
                 p.requires_grad = True
+            if hasattr(net, 'cnn_proj_p3'):
+                for p in net.cnn_proj_p3.parameters():
+                    p.requires_grad = True
             for p in net.gcn.parameters():
                 p.requires_grad = True
             net.yolo.eval(); net.cnn_proj.train(); net.gcn.train()
+            if hasattr(net, 'cnn_proj_p3'):
+                net.cnn_proj_p3.train()
         else:
             raise ValueError(f"Unknown phase: {phase}")
         # diagnostics

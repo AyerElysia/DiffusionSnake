@@ -22,15 +22,15 @@ train:
     lr: 5e-5
     milestones: (80, 120)
     gamma: 0.5
-    batch_size: 16
+    batch_size: 24
     gradient_accumulation_steps: 1
     gradient_clip: 1.0
     weight_decay: 0.01
     warmup_steps: 1000
 
     epoch: 10000
-    num_workers: 4
-    save_ep: 10
+    num_workers: 8
+    save_ep: 50
 
 test:
     dataset: 'BtcvVal'
@@ -81,3 +81,5 @@ segm_or_bbox: 'segm'
 use_diffusion_trainer: true
 
 yolo_model_scale: 'm'
+dataloader_persistent_workers: true
+dataloader_prefetch_factor: 4
