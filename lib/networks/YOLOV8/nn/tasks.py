@@ -766,15 +766,17 @@ def torch_safe_load(weight):
 
     check_suffix(file=weight, suffix=".pt")
     file = attempt_download_asset(weight)  # search online if missing locally
+    module_aliases = {
+        "ultralytics": "lib.networks.YOLOV8",
+        "ultralytics.nn": "lib.networks.YOLOV8.nn",
+        "ultralytics.nn.tasks": "lib.networks.YOLOV8.nn.tasks",
+        "ultralytics.nn.modules": "lib.networks.YOLOV8.nn.modules",
+        "ultralytics.utils": "lib.networks.YOLOV8.utils",
+        "ultralytics.data": "lib.networks.YOLOV8.data",
+    }
     try:
-        # with temporary_modules(
-        #     {
-        #         "ultralytics.yolo.utils": "ultralytics.utils",
-        #         "ultralytics.yolo.v8": "ultralytics.models.yolo",
-        #         "ultralytics.yolo.data": "ultralytics.data",
-        #     }
-        # ):  # for legacy 8.0 Classify and Pose models
-        ckpt = torch.load(file, map_location="cpu")
+        with temporary_modules(module_aliases):
+            ckpt = torch.load(file, map_location="cpu")
 
     except ModuleNotFoundError as e:  # e.name is missing module name
         if e.name == "models":
@@ -794,7 +796,8 @@ def torch_safe_load(weight):
             f"run a command with an official YOLOv8 model, i.e. 'yolo predict model=yolov8n.pt'"
         )
         check_requirements(e.name)  # install missing module
-        ckpt = torch.load(file, map_location="cpu")
+        with temporary_modules(module_aliases):
+            ckpt = torch.load(file, map_location="cpu")
 
     if not isinstance(ckpt, dict):
         # File is likely a YOLO instance saved with i.e. torch.save(model, "saved_model.pt")

@@ -221,6 +221,10 @@ class Network(nn.Module):
         if getattr(cfg, 'use_gt_det', False):
             self.use_gt_detection(output, batch)
 
+        if (not self.training) and str(getattr(cfg, 'contour_init_method', 'octagon')).strip().lower() == 'sam':
+            from lib.utils.snake.sam_init import attach_sam_testing_init
+            output = attach_sam_testing_init(output, batch, device=x.device)
+
         # 传入 Snake/Diffusion 进行演化
         if not self.freeze_snake:
             output = self.gcn(output, cnn_feature, batch)

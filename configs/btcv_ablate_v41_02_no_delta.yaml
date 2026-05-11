@@ -1,0 +1,95 @@
+# V4.1 mechanism ablation 02
+# Full minus per-point delta.
+
+model: 'sbd'
+network: 'ro_34'
+task: 'snake'
+model_dir: "data/outputs/v4_1_mechanism_ablation/v41_no_delta"
+
+gpus: [6]
+resume: true
+resume_weights_only: true
+resume_path: "data/outputs/btcv_diffusion_dit_v3_4_fm_full_noleak_yolos_detail_gpu4_reusemax/checkpoints/latest.pt"
+
+train_or_test: train
+
+train:
+    dataset: 'BtcvTrain'
+    data_path: '/home/medteam/Zhrch/Datasets/BTCV/btcv_png_new_snake'
+    per_contour: false
+    merge_with_val: false
+
+    optim: 'adamw'
+    lr: 5e-5
+    milestones: (80, 120)
+    gamma: 0.5
+    batch_size: 32
+    gradient_accumulation_steps: 1
+    gradient_clip: 1.0
+    weight_decay: 0.01
+    warmup_steps: 1000
+
+    epoch: 3000
+    num_workers: 4
+    save_ep: 250
+
+test:
+    dataset: 'BtcvVal'
+    batch_size: 1
+    img_path: '/home/medteam/Zhrch/Datasets/BTCV/btcv_png_test_new_snake'
+    epoch: -1
+
+use_nms_for_snake: true
+det_conf_thresh: 0.01
+det_iou_thresh: 0.45
+det_max_det: 100
+per_class_nms: true
+use_gt_det: false
+
+loss_scales: {det: 0, ex: 1.0, py: 1.2}
+
+use_diffusion_evolution: true
+use_flow_matching: true
+flow_ode_steps: 10
+flow_noise_scale: 1.0
+flow_train_noise_scale: 1.0
+flow_fix_t0: false
+
+diffusion_loss_weight: 1.0
+diffusion_loss_type: 'adaptive'
+diffusion_disp_norm: true
+diffusion_disp_stats: "data/stats/btcv_disp_stats_octagon.json"
+
+use_dit_v3: true
+use_dit_v4_1: true
+dit_num_layers: 6
+dit_num_heads: 8
+dit_state_dim: 256
+
+use_iterative_refinement: true
+iterative_num_steps: 3
+iterative_fractions: [0.3333, 0.5, 1.0]
+iterative_ode_steps: 20
+
+infer_noise_scale: 1.0
+infer_avg_samples: 1
+
+use_grpo: false
+heads: {'ct_hm': 9, 'wh': 2}
+segm_or_bbox: 'segm'
+use_diffusion_trainer: true
+
+yolo_model_scale: 's'
+v4_1_use_p3_features: true
+v4_1_use_detail_context: true
+v4_1_detail_context_mode: 'normal'
+v4_1_use_per_point_delta: false
+v4_1_use_curvature_reweight: true
+v4_1_curvature_loss_weight: 1.5
+v4_1_curvature_reweight_power: 1.0
+v4_1_small_disp_prob: 0.10
+v4_1_small_disp_min_frac: 0.80
+v4_1_small_disp_max_frac: 0.95
+
+dataloader_persistent_workers: true
+dataloader_prefetch_factor: 2

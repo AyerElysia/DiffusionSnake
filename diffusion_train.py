@@ -895,7 +895,7 @@ def main():
         """Enable/disable YOLO head training without affecting diffusion branch."""
         w = wrapper.module if hasattr(wrapper, 'module') else wrapper
         net = getattr(w, 'net', None)
-        if net is None:
+        if net is None or getattr(net, 'yolo', None) is None:
             return
         try:
             w.freeze_yolo = (not bool(trainable))

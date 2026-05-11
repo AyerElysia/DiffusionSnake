@@ -34,6 +34,15 @@ def prepare_training_init(ret, batch):
 
 
 def prepare_testing(output):
+    if 'sam_i_it_py' in output and output['sam_i_it_py'] is not None:
+        i_it_py = output['sam_i_it_py']
+        c_it_py = output.get('sam_c_it_py', img_poly_to_can_poly(i_it_py))
+        ind = output.get('sam_py_ind', torch.zeros((i_it_py.size(0),), dtype=torch.long, device=i_it_py.device))
+        i_it_4py = i_it_py[:, :snake_config.init_poly_num] if i_it_py.numel() > 0 else i_it_py.new_zeros((0, snake_config.init_poly_num, 2))
+        init = {'i_it_4py': i_it_4py, 'c_it_4py': i_it_4py.clone(), 'ind': ind}
+        init.update({'i_it_py': i_it_py, 'c_it_py': c_it_py, 'py_ind': ind})
+        return init
+
     box = output['detection'][..., :4]
     score = output['detection'][..., 4]
     init = prepare_testing_init(box, score)
@@ -221,9 +230,9 @@ def prepare_testing_evolve(ex):
 # 从CNN-map中提取数据，为蛇演化提供信息，这个很重要！！！
 # cnn_feature为 1,64,136,136.
 def get_gcn_feature(cnn_feature, img_poly, ind, h, w):  # h=w=136
-    img_poly = img_poly.clone()   # 避免修改原始数据
-    img_poly[..., 0] = img_poly[..., 0] / (w / 2.) - 1  #  大小放缩至 -1 到 1 之间
-    img_poly[..., 1] = img_poly[..., 1] / (h / 2.) - 1
+    norm_x = img_poly[..., 0] / (w / 2.) - 1  #  大小放缩至 -1 到 1 之间
+    norm_y = img_poly[..., 1] / (h / 2.) - 1
+    img_poly = torch.stack([norm_x, norm_y], dim=-1)
 
     batch_size = cnn_feature.size(0)  # batch_size = 1
     gcn_feature = torch.zeros([img_poly.size(0), cnn_feature.size(1), img_poly.size(1)]).to(img_poly.device)
@@ -325,9 +334,10 @@ def img_poly_to_can_poly(img_poly):
         return torch.zeros_like(img_poly)
     x_min = torch.min(img_poly[..., 0], dim=-1)[0]
     y_min = torch.min(img_poly[..., 1], dim=-1)[0]
-    can_poly = img_poly.clone()
-    can_poly[..., 0] = can_poly[..., 0] - x_min[..., None]
-    can_poly[..., 1] = can_poly[..., 1] - y_min[..., None]
+    can_poly = torch.stack([
+        img_poly[..., 0] - x_min[..., None],
+        img_poly[..., 1] - y_min[..., None],
+    ], dim=-1)
     # x_max = torch.max(img_poly[..., 0], dim=-1)[0]
     # y_max = torch.max(img_poly[..., 1], dim=-1)[0]
     # h, w = y_max - y_min + 1, x_max - x_min + 1

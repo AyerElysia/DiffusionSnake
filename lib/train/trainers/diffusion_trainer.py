@@ -4,6 +4,7 @@ import torch.nn.functional as F
 import logging
 from lib.config import cfg
 from lib.networks.YOLOV8.utils.loss import v8DetectionLoss
+from lib.utils import net_utils
 
 logger = logging.getLogger(__name__)
 
@@ -16,13 +17,21 @@ class DiffusionPretrainNetworkWrapper(nn.Module):
     def __init__(self, net: nn.Module):
         super().__init__()
         self.net = net
+        self.detector_backend = str(getattr(cfg, 'detector_backend', 'yolo') or 'yolo').strip().lower()
 
-        # YOLO 损失
-        try:
-            self.det_crit = self.net.yolo.init_criterion()
-        except (AttributeError, RuntimeError) as e:
-            logger.warning(f"Failed to init YOLO criterion, using default: {e}")
-            self.det_crit = v8DetectionLoss(self.net.yolo)
+        self.det_crit = None
+        self.ct_crit = None
+        self.wh_crit = None
+        self.heatmap_wh_weight = float(getattr(cfg, 'heatmap_wh_weight', 0.1))
+        if self.detector_backend == 'yolo':
+            try:
+                self.det_crit = self.net.yolo.init_criterion()
+            except (AttributeError, RuntimeError) as e:
+                logger.warning(f"Failed to init YOLO criterion, using default: {e}")
+                self.det_crit = v8DetectionLoss(self.net.yolo)
+        else:
+            self.ct_crit = net_utils.FocalLoss()
+            self.wh_crit = net_utils.IndL1Loss1d('smooth_l1')
 
         # 先验损失
         self.L_crit = F.mse_loss
@@ -38,7 +47,7 @@ class DiffusionPretrainNetworkWrapper(nn.Module):
         self.freeze_snake = bool(getattr(cfg, 'freeze_snake', False))
         self.freeze_yolo = bool(getattr(cfg, 'freeze_yolo', False))
 
-        if self.freeze_yolo:
+        if self.freeze_yolo and getattr(self.net, 'yolo', None) is not None:
             for p in self.net.yolo.parameters():
                 p.requires_grad = False
             self.net.yolo.eval()
@@ -83,10 +92,16 @@ class DiffusionPretrainNetworkWrapper(nn.Module):
         image_stats = {}
 
         # 1) YOLO 检测损失
-        if (not self.freeze_yolo) and ('yolo_preds' in output) and (self.det_crit is not None):
+        det_weight = float(self.loss_scales.get('det', 1.0))
+        if (
+            det_weight > 0.0
+            and (not self.freeze_yolo)
+            and self.detector_backend == 'yolo'
+            and ('yolo_preds' in output)
+            and (self.det_crit is not None)
+        ):
             det_loss, det_items = self.det_crit(output['yolo_preds'], batch)
             box_l, cls_l, dfl_l = det_items[0], det_items[1], det_items[2]
-            det_weight = float(self.loss_scales.get('det', 1.0))
             loss = loss + det_weight * det_loss
             bs = int(batch.get('inp').shape[0]) if isinstance(batch, dict) and isinstance(batch.get('inp', None), torch.Tensor) else 1
             bs = max(bs, 1)
@@ -97,6 +112,28 @@ class DiffusionPretrainNetworkWrapper(nn.Module):
                 'det_cls': cls_l,
                 'det_dfl': dfl_l,
                 'det_loss_scaled': det_weight * det_loss_log,
+            })
+        elif (
+            det_weight > 0.0
+            and (not self.freeze_yolo)
+            and self.ct_crit is not None
+            and ('ct_hm' in output)
+            and ('wh' in output)
+        ):
+            ct_target = batch['ct_hm'].to(output['ct_hm'].device)
+            wh_target = batch['wh'].to(output['wh'].device)
+            ct_ind = batch['ct_ind'].to(output['wh'].device)
+            ct_mask = batch['ct_01'].to(output['wh'].device)
+
+            ct_loss = self.ct_crit(output['ct_hm'], ct_target)
+            wh_loss = self.wh_crit(output['wh'], wh_target, ct_ind, ct_mask)
+            det_loss = ct_loss + self.heatmap_wh_weight * wh_loss
+            loss = loss + det_weight * det_loss
+            scalar_stats.update({
+                'det_loss': det_loss,
+                'det_ct': ct_loss,
+                'det_wh': wh_loss,
+                'det_loss_scaled': det_weight * det_loss,
             })
         else:
             scalar_stats.update({'det_loss': torch.tensor(0.0, device=base_device)})

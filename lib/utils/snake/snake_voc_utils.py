@@ -1,11 +1,14 @@
-import numpy as np
-from lib.utils import data_utils
+import math
+import os
+
 import cv2
-from lib.utils.snake import snake_config
+import numpy as np
+from scipy import ndimage
 from shapely.geometry import Polygon, MultiPolygon
 from shapely.ops import polygonize
-from scipy import ndimage
-import math
+
+from lib.utils import data_utils
+from lib.utils.snake import snake_config
 
 
 # Globals ----------------------------------------------------------------------
@@ -53,6 +56,11 @@ def xywh_to_xyxy(boxes):
 
 
 def augment(img, split, _data_rng, _eig_val, _eig_vec, mean, std, polys=None):
+    disable_aug = os.environ.get('SNAKE_DISABLE_AUG', '').strip().lower() in ('1', 'true', 'yes', 'on')
+    disable_lr_flip = os.environ.get('SNAKE_DISABLE_LR_FLIP', '').strip().lower() in ('1', 'true', 'yes', 'on')
+    if disable_aug and split == 'train':
+        split = 'val'
+
     # resize input
     height, width = img.shape[0], img.shape[1]
     center = np.array([img.shape[1] / 2., img.shape[0] / 2.], dtype=np.float32)
@@ -71,7 +79,7 @@ def augment(img, split, _data_rng, _eig_val, _eig_vec, mean, std, polys=None):
         center[1] = np.random.randint(low=max(y - h_border, 0), high=min(y + h_border, height - 1))
 
         # flip augmentation
-        if np.random.random() < 0.5:
+        if (not disable_lr_flip) and np.random.random() < 0.5:
             flipped = True
             img = img[:, ::-1, :]
             center[0] = width - center[0] - 1

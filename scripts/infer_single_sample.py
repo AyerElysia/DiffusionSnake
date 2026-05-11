@@ -25,6 +25,14 @@ if not os.environ.get('CFG_FILE'):
     os.environ['CFG_FILE'] = _DEFAULT_CFG
 
 from lib.config import cfg, args
+
+# Allow EVAL_GPU env var to override the GPU set by config (same as eval_v37_full_iou.py)
+_eval_gpu = os.environ.get('EVAL_GPU', '').strip()
+if _eval_gpu:
+    cfg.gpus = [int(_eval_gpu)]
+    os.environ['CUDA_VISIBLE_DEVICES'] = _eval_gpu
+    print(f'[*] Override infer GPU -> {_eval_gpu}')
+
 from lib.networks import make_network
 from lib.train.trainers import make_trainer
 from lib.datasets.make_dataset import make_dataset
@@ -175,6 +183,13 @@ def infer_one(model, device, sample, out_path):
         if p2 is None:
             raise RuntimeError('YOLO feature P2 not found')
         cnn_feature = core.cnn_proj(p2)
+        if getattr(core, 'use_p3_features', False) and hasattr(core, 'cnn_proj_p3'):
+            if isinstance(feat_list, (list, tuple)) and len(feat_list) > 1:
+                p3 = feat_list[1]
+                p3_up = torch.nn.functional.interpolate(
+                    p3, size=p2.shape[-2:], mode='bilinear', align_corners=False
+                )
+                cnn_feature = cnn_feature + core.cnn_proj_p3(p3_up)
 
         if 'ct_01' in batch:
             mask = batch['ct_01'][0].bool()

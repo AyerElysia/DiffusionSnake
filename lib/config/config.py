@@ -42,6 +42,11 @@ cfg.resume_path = ''
 cfg.use_diffusion_evolution = False
 cfg.use_diffusion_trainer = False
 cfg.freeze_snake = False
+cfg.detector_backend = 'yolo'
+cfg.heatmap_backbone = 'resnet18'
+cfg.heatmap_pretrained = False
+cfg.heatmap_wh_weight = 0.1
+cfg.heatmap_class_offset = 0
 cfg.diffusion_timesteps = 1000
 cfg.use_ddim_inference = True
 cfg.diffusion_loss_weight = 1.0
@@ -53,6 +58,9 @@ cfg.use_dit_v3_1 = False
 cfg.use_dit_v3_2 = False
 cfg.use_dit_v3_3 = False
 cfg.use_dit_v3_4 = False
+cfg.use_dit_v4 = False
+cfg.use_dit_v4_1 = False
+cfg.use_dit_v4_2 = False
 cfg.use_dit_v3_6 = False
 cfg.use_dit_v3_7 = False
 cfg.use_dit_v3_8 = False
@@ -63,6 +71,29 @@ cfg.flow_train_noise_scale = 1.0
 cfg.dit_num_layers = 6
 cfg.dit_num_heads = 8
 cfg.dit_state_dim = 256
+
+# GRPO / reward post-training defaults
+cfg.use_grpo = False
+cfg.use_grpo_kl = False
+cfg.grpo_first_contour_only = False
+cfg.grpo_train_steps = 1000
+cfg.grpo_seed = 20260504
+cfg.grpo_steps = 20
+cfg.grpo_k = 4
+cfg.grpo_window_size = 0
+cfg.grpo_window_range = [0, 19]
+cfg.grpo_clip_range = 0.2
+cfg.grpo_adv_clip_max = 5.0
+cfg.grpo_loss_weight = 1.0
+cfg.grpo_action_std = 0.75
+cfg.grpo_normalize_adv = True
+cfg.grpo_reward_image_scale = False
+cfg.grpo_reward_delta = False
+cfg.grpo_adv_center = 'group'
+cfg.grpo_pure_rl_loss = False
+cfg.reward_w_region = 1.0
+cfg.reward_w_dice = 0.0
+cfg.reward_w_iou = 0.0
 
 # Contour point configuration (default 128, can be overridden per version)
 cfg.poly_num = 128
@@ -89,6 +120,40 @@ cfg.iterative_ode_steps = 0
 cfg.v3_4_use_p3_features = False
 cfg.v3_4_use_detail_context = False
 cfg.v3_4_detail_context_mode = 'normal'
+cfg.v4_use_p3_features = False
+cfg.v4_use_detail_context = False
+cfg.v4_detail_context_mode = 'normal_tangent'
+cfg.v4_use_per_point_delta = True
+cfg.v4_per_point_delta_scale = 0.25
+cfg.v4_per_point_delta_reg_weight = 0.0
+cfg.v4_1_use_p3_features = False
+cfg.v4_1_use_detail_context = False
+cfg.v4_1_detail_context_mode = 'normal'
+cfg.v4_1_use_per_point_delta = True
+cfg.v4_1_per_point_delta_scale = 0.10
+cfg.v4_1_per_point_delta_reg_weight = 0.0
+cfg.v4_1_use_curvature_reweight = False
+cfg.v4_1_curvature_loss_weight = 1.5
+cfg.v4_1_curvature_reweight_power = 1.0
+cfg.v4_1_small_disp_prob = 0.0
+cfg.v4_1_small_disp_min_frac = 0.80
+cfg.v4_1_small_disp_max_frac = 0.95
+cfg.v4_2_use_p3_features = False
+cfg.v4_2_use_detail_context = False
+cfg.v4_2_detail_context_mode = 'normal_band'
+cfg.v4_2_use_per_point_delta = True
+cfg.v4_2_per_point_delta_scale = 0.10
+cfg.v4_2_per_point_delta_reg_weight = 0.0
+cfg.v4_2_use_curvature_conditioning = True
+cfg.v4_2_curvature_embed_scale = 0.10
+cfg.v4_2_use_delta_gate = True
+cfg.v4_2_delta_gate_bias = -2.0
+cfg.v4_2_use_curvature_reweight = True
+cfg.v4_2_curvature_loss_weight = 1.5
+cfg.v4_2_curvature_reweight_power = 1.0
+cfg.v4_2_small_disp_prob = 0.10
+cfg.v4_2_small_disp_min_frac = 0.80
+cfg.v4_2_small_disp_max_frac = 0.95
 
 # V3.5: Fourier low-pass post-processing
 cfg.fourier_smooth_k = 0  # 0=disabled, >0=keep lowest K freq components per side
@@ -120,6 +185,36 @@ cfg.yolo_train_scope = 'head'
 cfg.disable_lr_flip = False
 cfg.dataloader_persistent_workers = True
 cfg.dataloader_prefetch_factor = 4
+
+# V5.0: optional SAM mask-based contour initialization.
+cfg.contour_init_method = 'octagon'
+cfg.sam_weight = ''
+cfg.sam_allow_download = False
+cfg.sam_imgsz = 1024
+cfg.sam_prompt_source = 'yolo_box'
+cfg.sam_train_prompt_source = 'gt_box'
+cfg.sam_train_match_iou_min = 0.10
+cfg.sam_train_det_score_thresh = 1e-4
+cfg.sam_det_score_thresh = 1e-4
+cfg.sam_min_mask_area = 16
+cfg.sam_fallback = 'octagon'
+cfg.sam_use_in_train = True
+cfg.sam_backend = ''
+cfg.efficient_sam_weight = ''
+cfg.efficient_sam_encoder_dim = 192
+cfg.efficient_sam_encoder_heads = 3
+cfg.efficient_sam_bgr_to_rgb = True
+cfg.efficient_sam_mask_threshold = 0.0
+cfg.efficient_sam_multimask_select = 'area'
+cfg.samsnake_dla_pretrained = False
+cfg.samsnake_use_dcn = False
+cfg.samsnake_dla_last_level = 5
+cfg.v5_2_use_samsnake_refine = False
+cfg.samsnake_refine_stride = 4.0
+cfg.samsnake_refine_zero_init = True
+cfg.samsnake_refine_max_disp_frac = 0.0
+cfg.samsnake_refine_ignore = False
+cfg.fm_max_disp_frac = 0.0
 
 # demo
 cfg.demo_vis = '/mnt/date/zhangrch/EnergeSnake/zrc_visual/2301/'
@@ -218,6 +313,9 @@ def _infer_default_cfg(args):
         return env_cfg
     script = Path(sys.argv[0]).stem.lower()
     if "grpo_train" in script:
+        btcv_grpo_cfg = Path("configs/btcv_diffusion_dit_v3_4_fm_yolom_grpo_posttrain.yaml")
+        if btcv_grpo_cfg.exists():
+            return str(btcv_grpo_cfg)
         btcv_grpo_cfg = Path("configs/btcv_diffusion_dit_v3_1_fm_posttrain.yaml")
         if btcv_grpo_cfg.exists():
             return str(btcv_grpo_cfg)

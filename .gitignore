@@ -199,3 +199,4 @@ cython_debug/
 *.sh.bak
 clash/
 .gemini/
+SAMSnake/

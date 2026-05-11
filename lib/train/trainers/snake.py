@@ -120,11 +120,20 @@ class NetworkWrapper(nn.Module):
         super(NetworkWrapper, self).__init__()
 
         self.net = net
+        self.detector_backend = str(getattr(cfg, 'detector_backend', 'yolo') or 'yolo').strip().lower()
 
-        try:
-            self.det_crit = self.net.yolo.init_criterion()
-        except Exception:
-            self.det_crit = v8DetectionLoss(self.net.yolo)
+        self.det_crit = None
+        self.ct_crit = None
+        self.wh_crit = None
+        self.heatmap_wh_weight = float(getattr(cfg, 'heatmap_wh_weight', 0.1))
+        if self.detector_backend == 'yolo':
+            try:
+                self.det_crit = self.net.yolo.init_criterion()
+            except Exception:
+                self.det_crit = v8DetectionLoss(self.net.yolo)
+        else:
+            self.ct_crit = net_utils.FocalLoss()
+            self.wh_crit = net_utils.IndL1Loss1d('smooth_l1')
         self.ex_crit = torch.nn.functional.smooth_l1_loss
         self.py_crit = torch.nn.functional.smooth_l1_loss
         self.L_crit = F.mse_loss    # CMAM loss
@@ -153,11 +162,27 @@ class NetworkWrapper(nn.Module):
         base_device = output['inp'].device if isinstance(output.get('inp', None), torch.Tensor) else output['detection'].device
         loss = torch.zeros(1, device=base_device).squeeze()
 
-        if self.det_crit is not None and 'yolo_preds' in output:
+        if self.detector_backend == 'yolo' and self.det_crit is not None and 'yolo_preds' in output:
             det_loss, det_items = self.det_crit(output['yolo_preds'], batch)
             box_l, cls_l, dfl_l = det_items[0], det_items[1], det_items[2]
             scalar_stats.update({'det_box': box_l, 'det_cls': cls_l, 'det_dfl': dfl_l})
             scalar_stats.update({'det_loss': det_loss})
+            if det_loss.device != loss.device:
+                det_loss = det_loss.to(loss.device)
+            det_weight = float(self.loss_scales.get('det', 1.0))
+            det_loss_scaled = det_weight * det_loss
+            scalar_stats.update({'det_loss_scaled': det_loss_scaled})
+            loss += det_loss_scaled
+        elif self.ct_crit is not None and 'ct_hm' in output and 'wh' in output:
+            ct_target = batch['ct_hm'].to(output['ct_hm'].device)
+            wh_target = batch['wh'].to(output['wh'].device)
+            ct_ind = batch['ct_ind'].to(output['wh'].device)
+            ct_mask = batch['ct_01'].to(output['wh'].device)
+
+            ct_loss = self.ct_crit(output['ct_hm'], ct_target)
+            wh_loss = self.wh_crit(output['wh'], wh_target, ct_ind, ct_mask)
+            det_loss = ct_loss + self.heatmap_wh_weight * wh_loss
+            scalar_stats.update({'det_ct': ct_loss, 'det_wh': wh_loss, 'det_loss': det_loss})
             if det_loss.device != loss.device:
                 det_loss = det_loss.to(loss.device)
             det_weight = float(self.loss_scales.get('det', 1.0))

@@ -1,9 +1,6 @@
 import numpy as np
 import cv2
 import torch
-from typing import Tuple
-
-
 def _poly_to_mask_np(poly: np.ndarray, H: int, W: int) -> np.ndarray:
     """将多边形轮廓转换为二值掩码。"""
     m = np.zeros((H, W), dtype=np.uint8)
@@ -39,30 +36,62 @@ def _calc_mboundf(pred_mask: np.ndarray, gt_mask: np.ndarray) -> float:
     return float(np.mean(vals)) if len(vals) > 0 else 0.0
 
 
+def _calc_iou(pred_mask: np.ndarray, gt_mask: np.ndarray) -> float:
+    inter = np.logical_and(pred_mask, gt_mask).sum()
+    union = np.logical_or(pred_mask, gt_mask).sum()
+    return float(inter / union) if union > 0 else 0.0
+
+
+def _calc_dice(pred_mask: np.ndarray, gt_mask: np.ndarray) -> float:
+    inter = np.logical_and(pred_mask, gt_mask).sum()
+    denom = pred_mask.sum() + gt_mask.sum()
+    return float(2.0 * inter / denom) if denom > 0 else 0.0
+
+
+def compute_region_score(poly_py: torch.Tensor,
+                         gt_py: torch.Tensor,
+                         H: int,
+                         W: int,
+                         w_boundary: float = 1.0,
+                         w_dice: float = 0.0,
+                         w_iou: float = 0.0,
+                         coord_scale: float = 1.0) -> torch.Tensor:
+    """Compute absolute contour quality from boundary F-score, Dice, and optional IoU."""
+    device = poly_py.device
+    pred_np = poly_py.detach().float().cpu().numpy() * float(coord_scale)
+    gt_np = gt_py.detach().float().cpu().numpy() * float(coord_scale)
+
+    scores = []
+    for i in range(pred_np.shape[0]):
+        m_pred = _poly_to_mask_np(pred_np[i], H, W)
+        m_gt = _poly_to_mask_np(gt_np[i], H, W)
+        score = float(w_boundary) * _calc_mboundf(m_pred, m_gt)
+        if w_dice != 0:
+            score += float(w_dice) * _calc_dice(m_pred, m_gt)
+        if w_iou != 0:
+            score += float(w_iou) * _calc_iou(m_pred, m_gt)
+        scores.append(score)
+
+    return torch.tensor(scores, device=device, dtype=torch.float32)
+
+
 def compute_region_reward(i_it_py: torch.Tensor,
                           disp: torch.Tensor,
                           gt_py: torch.Tensor,
                           H: int,
                           W: int,
-                          w1: float = 1.0) -> torch.Tensor:
-    """
-    使用 mBoundF（边界F-score）改写的奖励：
-    reward = -w1 * |1 - mBoundF(end, GT)|
-    """
-    device = i_it_py.device
-
-    end_np = (i_it_py + disp).detach().float().cpu().numpy()
-    gt_np = gt_py.detach().float().cpu().numpy()
-
-    N = end_np.shape[0]
-    end_scores = []
-
-    for i in range(N):
-        m_end = _poly_to_mask_np(end_np[i], H, W)
-        m_gt = _poly_to_mask_np(gt_np[i], H, W)
-
-        end_scores.append(_calc_mboundf(m_end, m_gt))
-
-    end_scores_tensor = torch.tensor(end_scores, device=device, dtype=torch.float32)
-
-    return w1 * end_scores_tensor
+                          w1: float = 1.0,
+                          w_dice: float = 0.0,
+                          w_iou: float = 0.0,
+                          coord_scale: float = 1.0) -> torch.Tensor:
+    """Compute contour reward from boundary quality, Dice, and optional mask IoU."""
+    return compute_region_score(
+        i_it_py + disp,
+        gt_py,
+        H=H,
+        W=W,
+        w_boundary=w1,
+        w_dice=w_dice,
+        w_iou=w_iou,
+        coord_scale=coord_scale,
+    )

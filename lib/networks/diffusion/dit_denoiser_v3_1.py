@@ -104,6 +104,7 @@ class DiTDenoiserV3_1(nn.Module):
         polys=None,
         py_ind: torch.Tensor = None,
         point_mask: torch.Tensor = None,  # V3.10: add point mask
+        **kwargs,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """
         Forward pass.

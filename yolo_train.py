@@ -4,6 +4,7 @@ import json
 import copy
 
 import torch
+import torch.utils.data
 
 try:
     import torch.distributed as dist
@@ -24,6 +25,9 @@ from lib.config import cfg
 from lib.networks import make_network
 from lib.train.trainers import make_trainer
 from lib.datasets.make_dataset import make_data_loader
+from lib.datasets.make_dataset import make_dataset
+from lib.datasets.transforms import make_transforms
+from lib.datasets.collate_batch import make_collator
 from lib.datasets.dataset_catalog import DatasetCatalog
 from lib.networks.YOLOV8.utils.loss import v8DetectionLoss
 
@@ -71,12 +75,21 @@ def _move_batch_to_device(batch: dict, device: torch.device) -> dict:
     return batch
 
 
-def _set_yolo_head_only_trainable(yolo_model: torch.nn.Module):
-    # freeze all
+def _set_yolo_trainable(yolo_model: torch.nn.Module, scope: str):
+    scope = str(scope).strip().lower()
+
     for p in yolo_model.parameters():
         p.requires_grad = False
 
-    # unfreeze Detect head only
+    if scope == 'full':
+        for p in yolo_model.parameters():
+            p.requires_grad = True
+        yolo_model.train()
+        return
+
+    if scope != 'head':
+        raise ValueError(f"Unsupported YOLO_TRAIN_SCOPE={scope!r}, expected 'head' or 'full'")
+
     try:
         detect = yolo_model.model[-1]
     except Exception:
@@ -87,7 +100,6 @@ def _set_yolo_head_only_trainable(yolo_model: torch.nn.Module):
     for p in detect.parameters():
         p.requires_grad = True
 
-    # Keep backbone/neck in eval to avoid BN running-stats update
     try:
         for m in yolo_model.model[:-1]:
             m.eval()
@@ -110,6 +122,94 @@ def _build_optimizer(params, lr: float):
     return torch.optim.AdamW(params, lr=lr, weight_decay=wd)
 
 
+def _apply_cfg_overrides():
+    disable_aug = os.environ.get('YOLO_DISABLE_AUG', '').strip()
+    if disable_aug:
+        os.environ['SNAKE_DISABLE_AUG'] = disable_aug
+
+    load_yolo_pretrained = os.environ.get('YOLO_LOAD_PRETRAINED', '').strip()
+    if load_yolo_pretrained:
+        cfg.load_yolo_pretrained = load_yolo_pretrained.lower() in ('1', 'true', 'yes', 'on')
+
+    yolo_num_classes = os.environ.get('YOLO_NUM_CLASSES', '').strip()
+    if yolo_num_classes:
+        cfg.yolo_num_classes = int(yolo_num_classes)
+
+    yolo_pretrained = os.environ.get('YOLO_PRETRAINED_WEIGHTS', '').strip()
+    if yolo_pretrained:
+        cfg.yolo_pretrained = yolo_pretrained
+
+    train_dataset = os.environ.get('YOLO_TRAIN_DATASET', '').strip()
+    if train_dataset:
+        cfg.train.dataset = train_dataset
+
+    train_data_path = os.environ.get('YOLO_TRAIN_DATA_PATH', '').strip()
+    if train_data_path:
+        cfg.train.data_path = train_data_path
+
+    test_dataset = os.environ.get('YOLO_VAL_DATASET', '').strip()
+    if test_dataset:
+        cfg.test.dataset = test_dataset
+
+    test_img_path = os.environ.get('YOLO_VAL_DATA_PATH', '').strip()
+    if test_img_path:
+        cfg.test.img_path = test_img_path
+
+    epochs = os.environ.get('YOLO_MAX_EPOCHS', '').strip()
+    if epochs:
+        cfg.train.epoch = int(epochs)
+
+    batch_size = os.environ.get('YOLO_BATCH_SIZE', '').strip()
+    if batch_size:
+        cfg.train.batch_size = int(batch_size)
+
+    lr = os.environ.get('YOLO_LR', '').strip()
+    if lr:
+        cfg.train.lr = float(lr)
+
+    num_workers = os.environ.get('YOLO_NUM_WORKERS', '').strip()
+    if num_workers:
+        cfg.train.num_workers = int(num_workers)
+
+    disable_lr_flip = os.environ.get('YOLO_DISABLE_LR_FLIP', '').strip()
+    if disable_lr_flip:
+        os.environ['SNAKE_DISABLE_LR_FLIP'] = disable_lr_flip
+    elif bool(getattr(cfg, 'disable_lr_flip', False)):
+        os.environ['SNAKE_DISABLE_LR_FLIP'] = '1'
+
+
+def _build_train_loader():
+    transforms = make_transforms(cfg, is_train=True)
+    dataset = make_dataset(cfg, cfg.train.dataset, transforms, is_train=True)
+
+    subset_indices = None
+    single_sample_index = os.environ.get('YOLO_SINGLE_SAMPLE_INDEX', '').strip()
+    if single_sample_index:
+        idx = int(single_sample_index)
+        if idx < 0 or idx >= len(dataset):
+            raise IndexError(f'YOLO_SINGLE_SAMPLE_INDEX={idx} out of range for dataset of size {len(dataset)}')
+        subset_indices = [idx]
+
+    max_samples = os.environ.get('YOLO_MAX_SAMPLES', '').strip()
+    if subset_indices is None and max_samples:
+        keep = min(int(max_samples), len(dataset))
+        subset_indices = list(range(keep))
+
+    if subset_indices is not None:
+        dataset = torch.utils.data.Subset(dataset, subset_indices)
+
+    sampler = torch.utils.data.RandomSampler(dataset)
+    batch_sampler = torch.utils.data.BatchSampler(sampler, int(cfg.train.batch_size), False)
+    data_loader = torch.utils.data.DataLoader(
+        dataset,
+        batch_sampler=batch_sampler,
+        num_workers=int(cfg.train.num_workers),
+        collate_fn=make_collator(cfg),
+        pin_memory=True,
+    )
+    return data_loader, dataset, subset_indices
+
+
 def _save_checkpoint(ckpt_dir: str, trainer, optimizer, step: int, epoch: int = None):
     model_to_save = trainer.network.module if hasattr(trainer.network, 'module') else trainer.network
     ckpt = {
@@ -129,8 +229,9 @@ def _save_checkpoint(ckpt_dir: str, trainer, optimizer, step: int, epoch: int = 
 def main():
     is_main = _is_main_process()
 
-    # force COCO train
-    cfg.train.dataset = 'CocoTrain'
+    _apply_cfg_overrides()
+
+    train_scope = os.environ.get('YOLO_TRAIN_SCOPE', str(getattr(cfg, 'yolo_train_scope', 'head'))).strip().lower()
 
     out_dir = os.environ.get('YOLO_HEAD_OUT_DIR', os.path.join(_THIS_DIR, 'data', 'outputs', 'yolo_head_only'))
     ckpt_dir = os.path.join(out_dir, 'checkpoints')
@@ -144,6 +245,14 @@ def main():
             if cfg.train.dataset in DatasetCatalog.dataset_attrs:
                 a = DatasetCatalog.get(cfg.train.dataset)
                 print(f"[train_yolo_head_only] train.data_root={a.get('data_root')} ann_file={a.get('ann_file')}")
+            print(f"[train_yolo_head_only] train.data_path={getattr(cfg.train, 'data_path', '')}")
+            print(f"[train_yolo_head_only] val.img_path={getattr(cfg.test, 'img_path', '')}")
+            print(f"[train_yolo_head_only] train_scope={train_scope}")
+            print(f"[train_yolo_head_only] disable_aug={os.environ.get('SNAKE_DISABLE_AUG', '0')}")
+            print(f"[train_yolo_head_only] disable_lr_flip={os.environ.get('SNAKE_DISABLE_LR_FLIP', '0')}")
+            print(f"[train_yolo_head_only] load_yolo_pretrained={getattr(cfg, 'load_yolo_pretrained', False)}")
+            print(f"[train_yolo_head_only] yolo_pretrained={getattr(cfg, 'yolo_pretrained', '')}")
+            print(f"[train_yolo_head_only] yolo_num_classes={getattr(cfg, 'yolo_num_classes', 0)}")
             print(f"[train_yolo_head_only] out_dir={out_dir}")
         except Exception:
             pass
@@ -159,8 +268,7 @@ def main():
 
     device = next(wrapper.parameters()).device
 
-    # YOLO head-only
-    _set_yolo_head_only_trainable(net.yolo)
+    _set_yolo_trainable(net.yolo, train_scope)
 
     # criterion
     try:
@@ -168,11 +276,9 @@ def main():
     except Exception:
         det_crit = v8DetectionLoss(net.yolo)
 
-    # params = detect head only
-    detect = net.yolo.model[-1]
-    trainable_params = [p for p in detect.parameters() if p.requires_grad]
+    trainable_params = [p for p in net.yolo.parameters() if p.requires_grad]
     if len(trainable_params) == 0:
-        raise RuntimeError('No trainable params found in YOLO Detect head')
+        raise RuntimeError('No trainable params found in YOLO model')
 
     lr = float(getattr(cfg.train, 'lr', 1e-4))
     optimizer = _build_optimizer(trainable_params, lr=lr)
@@ -189,6 +295,8 @@ def main():
             except Exception:
                 resume_checkpoint = None
 
+    weights_only_resume = bool(int(os.environ.get('YOLO_WEIGHTS_ONLY_RESUME', '0')))
+
     if isinstance(resume_checkpoint, dict):
         state_dict = resume_checkpoint.get('state_dict')
         if state_dict is None:
@@ -200,15 +308,16 @@ def main():
             model_to_load.load_state_dict(state_dict, strict=False)
         except Exception:
             pass
-        if 'optimizer' in resume_checkpoint:
+        if (not weights_only_resume) and 'optimizer' in resume_checkpoint:
             try:
                 optimizer.load_state_dict(resume_checkpoint['optimizer'])
             except Exception:
                 pass
-        try:
-            resume_step = int(resume_checkpoint.get('step', 0))
-        except Exception:
-            resume_step = 0
+        if not weights_only_resume:
+            try:
+                resume_step = int(resume_checkpoint.get('step', 0))
+            except Exception:
+                resume_step = 0
 
     # wandb (separate by default)
     wandb_run = None
@@ -230,7 +339,7 @@ def main():
 
     jsonl_logger = JsonlLogger(log_path) if is_main else None
 
-    data_loader = make_data_loader(cfg, is_train=True, is_distributed=False)
+    data_loader, train_dataset, subset_indices = _build_train_loader()
     steps_per_epoch = len(data_loader)
     num_epochs = int(getattr(cfg.train, 'epoch', 1))
     if num_epochs <= 0:
@@ -245,27 +354,44 @@ def main():
 
     log_interval = int(os.environ.get('YOLO_HEAD_LOG_INTERVAL', '20'))
     save_interval = int(os.environ.get('YOLO_HEAD_SAVE_INTERVAL', '500'))
+    max_steps = int(os.environ.get('YOLO_MAX_STEPS', '0') or '0')
 
-    wrapper.train()
-    net.yolo.train()
-    # Head-only: keep everything except Detect head in eval mode
-    try:
-        wrapper.eval()
-    except Exception:
-        pass
-    try:
-        net.eval()
-    except Exception:
-        pass
-    try:
-        for m in net.yolo.model[:-1]:
-            m.eval()
-        net.yolo.model[-1].train()
-    except Exception:
+    if train_scope == 'head':
+        wrapper.train()
         net.yolo.train()
+        try:
+            wrapper.eval()
+        except Exception:
+            pass
+        try:
+            net.eval()
+        except Exception:
+            pass
+        try:
+            for m in net.yolo.model[:-1]:
+                m.eval()
+            net.yolo.model[-1].train()
+        except Exception:
+            net.yolo.train()
+    else:
+        wrapper.train()
+        net.train()
+        net.yolo.train()
+
+    if is_main:
+        try:
+            subset_desc = 'full'
+            if subset_indices is not None:
+                subset_desc = f'{len(subset_indices)} sample(s)'
+            print(f"[train_yolo_head_only] train_samples={len(train_dataset)} ({subset_desc})")
+            print(f"[train_yolo_head_only] steps_per_epoch={steps_per_epoch} epochs={num_epochs} max_steps={max_steps}")
+        except Exception:
+            pass
 
     for epoch in range(start_epoch, num_epochs):
         for step_in_epoch, batch in enumerate(data_loader):
+            if max_steps > 0 and global_step >= max_steps:
+                break
             if epoch == start_epoch and step_in_epoch < start_step_in_epoch:
                 continue
 
@@ -329,6 +455,8 @@ def main():
 
         if is_main:
             _save_checkpoint(ckpt_dir, trainer, optimizer, step=global_step, epoch=epoch)
+        if max_steps > 0 and global_step >= max_steps:
+            break
 
     if jsonl_logger is not None:
         try:

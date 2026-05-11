@@ -1,3 +1,4 @@
+import math
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -20,9 +21,25 @@ class FlowMatchingEvolution(nn.Module):
     def _detail_feature_multiplier(mode: str) -> int:
         if mode == 'normal':
             return 3
+        if mode == 'normal_band':
+            return 5
         if mode == 'normal_tangent':
             return 6
-        raise ValueError(f"Unsupported v3_7_detail_context_mode: {mode}")
+        raise ValueError(f"Unsupported detail_context_mode: {mode}")
+
+    @staticmethod
+    def _resolve_detail_context_mode(global_cfg) -> str:
+        if bool(getattr(global_cfg, 'v4_2_use_detail_context', False)):
+            return str(getattr(global_cfg, 'v4_2_detail_context_mode', 'normal_band')).strip().lower()
+        if bool(getattr(global_cfg, 'v4_1_use_detail_context', False)):
+            return str(getattr(global_cfg, 'v4_1_detail_context_mode', 'normal')).strip().lower()
+        if bool(getattr(global_cfg, 'v4_use_detail_context', False)):
+            return str(getattr(global_cfg, 'v4_detail_context_mode', 'normal')).strip().lower()
+        if bool(getattr(global_cfg, 'v3_4_use_detail_context', False)):
+            return str(getattr(global_cfg, 'v3_4_detail_context_mode', 'normal')).strip().lower()
+        if bool(getattr(global_cfg, 'v3_7_use_detail_context', False)):
+            return str(getattr(global_cfg, 'v3_7_detail_context_mode', 'normal')).strip().lower()
+        return 'normal'
 
     def __init__(
         self,
@@ -44,6 +61,9 @@ class FlowMatchingEvolution(nn.Module):
         self.use_iterative_refinement = bool(
             getattr(global_cfg, 'use_iterative_refinement', False)
             or getattr(global_cfg, 'use_dit_v3_4', False)
+            or getattr(global_cfg, 'use_dit_v4', False)
+            or getattr(global_cfg, 'use_dit_v4_1', False)
+            or getattr(global_cfg, 'use_dit_v4_2', False)
         )
         self.use_fourier_smooth = int(getattr(global_cfg, 'fourier_smooth_k', 0))
 
@@ -103,17 +123,136 @@ class FlowMatchingEvolution(nn.Module):
                 global_context_mode=_global_ctx_mode,
                 global_num_queries=_global_queries,
             )
+        elif getattr(global_cfg, 'use_dit_v3_1', False):
+            from .dit_denoiser_v3_1 import DiTDenoiserV3_1
+            print(f"[FlowMatchingEvolution] Using DiT Flow Network V3.1 "
+                  f"(Patchify + Self->Cross, ODE steps={ode_steps})")
+            self.denoiser = DiTDenoiserV3_1(
+                state_dim=dit_state_dim,
+                feature_dim=feature_dim,
+                num_layers=dit_num_layers,
+                num_heads=dit_num_heads,
+                num_points=num_points,
+            )
+        elif getattr(global_cfg, 'use_dit_v4_2', False):
+            from .dit_denoiser_v4_2 import DiTFlowMatchingV4_2
+            _detail_ctx = bool(
+                getattr(global_cfg, 'v4_2_use_detail_context', False)
+                or getattr(global_cfg, 'v4_1_use_detail_context', False)
+                or getattr(global_cfg, 'v3_4_use_detail_context', False)
+            )
+            _detail_mode = self._resolve_detail_context_mode(global_cfg)
+            _detail_mult = self._detail_feature_multiplier(_detail_mode) if _detail_ctx else 1
+            _use_pp_delta = bool(getattr(global_cfg, 'v4_2_use_per_point_delta', True))
+            _pp_delta_scale = float(getattr(global_cfg, 'v4_2_per_point_delta_scale', 0.10))
+            _pp_delta_reg = float(getattr(global_cfg, 'v4_2_per_point_delta_reg_weight', 0.0))
+            _use_curv_cond = bool(getattr(global_cfg, 'v4_2_use_curvature_conditioning', True))
+            _curv_scale = float(getattr(global_cfg, 'v4_2_curvature_embed_scale', 0.10))
+            _use_delta_gate = bool(getattr(global_cfg, 'v4_2_use_delta_gate', True))
+            _delta_gate_bias = float(getattr(global_cfg, 'v4_2_delta_gate_bias', -2.0))
+            print(f"[FlowMatchingEvolution] Using DiT Flow Network V4.2 "
+                  f"(detail_ctx={_detail_ctx}, detail_mode={_detail_mode}, "
+                  f"per_point_delta={_use_pp_delta}, delta_scale={_pp_delta_scale}, "
+                  f"delta_reg={_pp_delta_reg}, curvature_cond={_use_curv_cond}, "
+                  f"delta_gate={_use_delta_gate}, ODE steps={ode_steps})")
+            self.denoiser = DiTFlowMatchingV4_2(
+                state_dim=dit_state_dim,
+                feature_dim=feature_dim,
+                num_layers=dit_num_layers,
+                num_heads=dit_num_heads,
+                num_points=num_points,
+                use_detail_context=_detail_ctx,
+                detail_feature_dim=feature_dim * _detail_mult,
+                use_per_point_delta=_use_pp_delta,
+                per_point_delta_scale=_pp_delta_scale,
+                per_point_delta_reg_weight=_pp_delta_reg,
+                use_curvature_conditioning=_use_curv_cond,
+                curvature_embed_scale=_curv_scale,
+                use_delta_gate=_use_delta_gate,
+                delta_gate_bias=_delta_gate_bias,
+            )
+        elif getattr(global_cfg, 'use_dit_v4_1', False):
+            from .dit_denoiser_v4_1 import DiTFlowMatchingV4_1
+            _detail_ctx = bool(
+                getattr(global_cfg, 'v4_1_use_detail_context', False)
+                or getattr(global_cfg, 'v3_4_use_detail_context', False)
+            )
+            _detail_mode = self._resolve_detail_context_mode(global_cfg)
+            _detail_mult = self._detail_feature_multiplier(_detail_mode) if _detail_ctx else 1
+            _use_pp_delta = bool(getattr(global_cfg, 'v4_1_use_per_point_delta', True))
+            _pp_delta_scale = float(getattr(global_cfg, 'v4_1_per_point_delta_scale', 0.10))
+            _pp_delta_reg = float(getattr(global_cfg, 'v4_1_per_point_delta_reg_weight', 0.0))
+            print(f"[FlowMatchingEvolution] Using DiT Flow Network V4.1 "
+                  f"(V3.4 detail backbone, detail_ctx={_detail_ctx}, "
+                  f"detail_mode={_detail_mode}, per_point_delta={_use_pp_delta}, "
+                  f"delta_scale={_pp_delta_scale}, delta_reg={_pp_delta_reg}, "
+                  f"ODE steps={ode_steps})")
+            self.denoiser = DiTFlowMatchingV4_1(
+                state_dim=dit_state_dim,
+                feature_dim=feature_dim,
+                num_layers=dit_num_layers,
+                num_heads=dit_num_heads,
+                num_points=num_points,
+                use_detail_context=_detail_ctx,
+                detail_feature_dim=feature_dim * _detail_mult,
+                use_per_point_delta=_use_pp_delta,
+                per_point_delta_scale=_pp_delta_scale,
+                per_point_delta_reg_weight=_pp_delta_reg,
+            )
+        elif getattr(global_cfg, 'use_dit_v4', False):
+            from .dit_denoiser_v4 import DiTFlowMatchingV4
+            _detail_ctx = bool(
+                getattr(global_cfg, 'v4_use_detail_context', False)
+                or getattr(global_cfg, 'v3_4_use_detail_context', False)
+                or getattr(global_cfg, 'v3_7_use_detail_context', False)
+            )
+            _detail_mode = self._resolve_detail_context_mode(global_cfg)
+            _detail_mult = self._detail_feature_multiplier(_detail_mode) if _detail_ctx else 1
+            _use_pp_delta = bool(getattr(global_cfg, 'v4_use_per_point_delta', True))
+            _pp_delta_scale = float(getattr(global_cfg, 'v4_per_point_delta_scale', 0.25))
+            _pp_delta_reg = float(getattr(global_cfg, 'v4_per_point_delta_reg_weight', 0.0))
+            print(f"[FlowMatchingEvolution] Using DiT Flow Network V4.0 "
+                  f"(detail_ctx={_detail_ctx}, detail_mode={_detail_mode}, "
+                  f"per_point_delta={_use_pp_delta}, delta_scale={_pp_delta_scale}, "
+                  f"delta_reg={_pp_delta_reg}, ODE steps={ode_steps})")
+            self.denoiser = DiTFlowMatchingV4(
+                state_dim=dit_state_dim,
+                feature_dim=feature_dim,
+                num_layers=dit_num_layers,
+                num_heads=dit_num_heads,
+                num_points=num_points,
+                use_detail_context=_detail_ctx,
+                detail_feature_dim=feature_dim * _detail_mult,
+                use_per_point_delta=_use_pp_delta,
+                per_point_delta_scale=_pp_delta_scale,
+                per_point_delta_reg_weight=_pp_delta_reg,
+            )
         # V3.4: keep the original V3 backbone and iterative refinement, only swap to FM
         elif getattr(global_cfg, 'use_dit_v3_4', False):
             from .dit_denoiser_v3_4 import DiTFlowMatchingV3_4
+            _detail_ctx = bool(
+                getattr(global_cfg, 'v3_4_use_detail_context', False)
+                or getattr(global_cfg, 'v3_7_use_detail_context', False)
+            )
+            _detail_mode = str(
+                getattr(
+                    global_cfg,
+                    'v3_4_detail_context_mode',
+                    getattr(global_cfg, 'v3_7_detail_context_mode', 'normal'),
+                )
+            ).strip().lower()
+            _detail_mult = self._detail_feature_multiplier(_detail_mode) if _detail_ctx else 1
             print(f"[FlowMatchingEvolution] Using DiT Flow Network V3.4 "
-                  f"(V3 backbone + iterative refinement, ODE steps={ode_steps})")
+                  f"(V3 backbone + iterative refinement, detail_ctx={_detail_ctx}, "
+                  f"detail_mode={_detail_mode}, ODE steps={ode_steps})")
             self.denoiser = DiTFlowMatchingV3_4(
                 state_dim=dit_state_dim,
                 feature_dim=feature_dim,
                 num_layers=dit_num_layers,
                 num_heads=dit_num_heads,
                 num_points=num_points,
+                use_detail_context=_detail_ctx,
+                detail_feature_dim=feature_dim * _detail_mult,
             )
         # V3.6: V3 global query + iterative refinement + Flow Matching
         elif getattr(global_cfg, 'use_dit_v3_6', False):
@@ -165,11 +304,30 @@ class FlowMatchingEvolution(nn.Module):
         # V6o: endpoint consistency loss — weight on L_endpoint = (1-t)^2 * FM_loss
         self._endpoint_loss_weight = float(getattr(global_cfg, 'v3_7_endpoint_loss_weight', 0.0))
         # V3.7: curvature-aware point weighting for high-curvature detail
-        self._use_curvature_reweight = bool(getattr(global_cfg, 'v3_7_use_curvature_reweight', False))
-        self._curvature_loss_weight = float(getattr(global_cfg, 'v3_7_curvature_loss_weight', 1.0))
-        self._curvature_reweight_power = float(getattr(global_cfg, 'v3_7_curvature_reweight_power', 1.0))
-        self._use_detail_context = bool(getattr(global_cfg, 'v3_7_use_detail_context', False))
-        self._detail_context_mode = str(getattr(global_cfg, 'v3_7_detail_context_mode', 'normal')).strip().lower()
+        self._use_curvature_reweight = bool(
+            getattr(global_cfg, 'v4_2_use_curvature_reweight', False)
+            or
+            getattr(global_cfg, 'v4_1_use_curvature_reweight', False)
+            or getattr(global_cfg, 'v3_7_use_curvature_reweight', False)
+        )
+        if bool(getattr(global_cfg, 'v4_2_use_curvature_reweight', False)):
+            self._curvature_loss_weight = float(getattr(global_cfg, 'v4_2_curvature_loss_weight', 1.5))
+            self._curvature_reweight_power = float(getattr(global_cfg, 'v4_2_curvature_reweight_power', 1.0))
+        elif bool(getattr(global_cfg, 'v4_1_use_curvature_reweight', False)):
+            self._curvature_loss_weight = float(getattr(global_cfg, 'v4_1_curvature_loss_weight', 1.5))
+            self._curvature_reweight_power = float(getattr(global_cfg, 'v4_1_curvature_reweight_power', 1.0))
+        else:
+            self._curvature_loss_weight = float(getattr(global_cfg, 'v3_7_curvature_loss_weight', 1.0))
+            self._curvature_reweight_power = float(getattr(global_cfg, 'v3_7_curvature_reweight_power', 1.0))
+        self._use_detail_context = bool(
+            getattr(global_cfg, 'v4_2_use_detail_context', False)
+            or
+            getattr(global_cfg, 'v4_1_use_detail_context', False)
+            or getattr(global_cfg, 'v4_use_detail_context', False)
+            or getattr(global_cfg, 'v3_4_use_detail_context', False)
+            or getattr(global_cfg, 'v3_7_use_detail_context', False)
+        )
+        self._detail_context_mode = self._resolve_detail_context_mode(global_cfg)
         # V3.7.3: low-noise flow matching (default 1.0 = standard)
         self._flow_noise_scale = float(getattr(global_cfg, 'flow_noise_scale', 1.0))
         # Optional training-only noise scale (fallback to flow_noise_scale)
@@ -181,6 +339,17 @@ class FlowMatchingEvolution(nn.Module):
         self._infer_noise_scale = float(getattr(global_cfg, 'infer_noise_scale', -1.0))
         # V3.7.6: fix t=0 during training (pure direct regression)
         self._flow_fix_t0 = bool(getattr(global_cfg, 'flow_fix_t0', False))
+        if bool(getattr(global_cfg, 'use_dit_v4_2', False)):
+            self._small_disp_prob = float(getattr(global_cfg, 'v4_2_small_disp_prob', 0.0))
+            self._small_disp_min_frac = float(getattr(global_cfg, 'v4_2_small_disp_min_frac', 0.80))
+            self._small_disp_max_frac = float(getattr(global_cfg, 'v4_2_small_disp_max_frac', 0.95))
+        else:
+            self._small_disp_prob = float(getattr(global_cfg, 'v4_1_small_disp_prob', 0.0))
+            self._small_disp_min_frac = float(getattr(global_cfg, 'v4_1_small_disp_min_frac', 0.80))
+            self._small_disp_max_frac = float(getattr(global_cfg, 'v4_1_small_disp_max_frac', 0.95))
+        # V4.3: soft Chamfer loss — bidirectional soft nearest-neighbour on predicted endpoint contour
+        self._chamfer_loss_weight = float(getattr(global_cfg, 'v4_3_chamfer_loss_weight', 0.0))
+        self._chamfer_tau = float(getattr(global_cfg, 'v4_3_chamfer_tau', 0.05))
         # V3.7/V6b-style generalization knobs used by the standalone scripts.
         self._use_contour_norm = bool(getattr(global_cfg, 'v3_7_use_contour_norm', False))
         self._flow_zero_x0_prob = float(getattr(global_cfg, 'flow_zero_x0_prob', 0.0))
@@ -195,6 +364,7 @@ class FlowMatchingEvolution(nn.Module):
         # At training: 50% of steps do a "dry run" first, then condition on that result
         # At inference: always condition on previous ODE step's x1 prediction
         self._use_self_conditioning = bool(getattr(global_cfg, 'v3_7_use_self_conditioning', False))
+        self._max_disp_frac = float(getattr(global_cfg, 'fm_max_disp_frac', 0.0))
 
         # CMAM 先验参数保留 (以防外部调用)
         self.compute_L = True
@@ -267,6 +437,13 @@ class FlowMatchingEvolution(nn.Module):
             return disp_pred * contour_scale.to(disp_pred.device, disp_pred.dtype)
         return self.denormalize_disp(disp_pred)
 
+    def clamp_pred_disp(self, disp: torch.Tensor, init_poly: torch.Tensor) -> torch.Tensor:
+        if self._max_disp_frac <= 0 or disp.numel() == 0:
+            return disp
+        limit = self.compute_contour_scale(init_poly).to(disp.device, disp.dtype) * self._max_disp_frac
+        norm = disp.norm(dim=-1, keepdim=True).clamp_min(1e-6)
+        return disp * torch.clamp(limit / norm, max=1.0)
+
     def sample_train_t(self, n: int, device: torch.device, dtype: torch.dtype) -> torch.Tensor:
         if self._flow_fix_t0:
             return torch.zeros(n, 1, 1, device=device, dtype=dtype)
@@ -293,6 +470,22 @@ class FlowMatchingEvolution(nn.Module):
             ) < self._flow_zero_x0_prob
             x0 = torch.where(zero_mask, torch.zeros_like(x0), x0)
         return x0
+
+    def _compute_soft_chamfer(
+        self, pred_pts: torch.Tensor, gt_pts: torch.Tensor, tau: float = 0.05
+    ) -> torch.Tensor:
+        """Differentiable bidirectional soft Chamfer distance.
+
+        Uses weighted softmin (d weighted by softmax(-d/tau)).  Always ≥ 0.
+        Inputs should be in a normalised coordinate system (~unit scale) so
+        that tau is meaningful; call-site divides by contour_scale.
+        """
+        d = torch.cdist(pred_pts.float(), gt_pts.float())   # (N, P, P)
+        w_fwd = torch.softmax(-d / tau, dim=2)              # each pred → soft-nearest GT
+        w_bwd = torch.softmax(-d / tau, dim=1)              # each GT  → soft-nearest pred
+        soft_fwd = (d * w_fwd).sum(dim=2)                   # (N, P)
+        soft_bwd = (d * w_bwd).sum(dim=1)                   # (N, P)
+        return (soft_fwd.mean() + soft_bwd.mean()) * 0.5
 
     def compute_curvature_weights(self, polys: torch.Tensor) -> torch.Tensor:
         prev_pt = torch.roll(polys, 1, dims=1)
@@ -345,7 +538,15 @@ class FlowMatchingEvolution(nn.Module):
             0.5 * (plus_1 + minus_1) - sampled_feat,
         ]
 
-        if self._detail_context_mode == 'normal_tangent':
+        if self._detail_context_mode == 'normal_band':
+            radius_3 = torch.clamp(contour_scale / 16.0, min=2.5, max=6.0)
+            plus_3 = snake_gcn_utils.get_gcn_feature(cnn_feature, img_poly + normal * radius_3, py_ind, h, w)
+            minus_3 = snake_gcn_utils.get_gcn_feature(cnn_feature, img_poly - normal * radius_3, py_ind, h, w)
+            detail_terms.extend([
+                plus_3 - minus_3,
+                0.5 * (plus_2 + minus_2) - sampled_feat,
+            ])
+        elif self._detail_context_mode == 'normal_tangent':
             tangent_plus_1 = snake_gcn_utils.get_gcn_feature(
                 cnn_feature, img_poly + tangent * radius_1, py_ind, h, w
             )
@@ -416,6 +617,244 @@ class FlowMatchingEvolution(nn.Module):
             x_self_cond=x_self_cond,
         )
         return v_pred, L
+
+    def prepare_sampling_context(
+        self,
+        cnn_feature: torch.Tensor,
+        i_it_py: torch.Tensor,
+        py_ind: torch.Tensor,
+    ) -> Dict[str, torch.Tensor]:
+        h, w = cnn_feature.size(2), cnn_feature.size(3)
+        sampled_feat = snake_gcn_utils.get_gcn_feature(cnn_feature, i_it_py, py_ind, h, w)
+        contour_scale = self.compute_contour_scale(i_it_py)
+        detail_feat = self.sample_detail_features(
+            cnn_feature,
+            i_it_py,
+            py_ind,
+            h,
+            w,
+            sampled_feat=sampled_feat,
+            contour_scale=contour_scale,
+        )
+        return {
+            'sampled_feat': sampled_feat,
+            'detail_feat': detail_feat,
+            'contour_scale': contour_scale,
+            'h': h,
+            'w': w,
+        }
+
+    @staticmethod
+    def _gaussian_step_with_logprob(
+        step_mean: torch.Tensor,
+        action_std: float,
+        dt: float,
+        prev_sample: Optional[torch.Tensor] = None,
+        generator: Optional[torch.Generator] = None,
+    ):
+        if action_std <= 0:
+            if prev_sample is None:
+                prev_sample = step_mean
+            log_prob = step_mean.new_zeros(step_mean.size(0))
+            std = step_mean.new_zeros(step_mean.size(0), 1, 1)
+            return prev_sample, log_prob, step_mean, std
+
+        std_scalar = max(float(action_std) * math.sqrt(max(abs(float(dt)), 1e-12)), 1e-6)
+        std = step_mean.new_full((step_mean.size(0), 1, 1), std_scalar)
+        if prev_sample is None:
+            noise = torch.randn(
+                step_mean.shape,
+                device=step_mean.device,
+                dtype=step_mean.dtype,
+                generator=generator,
+            )
+            prev_sample = step_mean + std * noise
+        else:
+            prev_sample = prev_sample.to(device=step_mean.device, dtype=step_mean.dtype)
+
+        var = std.pow(2).clamp_min(1e-12)
+        log_prob = -((prev_sample.detach() - step_mean) ** 2) / (2.0 * var)
+        log_prob = log_prob - torch.log(std.clamp_min(1e-12)) - 0.5 * math.log(2.0 * math.pi)
+        log_prob = log_prob.mean(dim=tuple(range(1, log_prob.ndim)))
+        return prev_sample, log_prob, step_mean, std
+
+    def step_with_logprob(
+        self,
+        cnn_feature: torch.Tensor,
+        i_it_py: torch.Tensor,
+        c_it_py: torch.Tensor,
+        py_ind: torch.Tensor,
+        x_t: torch.Tensor,
+        t_value,
+        step_index: int,
+        total_steps: int,
+        action_std: float,
+        prev_sample: Optional[torch.Tensor] = None,
+        generator: Optional[torch.Generator] = None,
+        sampled_feat: Optional[torch.Tensor] = None,
+        detail_feat: Optional[torch.Tensor] = None,
+        contour_scale: Optional[torch.Tensor] = None,
+        x_self_cond: Optional[torch.Tensor] = None,
+    ):
+        if sampled_feat is None or contour_scale is None or (self._use_detail_context and detail_feat is None):
+            ctx = self.prepare_sampling_context(cnn_feature, i_it_py, py_ind)
+            sampled_feat = ctx['sampled_feat']
+            detail_feat = ctx['detail_feat']
+            contour_scale = ctx['contour_scale']
+
+        total_steps = max(int(total_steps), 1)
+        dt = 1.0 / float(total_steps)
+        t_float = float(t_value.item()) if torch.is_tensor(t_value) else float(t_value)
+        t_tensor = torch.full((x_t.size(0),), t_float, device=x_t.device, dtype=x_t.dtype)
+        contour_scale_flat = contour_scale.view(-1).to(device=x_t.device, dtype=x_t.dtype)
+
+        v_pred, _ = self.predict_velocity(
+            cnn_feature,
+            i_it_py,
+            c_it_py,
+            sampled_feat,
+            detail_feat,
+            py_ind,
+            x_t,
+            t_tensor,
+            contour_scale=contour_scale_flat,
+            x_self_cond=x_self_cond,
+        )
+
+        next_self_cond = None
+        if self._use_self_conditioning:
+            next_self_cond = (x_t + (1.0 - t_float) * v_pred).detach()
+
+        use_heun = (self._ode_solver == 'heun')
+        if use_heun and step_index < total_steps - 1:
+            x_pred = x_t + v_pred * dt
+            t_next = torch.full((x_t.size(0),), t_float + dt, device=x_t.device, dtype=x_t.dtype)
+            v_pred2, _ = self.predict_velocity(
+                cnn_feature,
+                i_it_py,
+                c_it_py,
+                sampled_feat,
+                detail_feat,
+                py_ind,
+                x_pred,
+                t_next,
+                contour_scale=contour_scale_flat,
+                x_self_cond=next_self_cond,
+            )
+            step_mean = x_t + (v_pred + v_pred2) * 0.5 * dt
+        else:
+            step_mean = x_t + v_pred * dt
+
+        if self._ode_smooth_k > 0:
+            step_mean = self.fourier_smooth(step_mean, self._ode_smooth_k)
+
+        prev_sample, log_prob, step_mean, std = self._gaussian_step_with_logprob(
+            step_mean,
+            action_std=action_std,
+            dt=dt,
+            prev_sample=prev_sample,
+            generator=generator,
+        )
+        return prev_sample, log_prob, step_mean, std, next_self_cond
+
+    @torch.no_grad()
+    def sample_with_logprob(
+        self,
+        cnn_feature: torch.Tensor,
+        i_it_py: torch.Tensor,
+        c_it_py: torch.Tensor,
+        py_ind: torch.Tensor,
+        steps: Optional[int] = None,
+        window_size: int = 0,
+        window_range: Tuple[int, int] = (0, 0),
+        noise_scale: Optional[float] = None,
+        action_std: float = 0.0,
+        generator: Optional[torch.Generator] = None,
+    ) -> Dict[str, Any]:
+        if steps is None:
+            steps = self.ode_steps
+        steps = max(int(steps), 1)
+        if noise_scale is None:
+            noise_scale = self._flow_train_noise_scale
+
+        device = i_it_py.device
+        x = torch.randn_like(i_it_py) * float(noise_scale)
+        ctx = self.prepare_sampling_context(cnn_feature, i_it_py, py_ind)
+
+        if window_size and window_size > 0:
+            start_min = int(window_range[0]) if isinstance(window_range, (tuple, list)) and len(window_range) > 0 else 0
+            end_max = int(window_range[1]) if isinstance(window_range, (tuple, list)) and len(window_range) > 1 else steps
+            end_max = max(end_max, window_size)
+            if end_max <= start_min + window_size:
+                s = max(0, min(start_min, max(steps - window_size, 0)))
+            else:
+                s = np.random.randint(start_min, end_max - window_size + 1)
+            e = min(s + window_size, steps)
+        else:
+            s = 0
+            e = steps
+
+        latents_seq = []
+        log_probs = []
+        t_seq = []
+        step_indices = []
+        x_ts = []
+        x_prevs = []
+        x_self_conds = []
+
+        x_self_cond = torch.zeros_like(x) if self._use_self_conditioning else None
+        dt = 1.0 / float(steps)
+
+        for idx in range(steps):
+            t_value = idx * dt
+            if idx == s:
+                latents_seq.append(x.detach())
+            in_policy_window = idx >= s and idx < e
+
+            x_prev, log_prob, _, _, next_self_cond = self.step_with_logprob(
+                cnn_feature,
+                i_it_py,
+                c_it_py,
+                py_ind,
+                x_t=x,
+                t_value=t_value,
+                step_index=idx,
+                total_steps=steps,
+                action_std=action_std if in_policy_window else 0.0,
+                prev_sample=None,
+                generator=generator,
+                sampled_feat=ctx['sampled_feat'],
+                detail_feat=ctx['detail_feat'],
+                contour_scale=ctx['contour_scale'],
+                x_self_cond=x_self_cond,
+            )
+
+            if in_policy_window:
+                latents_seq.append(x_prev.detach())
+                log_probs.append(log_prob.detach())
+                t_seq.append(torch.tensor(t_value, device=device, dtype=x.dtype))
+                step_indices.append(torch.tensor(idx, device=device, dtype=torch.long))
+                x_ts.append(x.detach())
+                x_prevs.append(x_prev.detach())
+                x_self_conds.append(None if x_self_cond is None else x_self_cond.detach())
+
+            x = x_prev.detach()
+            if self._use_self_conditioning:
+                x_self_cond = next_self_cond
+
+        disp = self.denormalize_pred_disp(x, ctx['contour_scale'])
+        py = i_it_py + disp
+        return {
+            'latents': latents_seq,
+            'log_probs': log_probs,
+            'timesteps': t_seq,
+            'step_indices': step_indices,
+            'x_ts': x_ts,
+            'x_prevs': x_prevs,
+            'x_self_conds': x_self_conds,
+            'disp': disp,
+            'py': py,
+        }
 
     def _sample_disp_from_sampled_feat(
         self,
@@ -489,7 +928,8 @@ class FlowMatchingEvolution(nn.Module):
             if self._ode_smooth_k > 0:
                 x_t = self.fourier_smooth(x_t, self._ode_smooth_k)
 
-        return self.denormalize_pred_disp(x_t, contour_scale)
+        disp = self.denormalize_pred_disp(x_t, contour_scale)
+        return self.clamp_pred_disp(disp, i_it_py)
 
     def sample_disp(self, cnn_feature, i_it_py, c_it_py, py_ind, steps=None) -> torch.Tensor:
         """
@@ -600,12 +1040,27 @@ class FlowMatchingEvolution(nn.Module):
         
         if self.training:
             train_dict = snake_gcn_utils.prepare_training(output, batch)
+            from lib.utils.snake.sam_init import sam_init_enabled
+            if sam_init_enabled():
+                h, w = cnn_feature.size(2), cnn_feature.size(3)
+                from lib.utils.snake.sam_init import maybe_replace_training_init, maybe_use_output_sam_training_init
+                train_dict = maybe_use_output_sam_training_init(train_dict, output)
+                if not torch.is_tensor(output.get('sam_i_it_py', None)):
+                    train_dict = maybe_replace_training_init(
+                        train_dict,
+                        output,
+                        batch,
+                        device=device,
+                        out_h=h,
+                        out_w=w,
+                    )
             ret.update(train_dict)
             
             i_init_train_py = train_dict['i_it_py']
             c_init_train_py = train_dict['c_it_py']
-            i_gt_py = train_dict['i_gt_py']
+            i_gt_py = train_dict['i_gt_py'].clone()
             py_ind = train_dict['py_ind']
+            point_mask_train = train_dict.get('point_mask', None)
 
             if i_init_train_py.numel() == 0:
                 ret.update({'diff_loss': (cnn_feature.sum() * 0.0), 'py_pred': [i_init_train_py]})
@@ -622,7 +1077,8 @@ class FlowMatchingEvolution(nn.Module):
             area_init, area_gt = _signed_area(i_init_train_py), _signed_area(i_gt_py)
             orient_mismatch = ((area_init >= 0) ^ (area_gt >= 0))
             if orient_mismatch.any():
-                i_gt_py[orient_mismatch] = torch.flip(i_gt_py[orient_mismatch], dims=[1])
+                flipped_gt = torch.flip(i_gt_py, dims=[1])
+                i_gt_py = torch.where(orient_mismatch.view(-1, 1, 1), flipped_gt, i_gt_py)
 
             if self._optimal_cyclic_align:
                 # Optimal cyclic alignment: find shift k* = argmin_k sum||oct[i] - gt[(i+k)%N]||^2
@@ -654,13 +1110,27 @@ class FlowMatchingEvolution(nn.Module):
                 full_disp = x1_raw.clone()
                 B = x1_raw.size(0)
                 situations = torch.randint(0, iter_steps, (B,), device=device)
-                for sit in range(1, iter_steps):
-                    mask = (situations == sit)
-                    if mask.any():
-                        frac = sit / iter_steps
-                        i_init_train_py[mask] = i_init_train_py[mask] + full_disp[mask] * frac
-                        x1_raw[mask] = full_disp[mask] * (1.0 - frac)
+                frac = situations.to(dtype=full_disp.dtype).view(B, 1, 1) / float(max(iter_steps, 1))
+                i_init_train_py = i_init_train_py + full_disp * frac
+                x1_raw = full_disp * (1.0 - frac)
 
+            if self._small_disp_prob > 0:
+                prob = min(max(self._small_disp_prob, 0.0), 1.0)
+                small_mask = torch.rand(x1_raw.size(0), device=device) < prob
+                if small_mask.any():
+                    min_frac = min(max(self._small_disp_min_frac, 0.0), 0.99)
+                    max_frac = min(max(self._small_disp_max_frac, min_frac), 0.99)
+                    frac = torch.empty(
+                        int(small_mask.sum().item()), 1, 1,
+                        device=device, dtype=x1_raw.dtype,
+                    ).uniform_(min_frac, max_frac)
+                    frac_full = torch.zeros_like(x1_raw[..., :1])
+                    frac_full = frac_full.clone()
+                    frac_full[small_mask] = frac
+                    i_init_train_py = i_init_train_py + x1_raw * frac_full
+                    x1_raw = x1_raw * (1.0 - frac_full)
+
+            c_init_train_py = snake_gcn_utils.img_poly_to_can_poly(i_init_train_py)
             contour_scale = self.compute_contour_scale(i_init_train_py)
             contour_scale_flat = contour_scale.view(-1)
             x1 = self.normalize_target_disp(x1_raw, contour_scale)
@@ -720,6 +1190,10 @@ class FlowMatchingEvolution(nn.Module):
 
             # 5. 计算目标速度 V_target = X_1 - X_0
             v_target = x1 - x0
+            x1_pred = x_t + (1.0 - t) * v_pred
+            pred_disp = self.denormalize_pred_disp(x1_pred, contour_scale)
+            pred_disp = self.clamp_pred_disp(pred_disp, i_init_train_py)
+            pred_contours = i_init_train_py + pred_disp
 
             # 6. Flow Matching Loss (V3.7: optional spectral decomposition)
             if self._use_curvature_reweight:
@@ -744,6 +1218,19 @@ class FlowMatchingEvolution(nn.Module):
                 endpoint_loss = F.mse_loss(x1_pred, x1, reduction='mean')
                 loss = loss + self._endpoint_loss_weight * endpoint_loss
 
+            # V4.3: soft Chamfer loss — penalise predicted contour distance to GT boundary
+            # Inputs are normalised by contour_scale so distances live in ~[0, 1] and
+            # tau / weight are well-calibrated independently of image resolution.
+            chamfer_loss_val = pred_contours.new_zeros(())
+            if self._chamfer_loss_weight > 0:
+                scale = contour_scale.to(pred_contours)          # (N, 1, 1)
+                chamfer_loss_val = self._compute_soft_chamfer(
+                    pred_contours / scale,
+                    i_gt_py.to(pred_contours) / scale,
+                    tau=self._chamfer_tau,
+                )
+                loss = loss + self._chamfer_loss_weight * chamfer_loss_val
+
             # Add denoiser regularisation (Laplacian from V3.7, zero for others)
             loss = loss + L_reg
 
@@ -752,7 +1239,12 @@ class FlowMatchingEvolution(nn.Module):
                 'diff_lossA1': loss,
                 'diff_loss_total': loss,
                 'diff_loss1': loss,
+                'diff_loss_chamfer': chamfer_loss_val,
+                'point_mask': point_mask_train,
                 'py_pred': [i_init_train_py],
+                'py': pred_contours,
+                'pred_contours': pred_contours,
+                'pred_disp': pred_disp,
                 'v_pred': v_pred.mean(), # For observation logging optional
             })
             
