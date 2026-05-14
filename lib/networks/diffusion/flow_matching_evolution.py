@@ -1105,16 +1105,66 @@ class FlowMatchingEvolution(nn.Module):
 
             x1_raw = i_gt_py - i_init_train_py
 
+            used_mixed_iter_interp = False
             if self.use_iterative_refinement:
                 iter_steps = int(getattr(global_cfg, 'iterative_num_steps', 3))
                 full_disp = x1_raw.clone()
                 B = x1_raw.size(0)
-                situations = torch.randint(0, iter_steps, (B,), device=device)
-                frac = situations.to(dtype=full_disp.dtype).view(B, 1, 1) / float(max(iter_steps, 1))
+                use_mixed_iter_interp = bool(getattr(global_cfg, 'v4_4_use_mixed_iter_interp', False))
+                if use_mixed_iter_interp:
+                    cont_p = max(float(getattr(global_cfg, 'v4_4_continuous_interp_prob', 0.70)), 0.0)
+                    disc_p = max(float(getattr(global_cfg, 'v4_4_discrete_interp_prob', 0.20)), 0.0)
+                    small_p = max(float(getattr(global_cfg, 'v4_4_small_interp_prob', self._small_disp_prob)), 0.0)
+                    total_p = cont_p + disc_p + small_p
+                    if total_p > 0:
+                        cont_p, disc_p, small_p = cont_p / total_p, disc_p / total_p, small_p / total_p
+                        draw = torch.rand(B, device=device)
+                        cont_mask = draw < cont_p
+                        disc_mask = (draw >= cont_p) & (draw < cont_p + disc_p)
+                        small_mask = draw >= (cont_p + disc_p)
+
+                        frac = torch.zeros(B, 1, 1, device=device, dtype=full_disp.dtype)
+
+                        default_cont_max = float(max(iter_steps - 1, 0)) / float(max(iter_steps, 1))
+                        cont_min = max(float(getattr(global_cfg, 'v4_4_continuous_interp_min_frac', 0.0)), 0.0)
+                        cont_max = min(
+                            float(getattr(global_cfg, 'v4_4_continuous_interp_max_frac', default_cont_max)),
+                            0.99,
+                        )
+                        if cont_max < cont_min:
+                            cont_max = cont_min
+                        if cont_mask.any():
+                            frac[cont_mask] = torch.empty(
+                                int(cont_mask.sum().item()), 1, 1,
+                                device=device, dtype=full_disp.dtype,
+                            ).uniform_(cont_min, cont_max)
+
+                        if disc_mask.any():
+                            situations = torch.randint(
+                                0, iter_steps,
+                                (int(disc_mask.sum().item()),),
+                                device=device,
+                            )
+                            frac[disc_mask] = situations.to(dtype=full_disp.dtype).view(-1, 1, 1) / float(max(iter_steps, 1))
+
+                        if small_mask.any() and small_p > 0:
+                            min_frac = min(max(self._small_disp_min_frac, 0.0), 0.99)
+                            max_frac = min(max(self._small_disp_max_frac, min_frac), 0.99)
+                            frac[small_mask] = torch.empty(
+                                int(small_mask.sum().item()), 1, 1,
+                                device=device, dtype=full_disp.dtype,
+                            ).uniform_(min_frac, max_frac)
+                        used_mixed_iter_interp = True
+                    else:
+                        situations = torch.randint(0, iter_steps, (B,), device=device)
+                        frac = situations.to(dtype=full_disp.dtype).view(B, 1, 1) / float(max(iter_steps, 1))
+                else:
+                    situations = torch.randint(0, iter_steps, (B,), device=device)
+                    frac = situations.to(dtype=full_disp.dtype).view(B, 1, 1) / float(max(iter_steps, 1))
                 i_init_train_py = i_init_train_py + full_disp * frac
                 x1_raw = full_disp * (1.0 - frac)
 
-            if self._small_disp_prob > 0:
+            if self._small_disp_prob > 0 and not used_mixed_iter_interp:
                 prob = min(max(self._small_disp_prob, 0.0), 1.0)
                 small_mask = torch.rand(x1_raw.size(0), device=device) < prob
                 if small_mask.any():
