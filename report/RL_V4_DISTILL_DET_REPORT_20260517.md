@@ -1022,4 +1022,47 @@ Mean gain ≈ +0.005 on training samples — these pseudo-labels are consistentl
 - Conservative estimate: capture 10–30% of the pseudo-label gap → **+0.0005 to +0.0015 on test set**
 - Optimistic: if generalization is good → up to +0.003 on test set (vs oracle ceiling +0.0081)
 
+---
+
+## 18. V5b Step 80 Eval and Final Online Distillation Verdict (2026-05-18)
+
+### 18.1 V5b Step 80 Full Eval Result
+
+| Model | Median IoU | Δ median | Mean IoU | Δ mean |
+|-------|-----------|---------|---------|-------|
+| Baseline | **0.8926** | — | 0.8925 | — |
+| V5b step 20 | 0.8925 | -0.0001 | 0.8925 | +0.0000 |
+| V5b step 40 | 0.8925 | -0.0001 | 0.8927 | +0.0002 |
+| V5b step 60 | 0.8924 | -0.0002 | 0.8925 | +0.0000 |
+| **V5b step 80** | **0.8925** | **-0.0001** | **0.8925** | **+0.0000** |
+
+Step 80 is identical to all previous: **zero improvement, pure noise.**
+
+The step-40 mean delta of +0.0002 was a false positive — it did not persist. All deltas across 80 steps are in the range [-0.0002, +0.0002], consistent with pure measurement noise.
+
+### 18.2 Final Verdict: Online Distillation Cannot Learn
+
+After 80 steps with three variants (V5b, V6, V7) and zero measurable improvement:
+
+- **V5b** (lr=5e-7, distill_weight=1.0, 80 steps): median Δ oscillates ±0.0002 — noise only
+- **V6** (lr=2e-6, distill_weight=1.0, 22 steps): clear regression (-0.0006) — lr too high
+- **V7** (lr=5e-7, distill_weight=2.0, 20 steps): median Δ = -0.0001 — noise only
+
+**V5b killed at step 80.** GPU 4 freed for offline pseudo-label generation.
+
+### 18.3 Offline Pseudo-Label Generation Progress
+
+K=4 generation running on GPU 4 (full bandwidth after V5b killed):
+
+| Checkpoint | Samples | Running gain | File size |
+|-----------|---------|-------------|----------|
+| Sample 21 | 21/720 | +0.0052 | — |
+| Sample 41 | 41/720 | +0.0054 | — |
+| Sample 50 (save) | 50/720 | — | 1.8 MB |
+| Sample 61 | 61/720 | **+0.0063** | — |
+
+**Notable:** harder samples (low det IoU) show larger best-of-4 gains — exactly the samples where fine-tuning will matter most. Running gain increasing as more hard samples are encountered.
+
+ETA: ~1.5 hours total (720 × ~10s/sample), completion around 09:30.
+
 
