@@ -5,7 +5,7 @@ zero-init per-point residual head for small local contour corrections.
 """
 
 from .dit_denoiser_v3_4 import DiTFlowMatchingV3_4
-from .dit_denoiser_v4 import PerPointDeltaHead
+from .dit_denoiser_v4 import LatentLoopBlock, MoEFinalHead, PerPointDeltaHead, StrongPerPointDeltaHead
 
 
 class DiTFlowMatchingV4_1(DiTFlowMatchingV3_4):
@@ -18,20 +18,75 @@ class DiTFlowMatchingV4_1(DiTFlowMatchingV3_4):
         use_per_point_delta: bool = True,
         per_point_delta_scale: float = 0.10,
         per_point_delta_reg_weight: float = 0.0,
+        per_point_delta_head_type: str = 'linear',
+        per_point_delta_hidden_mult: float = 2.0,
+        per_point_delta_use_cyclic_mixer: bool = True,
+        final_head_type: str = 'standard',
+        moe_num_experts: int = 8,
+        moe_top_k: int = 2,
+        moe_balance_weight: float = 1e-3,
+        moe_expert_init_std: float = 1e-4,
+        moe_router_noise_std: float = 0.01,
+        moe_use_point_embed: bool = True,
+        moe_use_cyclic_router: bool = True,
+        moe_use_shared_expert: bool = False,
+        moe_routed_expert_scale: float = 1.0,
+        use_latent_loop: bool = False,
+        latent_loop_steps: int = 4,
         **kwargs,
     ):
         super().__init__(*args, num_points=num_points, **kwargs)
         self.num_points = int(num_points)
-        self.use_per_point_delta = bool(use_per_point_delta)
+        self.final_head_type = str(final_head_type).strip().lower()
+        self.use_moe_final_head = self.final_head_type in ('moe', 'moe_final', 'deepseek_moe')
+        self.use_per_point_delta = bool(use_per_point_delta) and not self.use_moe_final_head
+        self.per_point_delta_head_type = str(per_point_delta_head_type).strip().lower()
+        self.use_latent_loop = bool(use_latent_loop)
+        self.latent_loop_steps = int(max(1, latent_loop_steps))
 
-        if self.use_per_point_delta:
-            self.per_point_delta_head = PerPointDeltaHead(
+        if self.use_moe_final_head:
+            self.final_layer = MoEFinalHead(
                 dim=self.state_dim,
                 out_dim=2,
                 num_points=self.num_points,
-                delta_scale=per_point_delta_scale,
-                reg_weight=per_point_delta_reg_weight,
+                num_experts=moe_num_experts,
+                top_k=moe_top_k,
+                balance_weight=moe_balance_weight,
+                expert_init_std=moe_expert_init_std,
+                router_noise_std=moe_router_noise_std,
+                use_point_embed=moe_use_point_embed,
+                use_cyclic_router=moe_use_cyclic_router,
+                use_shared_expert=moe_use_shared_expert,
+                routed_expert_scale=moe_routed_expert_scale,
             )
+
+        if self.use_latent_loop:
+            self.latent_loop = LatentLoopBlock(
+                dim=self.state_dim,
+                num_heads=getattr(self.dit_layers[0], 'num_heads', 8),
+                num_points=self.num_points,
+                dropout=0.0,
+            )
+
+        if self.use_per_point_delta:
+            if self.per_point_delta_head_type in ('strong', 'mlp', 'local'):
+                self.per_point_delta_head = StrongPerPointDeltaHead(
+                    dim=self.state_dim,
+                    out_dim=2,
+                    num_points=self.num_points,
+                    delta_scale=per_point_delta_scale,
+                    reg_weight=per_point_delta_reg_weight,
+                    hidden_mult=per_point_delta_hidden_mult,
+                    use_cyclic_mixer=per_point_delta_use_cyclic_mixer,
+                )
+            else:
+                self.per_point_delta_head = PerPointDeltaHead(
+                    dim=self.state_dim,
+                    out_dim=2,
+                    num_points=self.num_points,
+                    delta_scale=per_point_delta_scale,
+                    reg_weight=per_point_delta_reg_weight,
+                )
 
     def forward(
         self,
@@ -93,8 +148,14 @@ class DiTFlowMatchingV4_1(DiTFlowMatchingV3_4):
             context = global_ctx if (i % 2 == 0) else local_ctx
             x = dit_layer(x, context, t_emb)
 
+        if self.use_latent_loop:
+            for _ in range(self.latent_loop_steps):
+                x = self.latent_loop(x, t_emb)
+
         pred = self.final_layer(x, t_emb)
         reg_loss = pred.new_zeros(())
+        if hasattr(self.final_layer, 'reg_loss'):
+            reg_loss = reg_loss + self.final_layer.reg_loss().to(pred.device, pred.dtype)
         if self.use_per_point_delta:
             pred = pred + self.per_point_delta_head(x, t_emb)
             reg_loss = reg_loss + self.per_point_delta_head.reg_loss().to(pred.device, pred.dtype)

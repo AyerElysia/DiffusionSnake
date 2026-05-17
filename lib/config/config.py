@@ -292,6 +292,9 @@ def parse_cfg(cfg, args):
         raise ValueError('task must be specified')
 
     # assign the gpus
+    grpo_gpu_override = os.environ.get('GRPO_V2_GPU', '').strip()
+    if grpo_gpu_override:
+        cfg.gpus = [int(grpo_gpu_override)]
     os.environ['CUDA_VISIBLE_DEVICES'] = ', '.join([str(gpu) for gpu in cfg.gpus])
 
     cfg.det_dir = os.path.join(cfg.model_dir, cfg.task, args.det)

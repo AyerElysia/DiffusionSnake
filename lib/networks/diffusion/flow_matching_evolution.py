@@ -182,10 +182,30 @@ class FlowMatchingEvolution(nn.Module):
             _use_pp_delta = bool(getattr(global_cfg, 'v4_1_use_per_point_delta', True))
             _pp_delta_scale = float(getattr(global_cfg, 'v4_1_per_point_delta_scale', 0.10))
             _pp_delta_reg = float(getattr(global_cfg, 'v4_1_per_point_delta_reg_weight', 0.0))
+            _pp_delta_head_type = str(getattr(global_cfg, 'v4_1_per_point_delta_head_type', 'linear')).strip().lower()
+            _pp_delta_hidden_mult = float(getattr(global_cfg, 'v4_1_per_point_delta_hidden_mult', 2.0))
+            _pp_delta_cyclic = bool(getattr(global_cfg, 'v4_1_per_point_delta_use_cyclic_mixer', True))
+            _final_head_type = str(getattr(global_cfg, 'v4_1_final_head_type', 'standard')).strip().lower()
+            _moe_num_experts = int(getattr(global_cfg, 'v4_6_moe_num_experts', 8))
+            _moe_top_k = int(getattr(global_cfg, 'v4_6_moe_top_k', 2))
+            _moe_balance_weight = float(getattr(global_cfg, 'v4_6_moe_balance_weight', 1e-3))
+            _moe_expert_init_std = float(getattr(global_cfg, 'v4_6_moe_expert_init_std', 1e-4))
+            _moe_router_noise_std = float(getattr(global_cfg, 'v4_6_moe_router_noise_std', 0.01))
+            _moe_point_embed = bool(getattr(global_cfg, 'v4_6_moe_use_point_embed', True))
+            _moe_cyclic_router = bool(getattr(global_cfg, 'v4_6_moe_use_cyclic_router', True))
+            _moe_shared_expert = bool(getattr(global_cfg, 'v4_6_moe_use_shared_expert', False))
+            _moe_routed_scale = float(getattr(global_cfg, 'v4_6_moe_routed_expert_scale', 1.0))
+            _latent_loop = bool(getattr(global_cfg, 'v4_7_use_latent_loop', False))
+            _latent_loop_steps = int(getattr(global_cfg, 'v4_7_latent_loop_steps', 4))
             print(f"[FlowMatchingEvolution] Using DiT Flow Network V4.1 "
                   f"(V3.4 detail backbone, detail_ctx={_detail_ctx}, "
                   f"detail_mode={_detail_mode}, per_point_delta={_use_pp_delta}, "
-                  f"delta_scale={_pp_delta_scale}, delta_reg={_pp_delta_reg}, "
+                  f"delta_head={_pp_delta_head_type}, delta_scale={_pp_delta_scale}, "
+                  f"delta_reg={_pp_delta_reg}, "
+                  f"final_head={_final_head_type}, "
+                  f"moe_experts={_moe_num_experts}, moe_top_k={_moe_top_k}, "
+                  f"moe_shared={_moe_shared_expert}, "
+                  f"latent_loop={_latent_loop}, latent_loop_steps={_latent_loop_steps}, "
                   f"ODE steps={ode_steps})")
             self.denoiser = DiTFlowMatchingV4_1(
                 state_dim=dit_state_dim,
@@ -198,6 +218,21 @@ class FlowMatchingEvolution(nn.Module):
                 use_per_point_delta=_use_pp_delta,
                 per_point_delta_scale=_pp_delta_scale,
                 per_point_delta_reg_weight=_pp_delta_reg,
+                per_point_delta_head_type=_pp_delta_head_type,
+                per_point_delta_hidden_mult=_pp_delta_hidden_mult,
+                per_point_delta_use_cyclic_mixer=_pp_delta_cyclic,
+                final_head_type=_final_head_type,
+                moe_num_experts=_moe_num_experts,
+                moe_top_k=_moe_top_k,
+                moe_balance_weight=_moe_balance_weight,
+                moe_expert_init_std=_moe_expert_init_std,
+                moe_router_noise_std=_moe_router_noise_std,
+                moe_use_point_embed=_moe_point_embed,
+                moe_use_cyclic_router=_moe_cyclic_router,
+                moe_use_shared_expert=_moe_shared_expert,
+                moe_routed_expert_scale=_moe_routed_scale,
+                use_latent_loop=_latent_loop,
+                latent_loop_steps=_latent_loop_steps,
             )
         elif getattr(global_cfg, 'use_dit_v4', False):
             from .dit_denoiser_v4 import DiTFlowMatchingV4
@@ -852,6 +887,9 @@ class FlowMatchingEvolution(nn.Module):
             'x_ts': x_ts,
             'x_prevs': x_prevs,
             'x_self_conds': x_self_conds,
+            'sampled_feat': ctx['sampled_feat'],
+            'detail_feat': ctx['detail_feat'],
+            'contour_scale': ctx['contour_scale'],
             'disp': disp,
             'py': py,
         }
