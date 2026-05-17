@@ -692,3 +692,334 @@ Results expected in ~60-90 min.
 | Oracle std=0.05 | GPU 3 | Running (2.5h+) | Confirm ODE noise uselessness |
 | Oracle std=0.01/0.02 | GPU 1/2 | Running (2.5h+) | Same |
 
+---
+
+## 14. TTA-8 Results + V5 Early Training Analysis (2026-05-18 02:35)
+
+### 14.1 TTA Scaling: n=4 Is the Sweet Spot
+
+**TTA-8 eval completed (150 samples, infer_avg_samples=8):**
+
+| n (seeds) | Median IoU | Mean IoU | Δ Median (vs n=1) | Δ Mean (vs n=1) | Marginal Δ |
+|-----------|-----------|---------|-------------------|-----------------|-----------|
+| 1 (baseline) | 0.8926 | 0.8925 | — | — | — |
+| 4 | **0.8942** | 0.8947 | **+0.0016** | **+0.0022** | +0.0016 |
+| 8 | **0.8942** | 0.8953 | **+0.0016** | **+0.0028** | +0.0000 |
+
+**Key finding:** Median IoU plateaus at n=4. Going from n=4 → n=8 yields **zero marginal median improvement** (+0.0006 mean only). The x_0 diversity signal is fully captured at n=4 seeds.
+
+**Detailed breakdown:**
+- n=4 improved: 101/150 samples, regressed: 49/150
+- n=8 improved: 98/150 samples, regressed: 52/150 (slightly worse distribution)
+- Hard samples (IoU<0.88, n=44): n=4 gives +0.0064 mean; n=8 gives +0.0061 mean (essentially tied)
+
+**Conclusion: TTA-4 is the optimal inference setting.** Set `infer_avg_samples=4` as the default production inference for free +0.0016 median IoU (no training needed, ~4× inference cost).
+
+### 14.2 V5 Training — Early Analysis (Steps 1–14)
+
+**Training metrics summary:**
+
+| Metric | Value | Interpretation |
+|--------|-------|---------------|
+| distill_active_frac mean | **0.935** | 93.5% of steps have valid signal (excellent) |
+| distill_active_frac min | 0.500 | Even worst batch still 50% active |
+| final_score_best range | 0.886–0.963 | Best-of-16 consistently well above baseline |
+| distill_loss range | 0.00001–0.0045 | FM velocity MSE, noisy but real |
+| eval_iou | 0.881 (step 1 only) | Noise (8-batch sample), full eval at step 51 |
+
+**Why distill_loss varies widely:** Each step processes a random batch, and velocity difference between current model and best-of-16 depends on batch composition. Steps with harder organs (harder batches) show larger loss.
+
+### 14.3 KL Loss Does NOT Interfere with Distillation
+
+An apparent issue was noticed: `kl_loss ≈ 807` (vs distill_loss ≈ 0.001), suggesting KL dominates.
+
+**Investigation:** With `action_std=0`, the returned `std=0` tensor is clamped to `var=1e-12`, making `kl_term = (mean_diff)² / 2e-12 ≈ 800`. This produces pre-clip gradient norm of **2.6M**.
+
+**However,** `grad_clip_norm=0.5` clips ALL gradients. The PPO step's effective gradient scale = `0.5 / 2.6M ≈ 2e-7` → essentially **zero weight change** from the PPO/KL step.
+
+The distillation step (`distill_grad_norm=0.07–0.27 < 0.5 clip threshold`) runs **after** PPO and makes **unclipped real updates**. Therefore:
+- **PPO/KL step → zero net weight change (clipped to near-nothing)**
+- **Distillation step → real updates (sole learning signal)**
+
+V5 is effectively doing pure distillation training despite the appearance of a KL interference. No config change needed.
+
+### 14.4 Next Milestone: Step 51 Full Eval
+
+`eval_every=50` → first full eval at step 51 (expected in ~40 min from step 14).
+
+**Decision thresholds:**
+- `eval_iou > 0.893`: V5 is improving the deterministic baseline → continue to step 200+
+- `eval_iou 0.888–0.892`: flat, distillation learning too slowly → try lr=1e-6 or higher distill_det_margin
+- `eval_iou < 0.887`: regression → diagnose and pivot
+
+---
+
+## 15. Oracle Results + V5 OOM Crash + V5b Restart (2026-05-18 03:30 – 04:45)
+
+### 15.1 All Oracle Experiments Completed
+
+**Oracle k=16 results (150 test samples each):**
+
+| action_std | det median | avg_k median | best_k median | avg_k delta | best_k delta |
+|-----------|-----------|-------------|--------------|------------|-------------|
+| **0.00** | 0.8939 | 0.8931 | **0.9020** | -0.0007 | **+0.0081** |
+| 0.01 | 0.8914 | 0.8929 | 0.8932 | +0.0016 | +0.0019 |
+| 0.02 | 0.8912 | 0.8914 | 0.8712 | +0.0002 | -0.0200 |
+| 0.05 | 0.8930 | 0.8794 | 0.7777 | -0.0136 | **-0.1153** |
+| 0.15 | 0.8827 | 0.7949 | 0.5125 | -0.0878 | **-0.3702** |
+
+**Key findings:**
+
+1. **std=0.00 best_k = +0.0081 (oracle ceiling):** With 16 x_0 seeds, the oracle best-of-16 consistently achieves 0.9020 vs det=0.8939. This is the V5 distillation target and confirms meaningful signal exists.
+
+2. **std=0.00 avg_k = -0.0007 (averaging 16 hurts):** Averaging all 16 x_0 seeds is WORSE than using one. This clarifies the TTA-4 / TTA-8 plateau: at n=4 averaging helps (+0.0016), at n=16 it hurts. The sweet spot is confirmed at n=4.
+
+3. **std > 0.01: rapid degradation of best_k.** Even tiny ODE noise (std=0.02) causes best_k to drop below baseline (-0.020). By std=0.05, best-of-16 is -0.115 below single-seed. This definitively confirms V4's action_std=0.15 was catastrophically wrong, and V5's action_std=0 is the correct approach.
+
+**V5 theoretical ceiling:** If distillation captures 50% of the +0.0081 oracle gap → +0.004 improvement. That would bring median IoU from 0.8926 to ~0.897. With TTA-4 (+0.0016), combined ceiling is ~0.899.
+
+### 15.2 V5 (GPU 3) Crashed — CUDA OOM
+
+V5 training ran successfully for 34 steps on GPU 3, then crashed during the step-40 eval:
+
+```
+RuntimeError: CUDA out of memory. Tried to allocate 20.00 MiB
+(GPU 0; 47.38 GiB total capacity; 882.30 MiB already allocated; 13.88 MiB free)
+```
+
+**Root cause:** Another user's large training job started on GPU 3 mid-run, consuming ~40 GB. V5's rollout/eval memory allocation failed. Because nohup output is buffered by conda run, the log appeared to show steps 1 and 20 AFTER the crash — this was buffered stdout being flushed at exit, not a second run.
+
+**Key data recovered from V5 run:**
+- Steps 1–34 logged (distill_active mean=0.928, consistent signal throughout)
+- Step 20 8-batch eval = 0.8852 (ambiguous: step-1 bias was -0.012, possible true quality ≈ 0.897)
+- save_every=100, so NO checkpoint was saved before crash
+
+### 15.3 V5b Launched (GPU 4, save_every=20)
+
+Created `configs/btcv_v3_4_fm_rl_v5b_gpu4.yaml` with:
+- **GPU 4** (35 GB free) — no risk of OOM from other users
+- **save_every=20** — checkpoint at step 20 for immediate full 150-sample eval
+- All other V5 hyperparameters unchanged (lr=5e-7, k=16, action_std=0, distill_det_margin=0.002)
+
+V5b PID 606476, GPU 4 confirmed (UUID match). Step 1 results identical to V5 (deterministic from same baseline checkpoint):
+- step=1: distill_active=0.750, distill_loss=0.002048, eval_iou=0.8810 (8-batch noise)
+- step=2: distill_active=1.000, distill_loss=0.000973
+- step=3: distill_active=0.833, distill_loss=0.000078
+
+### 15.4 V5b Step 20 Full Eval — Neutral (Expected)
+
+Step 20 checkpoint saved successfully. Full 150-sample eval on GPU 5:
+
+| | Baseline | V5b Step 20 | Delta |
+|--|---------|------------|-------|
+| Median IoU | **0.8926** | 0.8925 | **-0.0001** |
+| Mean IoU | 0.8925 | 0.8925 | 0.0000 |
+| Dice | 0.9414 | 0.9414 | 0.0000 |
+| mBoundF | 0.7755 | 0.7756 | +0.0001 |
+| Improved / Regressed | — | 78 / 72 | (noise level) |
+
+**Interpretation:** Essentially zero change after 20 steps. This is expected: with lr=5e-7 and grad_norm=0.07–0.27, cumulative parameter change per weight is ~2–7 × 10⁻⁶ (negligible). The model needs many more steps to show measurable change. The key finding here is **no regression** (the approach is stable), and the neutral delta falls squarely between our decision thresholds of 0.888–0.892.
+
+---
+
+## 16. V6 — Higher Learning Rate (lr=2e-6) Parallel Run (2026-05-18 05:35+)
+
+### 16.1 Motivation
+
+With V5b showing no change at step 20, we need to determine whether the distillation approach can converge within a practical number of steps. Options:
+- **Wait for V5b ~100 steps**: cumulative change ~5× larger; detectable at step 60–100
+- **Try higher lr**: if convergence is lr-limited, 4× lr = 4× faster learning signal
+
+Chose to run both in parallel since GPU 5 was free. V5b continues on GPU 4 as the conservative run, V6 tests higher lr on GPU 5.
+
+### 16.2 V6 Config (`btcv_v3_4_fm_rl_v6_lr2e6_gpu5.yaml`)
+
+Changes vs V5b:
+- `grpo_v2_lr: 2.0e-6` (4× higher)
+- `gpus: [5]`
+- `model_dir: data/outputs/btcv_v3_4_fm_rl_v6_lr2e6_gpu5`
+- `grpo_v2_seed: 20260518` (different seed for variety)
+- All other params identical to V5b
+
+### 16.3 V6 Step 1 Metrics
+
+- `distill_active_frac = 1.000` (all 16 rollouts have valid signal — better than V5b's 0.750)
+- `distill_loss = 0.000616`
+- `eval_iou = 0.8869` (8-batch eval noise — same pattern as V5b)
+
+### 16.4 Next Evals
+
+### 16.3 Full Eval Results Summary
+
+| Model | Median IoU | Δ median | Mean IoU | Δ mean | Impr/Regr |
+|-------|-----------|---------|---------|-------|----------|
+| Baseline | **0.8926** | — | 0.8925 | — | — |
+| V5b step 20 | 0.8925 | -0.0001 | 0.8925 | +0.0000 | 78/72 |
+| V5b step 40 | 0.8925 | -0.0001 | **0.8927** | **+0.0002** | **82/68** |
+| V6  step 20 | 0.8920 | **-0.0006** | 0.8920 | **-0.0005** | **63/87** |
+
+Hard samples (IoU < 0.88, n=44):
+- V5b step 20: mean_delta = +0.0001
+- V5b step 40: mean_delta = +0.0004
+- V6  step 20: mean_delta = **-0.0005** (regression)
+
+### 16.4 Key Finding: Higher LR Destabilizes Distillation
+
+**V6 (lr=2e-6) at step 20: clear regression** — 63 improved vs 87 regressed, mean -0.0005. The 4× higher learning rate causes the model to overshoot. With online distillation (where the rollout targets are generated by the same model being trained), a higher lr amplifies distribution shift: the model drifts further each step, the best-of-k targets shift more rapidly, and training targets become inconsistent → regression.
+
+**V5b (lr=5e-7) shows a consistent, tiny positive trend:**
+- Step 20→40: mean_delta improved 78/72 → 82/68 (improving)
+- Mean delta increasing: 0.0000 → +0.0002 per 20-step interval
+- Hard samples: +0.0001 → +0.0004
+
+**Decision:** V6 killed at step 22. V5b continues as the primary run.
+
+### 16.5 V5b Long-Run Projection
+
+If the mean improvement continues at +0.0002/20 steps linearly:
+
+| Steps | Expected mean Δ |
+|-------|----------------|
+| 60    | +0.0003        |
+| 100   | +0.0005        |
+| 200   | +0.0010        |
+| 500   | +0.0025        |
+
+A +0.001 mean improvement corresponds to ~+0.001 median — marginally meaningful. A +0.0025 mean improvement would be clearly measurable. Will check at step 60, 80, 100 with full evals to verify the trend is holding.
+
+---
+
+## 17. Online Distillation Diagnosis and Pivot to Offline Pseudo-Label Fine-Tuning (2026-05-18)
+
+### 17.1 V5b Step 60 Result (Full Eval)
+
+| Model | Median IoU | Δ median | Mean IoU | Δ mean |
+|-------|-----------|---------|---------|-------|
+| Baseline | **0.8926** | — | **0.8925** | — |
+| V5b step 20 | 0.8925 | -0.0001 | 0.8925 | +0.0000 |
+| V5b step 40 | 0.8925 | -0.0001 | 0.8927 | +0.0002 |
+| V5b step 60 | 0.8924 | **-0.0002** | 0.8925 | **+0.0000** |
+
+Step 60 result: **flat/noise**. The positive mean trend from step 40 did not hold. The step 20/40/60 variations (+0.0000, +0.0002, +0.0000) are consistent with measurement noise, not true learning.
+
+### 17.2 Root Cause Analysis of Online Distillation Failure
+
+After 60 steps, V5b shows zero measurable improvement. Investigating why:
+
+**Root cause 1: Effective learning rate is too small**
+- Online distillation requires `lr ≤ 5e-7` for stability (V6 showed regression at 2e-6)
+- This is ~1000× smaller than typical FM pre-training LRs
+- After 60 steps at lr=5e-7 with mean grad_norm≈0.15: cumulative parameter change ≈ 2–7 × 10⁻⁶ per parameter — negligible relative to pre-trained weight magnitudes (~0.01–0.1)
+- Even after 200 steps at this lr, the model would barely move
+
+**Root cause 2: Sparse gradient signal**
+- ~65% of training steps have `distill_loss < 0.001` → near-zero gradient
+- Only ~35% of steps contribute meaningful update signal
+- The model only learns from steps where best-of-k rollout substantially beats the mean rollout
+
+**Root cause 3: Circular dependency / moving targets**
+- Online: model generates rollouts → best-of-k selected → model trained on those targets → model changes → next rollouts shift → targets shift → instability
+- This circular dependency *forces* the safe lr to be 1000× smaller than what the model needs to learn effectively
+- V6 at 4× lr demonstrated: the instability sets in immediately
+
+**Oracle gap confirms the wasted potential:**  
+Running `test/eval_best_of_k_oracle.py` (GT-scored best-of-16 on test set):
+- Baseline det: median = 0.8939
+- Best-of-16 with GT selection: median = **0.9020**
+- Oracle gap = **+0.0081** 
+- Online distillation after 60 steps captured: **≈ 0% of this gap**
+
+### 17.3 V7 (distill_weight=2.0) Experiment and Result
+
+**V7 configuration:** `btcv_v3_4_fm_rl_v7_dw2_gpu5.yaml`
+- Same as V5b but `grpo_v2_distill_weight: 2.0` (2× stronger distillation loss weight)
+- Hypothesis: stronger loss signal might overcome the sparse gradient problem
+
+**V7 step 20 full eval:**
+| Model | Median IoU | Δ median | Mean IoU | Δ mean |
+|-------|-----------|---------|---------|-------|
+| Baseline | 0.8926 | — | 0.8925 | — |
+| V7 step 20 | 0.8925 | **-0.0001** | 0.8926 | +0.0001 |
+
+**Result: Flat.** Doubling the distillation weight does not help. The fundamental problem is not the loss magnitude but the circular dependency limiting the stable learning rate.
+
+**Decision:** V7 killed after step 20.
+
+### 17.4 Summary of Online Distillation Approach Limitations
+
+| Run | lr | distill_weight | Steps | Best Δ median | Verdict |
+|-----|---|---------------|-------|--------------|---------|
+| V5b | 5e-7 | 1.0 | 60+ | +0.0000 | Stalled |
+| V6  | 2e-6 | 1.0 | 22 | -0.0006 | Regression |
+| V7  | 5e-7 | 2.0 | 20 | -0.0001 | Flat |
+
+**Conclusion:** Online distillation (GRPO-style best-of-k) cannot produce measurable improvement on this model:
+1. The stable lr is constrained by the moving-target instability to ~5e-7
+2. At lr=5e-7, cumulative parameter change is too small to matter within practical step counts
+3. Increasing distillation weight or lr both fail for different reasons
+
+**TTA-4 confirmed as the only working inference-time improvement: +0.0016 median** (tested earlier, works by averaging 4 rollouts at inference time, no training required).
+
+### 17.5 Pivot: Offline Pseudo-Label Fine-Tuning
+
+**Core insight:** Break the circular dependency by separating pseudo-label generation from model training.
+
+**Strategy:**
+1. **Pre-generate** best-of-k pseudo-labels for the training set (720 images) using the FIXED baseline model checkpoint
+2. **Fine-tune** on these fixed targets at 100× higher LR (1e-5 vs 5e-7)
+3. Since targets are fixed, there is no moving-target instability → can use high LR safely
+
+**Why this is sound:**
+- FM training: any (x0 ~ N(0,I), x1=best_disp) defines a valid flow trajectory
+- Pre-generating on the TRAINING set avoids test contamination
+- Fixed targets break the circular dependency — standard supervised fine-tuning from here
+- At lr=1e-5, cumulative parameter change at step 40 ≈ 100× larger than V5b at step 100
+
+**Scoring:** Each of k rollouts scored by GT reward:
+- `boundary_F × 0.2 + Dice × 0.2 + IoU × 0.6` (against ground-truth polygons)
+- Same reward function as in grpo_train_v2.py — no proxy needed
+
+**Pseudo-label quality (from K=4 run, first 5 training samples):**
+| Sample | det IoU | best-of-4 IoU | gain |
+|--------|---------|--------------|------|
+| 1 | 0.8963 | 0.9046 | +0.0083 |
+| 2 | 0.9255 | 0.9266 | +0.0011 |
+| 3 | 0.8983 | 0.9059 | +0.0075 |
+| 4 | 0.9253 | 0.9319 | +0.0066 |
+| 5 | 0.9354 | 0.9374 | +0.0020 |
+| **avg** | **0.9162** | **0.9213** | **+0.0051** |
+
+Mean gain ≈ +0.005 on training samples — these pseudo-labels are consistently better than det baseline, providing valid fine-tuning signal.
+
+### 17.6 Scripts Written
+
+**`scripts/gen_train_pseudo_labels.py`**
+- Iterates training set (720 samples)
+- Runs k=4 stochastic rollouts per sample using the baseline model checkpoint
+- Scores each rollout by GT reward (boundary_F × 0.2 + Dice × 0.2 + IoU × 0.6)
+- Saves best displacement tensor per sample to JSON
+- Resume support (saves every 50 samples); env-var interface (K, CKPT, OUT)
+
+**`scripts/finetune_with_pseudo_labels.py`**
+- Loads pseudo-label JSON; builds training dataset
+- Freezes CNN backbone; trains only FM denoiser parameters
+- Standard FM MSE loss: `loss = MSE(predict_velocity(x_t, t), x1 - x0)`
+- Env-var interface: PSEUDO, CKPT, LR (default 1e-5), STEPS (default 200), BATCH_SIZE
+
+### 17.7 Status and Next Steps
+
+**Currently running (2026-05-18):**
+- Pseudo-label generation (K=4, 720 training samples, GPU 4): ~50% complete, ETA ~1.5 hours
+- V5b training (GPU 4): step ~60, running but not driving decisions
+
+**After pseudo-labels complete:**
+1. Run fine-tuning: `LR=1e-5 STEPS=200 BATCH_SIZE=4 python finetune_with_pseudo_labels.py`
+2. Evaluate at steps 20/40/80/200 on full 150-sample test set
+3. Decision threshold: median gain > +0.001 → continue; regression → try lr=5e-5 or lr=1e-4
+
+**Expected outcome:**
+- With mean pseudo-label gain of +0.005 on training set and fine-tuning at 100× higher LR
+- Conservative estimate: capture 10–30% of the pseudo-label gap → **+0.0005 to +0.0015 on test set**
+- Optimistic: if generalization is good → up to +0.003 on test set (vs oracle ceiling +0.0081)
+
+
