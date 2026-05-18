@@ -47,6 +47,12 @@ cfg.heatmap_backbone = 'resnet18'
 cfg.heatmap_pretrained = False
 cfg.heatmap_wh_weight = 0.1
 cfg.heatmap_class_offset = 0
+cfg.use_swin_snake_feature = False
+cfg.swin_model_name = 'swin_tiny_patch4_window7_224'
+cfg.swin_img_size = 672
+cfg.swin_pretrained = False
+cfg.swin_pretrained_path = ''
+cfg.swin_freeze = False
 cfg.diffusion_timesteps = 1000
 cfg.use_ddim_inference = True
 cfg.diffusion_loss_weight = 1.0
@@ -154,6 +160,19 @@ cfg.v4_2_curvature_reweight_power = 1.0
 cfg.v4_2_small_disp_prob = 0.10
 cfg.v4_2_small_disp_min_frac = 0.80
 cfg.v4_2_small_disp_max_frac = 0.95
+
+# V4.9: richer interpolation-state sampling for multi-step flow training.
+cfg.v4_9_use_rich_state_sampling = False
+cfg.v4_9_continuous_state_prob = 0.60
+cfg.v4_9_small_state_prob = 0.25
+cfg.v4_9_hard_far_state_prob = 0.10
+cfg.v4_9_near_zero_state_prob = 0.05
+cfg.v4_9_continuous_min_frac = 0.05
+cfg.v4_9_continuous_max_frac = 0.85
+cfg.v4_9_hard_far_min_frac = 0.0
+cfg.v4_9_hard_far_max_frac = 0.20
+cfg.v4_9_near_zero_min_frac = 0.95
+cfg.v4_9_near_zero_max_frac = 0.995
 
 # V3.5: Fourier low-pass post-processing
 cfg.fourier_smooth_k = 0  # 0=disabled, >0=keep lowest K freq components per side

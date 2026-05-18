@@ -31,6 +31,8 @@ class DiTFlowMatchingV4_1(DiTFlowMatchingV3_4):
         moe_use_cyclic_router: bool = True,
         moe_use_shared_expert: bool = False,
         moe_routed_expert_scale: float = 1.0,
+        moe_expert_type: str = 'linear',
+        moe_expert_hidden_dim: int = 256,
         use_latent_loop: bool = False,
         latent_loop_steps: int = 4,
         **kwargs,
@@ -58,6 +60,8 @@ class DiTFlowMatchingV4_1(DiTFlowMatchingV3_4):
                 use_cyclic_router=moe_use_cyclic_router,
                 use_shared_expert=moe_use_shared_expert,
                 routed_expert_scale=moe_routed_expert_scale,
+                expert_type=moe_expert_type,
+                expert_hidden_dim=moe_expert_hidden_dim,
             )
 
         if self.use_latent_loop:

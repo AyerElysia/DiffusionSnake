@@ -87,6 +87,78 @@ class HeatmapResNetDetector(nn.Module):
         wh = F.relu(self.wh_head(feat))
         return feat, ct_hm, wh
 
+
+class SwinSnakeFeatureExtractor(nn.Module):
+    def __init__(
+            self,
+            model_name="swin_tiny_patch4_window7_224",
+            pretrained=False,
+            pretrained_path="",
+            img_size=672,
+            out_channels=64):
+        super().__init__()
+        try:
+            import timm
+        except Exception as e:
+            raise ImportError(f"timm is required for Swin snake feature extraction: {e}")
+
+        self.img_size = int(img_size)
+        if self.img_size % 224 != 0:
+            raise ValueError("swin_img_size must be a multiple of 224 for window-7 Swin-T on this timm version.")
+        self.swin = timm.create_model(
+            str(model_name),
+            pretrained=bool(pretrained) and not str(pretrained_path or '').strip(),
+            img_size=self.img_size,
+        )
+        if str(pretrained_path or '').strip():
+            ckpt = torch.load(str(pretrained_path), map_location='cpu')
+            state_dict = ckpt.get('model', ckpt.get('state_dict', ckpt)) if isinstance(ckpt, dict) else ckpt
+            target_state = self.swin.state_dict()
+            reusable_state = {
+                k: v for k, v in state_dict.items()
+                if k in target_state and tuple(v.shape) == tuple(target_state[k].shape)
+            }
+            missing, unexpected = self.swin.load_state_dict(reusable_state, strict=False)
+            print(
+                f"[Snake] Loaded Swin pretrained path={pretrained_path} "
+                f"reused={len(reusable_state)}/{len(target_state)} "
+                f"missing={len(missing)} unexpected={len(unexpected)}"
+            )
+
+        self.p2_channels = int(getattr(self.swin.layers[0], 'dim'))
+        self.p3_channels = int(getattr(self.swin.layers[1], 'dim'))
+        self.proj_p2 = nn.Conv2d(self.p2_channels, out_channels, kernel_size=1, bias=False)
+        self.proj_p3 = nn.Conv2d(self.p3_channels, out_channels, kernel_size=1, bias=False)
+        nn.init.zeros_(self.proj_p3.weight)
+
+    def forward(self, x):
+        h_in, w_in = x.shape[-2:]
+        if h_in > self.img_size or w_in > self.img_size:
+            raise ValueError(f"Input {(h_in, w_in)} exceeds configured Swin img_size={self.img_size}")
+        pad_h = self.img_size - h_in
+        pad_w = self.img_size - w_in
+        if pad_h or pad_w:
+            x = F.pad(x, (0, pad_w, 0, pad_h), mode="constant", value=0)
+
+        y = self.swin.patch_embed(x)
+        y = self.swin.pos_drop(y)
+        for block in self.swin.layers[0].blocks:
+            y = block(y)
+
+        grid_p2 = self.img_size // 4
+        p2 = y.view(y.size(0), grid_p2, grid_p2, self.p2_channels).permute(0, 3, 1, 2).contiguous()
+        out_h, out_w = h_in // 4, w_in // 4
+        p2 = p2[:, :, :out_h, :out_w]
+        feat = self.proj_p2(p2)
+
+        p3_tokens = self.swin.layers[0].downsample(y)
+        grid_p3 = self.img_size // 8
+        p3 = p3_tokens.view(p3_tokens.size(0), grid_p3, grid_p3, self.p3_channels).permute(0, 3, 1, 2).contiguous()
+        p3 = p3[:, :, :max(out_h // 2, 1), :max(out_w // 2, 1)]
+        p3 = F.interpolate(p3, size=(out_h, out_w), mode="bilinear", align_corners=False)
+        return feat + self.proj_p3(p3)
+
+
 class Network(nn.Module):
     def __init__(self, num_layers, heads, head_conv=256, down_ratio=4, det_dir=''):
         super(Network, self).__init__()
@@ -97,6 +169,8 @@ class Network(nn.Module):
         self.freeze_snake = bool(getattr(cfg, 'freeze_snake', False))
         self.freeze_yolo = bool(getattr(cfg, 'freeze_yolo', False))
         self.use_p3_features = False
+        self.use_swin_snake_feature = False
+        self.swin_snake_feature = None
         self.yolo = None
         self.samsnake_dla = None
         self.samsnake_refine = None
@@ -142,6 +216,26 @@ class Network(nn.Module):
                 self.cnn_proj_p3 = nn.Conv2d(in_ch, 64, kernel_size=1, bias=False)
                 nn.init.zeros_(self.cnn_proj_p3.weight)
                 print("[Snake] P3 feature fusion enabled with zero-init residual.")
+            self.use_swin_snake_feature = bool(getattr(cfg, 'use_swin_snake_feature', False))
+            if self.use_swin_snake_feature:
+                self.swin_snake_feature = SwinSnakeFeatureExtractor(
+                    model_name=str(getattr(cfg, 'swin_model_name', 'swin_tiny_patch4_window7_224')),
+                    pretrained=bool(getattr(cfg, 'swin_pretrained', False)),
+                    pretrained_path=str(getattr(cfg, 'swin_pretrained_path', '') or ''),
+                    img_size=int(getattr(cfg, 'swin_img_size', 672)),
+                    out_channels=64,
+                )
+                if bool(getattr(cfg, 'swin_freeze', False)):
+                    self.swin_snake_feature.eval()
+                    for p in self.swin_snake_feature.parameters():
+                        p.requires_grad = False
+                print(
+                    f"[Snake] Swin feature replacement enabled: "
+                    f"model={getattr(cfg, 'swin_model_name', 'swin_tiny_patch4_window7_224')} "
+                    f"pretrained={getattr(cfg, 'swin_pretrained', False)} "
+                    f"pretrained_path={getattr(cfg, 'swin_pretrained_path', '') or 'none'} "
+                    f"img_size={getattr(cfg, 'swin_img_size', 672)}"
+                )
         elif self.detector_backend.startswith('heatmap_'):
             self.heatmap_detector = HeatmapResNetDetector(
                 num_classes=nc,
@@ -473,16 +567,20 @@ class Network(nn.Module):
             # 兼容返回单个张量的情况（导出/特殊路径）
             yolo_y, yolo_feats = yolo_out, []
 
-        # 选择 P2 特征（最细一层，对应 stride=4，索引取 0）并压到 64 通道
-        p2 = yolo_feats[0] if isinstance(yolo_feats, (list, tuple)) and len(yolo_feats) > 0 else None
-        if p2 is None:
-            raise RuntimeError("YOLO head features are not available; expected a list with P2 at index 0.")
-        cnn_feature = self.cnn_proj(p2)
-        if self.use_p3_features:
-            p3 = yolo_feats[1] if isinstance(yolo_feats, (list, tuple)) and len(yolo_feats) > 1 else None
-            if p3 is not None:
-                p3_up = F.interpolate(p3, size=p2.shape[-2:], mode='bilinear', align_corners=False)
-                cnn_feature = cnn_feature + self.cnn_proj_p3(p3_up)
+        if self.use_swin_snake_feature:
+            cnn_feature = self.swin_snake_feature(x)
+            p2 = cnn_feature
+        else:
+            # 选择 P2 特征（最细一层，对应 stride=4，索引取 0）并压到 64 通道
+            p2 = yolo_feats[0] if isinstance(yolo_feats, (list, tuple)) and len(yolo_feats) > 0 else None
+            if p2 is None:
+                raise RuntimeError("YOLO head features are not available; expected a list with P2 at index 0.")
+            cnn_feature = self.cnn_proj(p2)
+            if self.use_p3_features:
+                p3 = yolo_feats[1] if isinstance(yolo_feats, (list, tuple)) and len(yolo_feats) > 1 else None
+                if p3 is not None:
+                    p3_up = F.interpolate(p3, size=p2.shape[-2:], mode='bilinear', align_corners=False)
+                    cnn_feature = cnn_feature + self.cnn_proj_p3(p3_up)
 
         # 从 YOLO 输出构建 detection (B, N, 6) => [x1,y1,x2,y2,score,cls]
         # 并按配置执行阈值+NMS，确保训练/测试阶段一致地给 Snake 提供精简候选

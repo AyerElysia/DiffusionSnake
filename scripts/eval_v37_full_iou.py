@@ -337,8 +337,13 @@ def eval_sample(model, device, batch, ode_steps=10, save_visuals=False, sample_d
             yolo_out = core.yolo(batch['inp'])
             feat_list = yolo_out[1] if isinstance(yolo_out, (list, tuple)) and len(yolo_out) > 1 else None
             feat_p2 = feat_list[0] if isinstance(feat_list, (list, tuple)) else yolo_out
-            cnn_feature = core.cnn_proj(feat_p2)
-            if getattr(core, 'use_p3_features', False) and hasattr(core, 'cnn_proj_p3'):
+            if getattr(core, 'use_swin_snake_feature', False):
+                if not hasattr(core, 'swin_snake_feature') or core.swin_snake_feature is None:
+                    raise RuntimeError('Swin feature evaluation requested but swin_snake_feature is missing')
+                cnn_feature = core.swin_snake_feature(batch['inp'])
+            else:
+                cnn_feature = core.cnn_proj(feat_p2)
+            if (not getattr(core, 'use_swin_snake_feature', False)) and getattr(core, 'use_p3_features', False) and hasattr(core, 'cnn_proj_p3'):
                 if isinstance(feat_list, (list, tuple)) and len(feat_list) > 1:
                     feat_p3 = feat_list[1]
                     feat_p3_up = torch.nn.functional.interpolate(

@@ -159,6 +159,8 @@ class MoEFinalHead(nn.Module):
         use_cyclic_router: bool = True,
         use_shared_expert: bool = False,
         routed_expert_scale: float = 1.0,
+        expert_type: str = 'linear',
+        expert_hidden_dim: int = 256,
     ):
         super().__init__()
         self.num_points = int(num_points)
@@ -170,6 +172,9 @@ class MoEFinalHead(nn.Module):
         self.use_cyclic_router = bool(use_cyclic_router)
         self.use_shared_expert = bool(use_shared_expert)
         self.routed_expert_scale = float(routed_expert_scale)
+        self.expert_type = str(expert_type).strip().lower()
+        self.use_mlp_experts = self.expert_type in ('mlp', 'mlp_all', 'mlp_experts')
+        self.expert_hidden_dim = int(expert_hidden_dim)
 
         self.norm = RMSNorm(dim)
         self.linear = nn.Linear(dim, out_dim)
@@ -178,8 +183,27 @@ class MoEFinalHead(nn.Module):
             nn.Linear(dim, 2 * dim, bias=True),
         )
 
-        self.expert_delta_weight = nn.Parameter(torch.empty(self.num_experts, out_dim, dim))
-        self.expert_delta_bias = nn.Parameter(torch.empty(self.num_experts, out_dim))
+        if self.use_mlp_experts:
+            hidden_dim = max(16, self.expert_hidden_dim)
+            self.shared_mlp = nn.Sequential(
+                nn.Linear(dim, hidden_dim),
+                nn.SiLU(),
+                nn.Linear(hidden_dim, dim),
+            )
+            self.expert_fc1_weight = nn.Parameter(torch.empty(self.num_experts, hidden_dim, dim))
+            self.expert_fc1_bias = nn.Parameter(torch.empty(self.num_experts, hidden_dim))
+            self.expert_fc2_weight = nn.Parameter(torch.empty(self.num_experts, out_dim, hidden_dim))
+            self.expert_fc2_bias = nn.Parameter(torch.empty(self.num_experts, out_dim))
+            self.register_parameter('expert_delta_weight', None)
+            self.register_parameter('expert_delta_bias', None)
+        else:
+            self.shared_mlp = None
+            self.expert_delta_weight = nn.Parameter(torch.empty(self.num_experts, out_dim, dim))
+            self.expert_delta_bias = nn.Parameter(torch.empty(self.num_experts, out_dim))
+            self.register_parameter('expert_fc1_weight', None)
+            self.register_parameter('expert_fc1_bias', None)
+            self.register_parameter('expert_fc2_weight', None)
+            self.register_parameter('expert_fc2_bias', None)
 
         if self.use_point_embed:
             self.point_embed = nn.Parameter(torch.empty(1, self.num_points, dim))
@@ -206,8 +230,18 @@ class MoEFinalHead(nn.Module):
         nn.init.constant_(self.adaLN[-1].bias, 0)
         nn.init.constant_(self.linear.weight, 0)
         nn.init.constant_(self.linear.bias, 0)
-        nn.init.normal_(self.expert_delta_weight, std=float(expert_init_std))
-        nn.init.normal_(self.expert_delta_bias, std=float(expert_init_std))
+        if self.use_mlp_experts:
+            nn.init.xavier_uniform_(self.shared_mlp[0].weight)
+            nn.init.zeros_(self.shared_mlp[0].bias)
+            nn.init.zeros_(self.shared_mlp[-1].weight)
+            nn.init.zeros_(self.shared_mlp[-1].bias)
+            nn.init.xavier_uniform_(self.expert_fc1_weight)
+            nn.init.zeros_(self.expert_fc1_bias)
+            nn.init.normal_(self.expert_fc2_weight, std=float(expert_init_std))
+            nn.init.normal_(self.expert_fc2_bias, std=float(expert_init_std))
+        else:
+            nn.init.normal_(self.expert_delta_weight, std=float(expert_init_std))
+            nn.init.normal_(self.expert_delta_bias, std=float(expert_init_std))
         if self.point_embed is not None:
             nn.init.normal_(self.point_embed, std=0.02)
         if self.router_mixer is not None:
@@ -231,10 +265,18 @@ class MoEFinalHead(nn.Module):
     def forward(self, x: torch.Tensor, t_emb: torch.Tensor) -> torch.Tensor:
         shift, scale = self.adaLN(t_emb).chunk(2, dim=1)
         x = modulate(self.norm(x), shift, scale)
-        base = self.linear(x)
+        if self.use_mlp_experts:
+            base = self.linear(x + self.shared_mlp(x))
+            expert_hidden = torch.einsum('npd,ehd->npeh', x, self.expert_fc1_weight)
+            expert_hidden = expert_hidden + self.expert_fc1_bias.view(1, 1, self.num_experts, -1)
+            expert_hidden = torch.nn.functional.silu(expert_hidden)
+            expert_delta = torch.einsum('npeh,eoh->npeo', expert_hidden, self.expert_fc2_weight)
+            expert_delta = expert_delta + self.expert_fc2_bias.view(1, 1, self.num_experts, -1)
+        else:
+            base = self.linear(x)
+            expert_delta = torch.einsum('npd,eod->npeo', x, self.expert_delta_weight)
+            expert_delta = expert_delta + self.expert_delta_bias.view(1, 1, self.num_experts, -1)
 
-        expert_delta = torch.einsum('npd,eod->npeo', x, self.expert_delta_weight)
-        expert_delta = expert_delta + self.expert_delta_bias.view(1, 1, self.num_experts, -1)
         if self.use_shared_expert:
             expert_out = expert_delta
         else:
@@ -267,7 +309,8 @@ class MoEFinalHead(nn.Module):
 
     def reg_loss(self) -> torch.Tensor:
         if self._last_aux_loss is None:
-            return self.expert_delta_weight.new_zeros(())
+            param = self.linear.weight
+            return param.new_zeros(())
         return self._last_aux_loss
 
 
