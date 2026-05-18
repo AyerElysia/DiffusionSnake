@@ -195,6 +195,8 @@ class FlowMatchingEvolution(nn.Module):
             _moe_cyclic_router = bool(getattr(global_cfg, 'v4_6_moe_use_cyclic_router', True))
             _moe_shared_expert = bool(getattr(global_cfg, 'v4_6_moe_use_shared_expert', False))
             _moe_routed_scale = float(getattr(global_cfg, 'v4_6_moe_routed_expert_scale', 1.0))
+            _moe_expert_type = str(getattr(global_cfg, 'v4_6_moe_expert_type', 'linear')).strip().lower()
+            _moe_expert_hidden = int(getattr(global_cfg, 'v4_6_moe_expert_hidden_dim', 256))
             _latent_loop = bool(getattr(global_cfg, 'v4_7_use_latent_loop', False))
             _latent_loop_steps = int(getattr(global_cfg, 'v4_7_latent_loop_steps', 4))
             print(f"[FlowMatchingEvolution] Using DiT Flow Network V4.1 "
@@ -205,6 +207,8 @@ class FlowMatchingEvolution(nn.Module):
                   f"final_head={_final_head_type}, "
                   f"moe_experts={_moe_num_experts}, moe_top_k={_moe_top_k}, "
                   f"moe_shared={_moe_shared_expert}, "
+                  f"moe_expert_type={_moe_expert_type}, "
+                  f"moe_expert_hidden={_moe_expert_hidden}, "
                   f"latent_loop={_latent_loop}, latent_loop_steps={_latent_loop_steps}, "
                   f"ODE steps={ode_steps})")
             self.denoiser = DiTFlowMatchingV4_1(
@@ -231,6 +235,8 @@ class FlowMatchingEvolution(nn.Module):
                 moe_use_cyclic_router=_moe_cyclic_router,
                 moe_use_shared_expert=_moe_shared_expert,
                 moe_routed_expert_scale=_moe_routed_scale,
+                moe_expert_type=_moe_expert_type,
+                moe_expert_hidden_dim=_moe_expert_hidden,
                 use_latent_loop=_latent_loop,
                 latent_loop_steps=_latent_loop_steps,
             )
@@ -372,6 +378,10 @@ class FlowMatchingEvolution(nn.Module):
         # V3.7.3: inference averaging
         self._infer_avg_samples = int(getattr(global_cfg, 'infer_avg_samples', 0))
         self._infer_noise_scale = float(getattr(global_cfg, 'infer_noise_scale', -1.0))
+        # Per-step noise annealing: list of noise scales for each iterative refinement step
+        # e.g. [0.7, 0.5, 0.3] for coarse-to-fine. Empty = use infer_noise_scale for all steps.
+        _itn = getattr(global_cfg, 'iterative_noise_scales', [])
+        self._iterative_noise_scales = list(_itn) if _itn else []
         # V3.7.6: fix t=0 during training (pure direct regression)
         self._flow_fix_t0 = bool(getattr(global_cfg, 'flow_fix_t0', False))
         if bool(getattr(global_cfg, 'use_dit_v4_2', False)):
@@ -1046,12 +1056,16 @@ class FlowMatchingEvolution(nn.Module):
             )
             # V6o: stochastic TTA ensemble for iterative inference
             avg_n = self._infer_avg_samples
+            step_ns = self._iterative_noise_scales[step_idx] if (
+                self._iterative_noise_scales and step_idx < len(self._iterative_noise_scales)
+            ) else None
             if avg_n > 1:
                 all_disps = []
                 for _ in range(avg_n):
                     d = self._sample_disp_from_sampled_feat(
                         cnn_feature, current_contour, c_it_py, py_ind,
                         sampled_feat, detail_feat, steps=ode_steps,
+                        noise_scale=step_ns,
                     )
                     all_disps.append(d)
                 disp = torch.stack(all_disps).mean(dim=0)
@@ -1064,6 +1078,7 @@ class FlowMatchingEvolution(nn.Module):
                     sampled_feat,
                     detail_feat,
                     steps=ode_steps,
+                    noise_scale=step_ns,
                 )
             frac = fractions[step_idx]
             applied_disp = disp * frac
@@ -1148,8 +1163,72 @@ class FlowMatchingEvolution(nn.Module):
                 iter_steps = int(getattr(global_cfg, 'iterative_num_steps', 3))
                 full_disp = x1_raw.clone()
                 B = x1_raw.size(0)
+                use_rich_state_sampling = bool(getattr(global_cfg, 'v4_9_use_rich_state_sampling', False))
                 use_mixed_iter_interp = bool(getattr(global_cfg, 'v4_4_use_mixed_iter_interp', False))
-                if use_mixed_iter_interp:
+                if use_rich_state_sampling:
+                    cont_p = max(float(getattr(global_cfg, 'v4_9_continuous_state_prob', 0.60)), 0.0)
+                    small_p = max(float(getattr(global_cfg, 'v4_9_small_state_prob', 0.25)), 0.0)
+                    far_p = max(float(getattr(global_cfg, 'v4_9_hard_far_state_prob', 0.10)), 0.0)
+                    zero_p = max(float(getattr(global_cfg, 'v4_9_near_zero_state_prob', 0.05)), 0.0)
+                    total_p = cont_p + small_p + far_p + zero_p
+                    if total_p > 0:
+                        cont_p, small_p, far_p, zero_p = (
+                            cont_p / total_p,
+                            small_p / total_p,
+                            far_p / total_p,
+                            zero_p / total_p,
+                        )
+                        draw = torch.rand(B, device=device)
+                        cont_mask = draw < cont_p
+                        small_mask = (draw >= cont_p) & (draw < cont_p + small_p)
+                        far_mask = (draw >= cont_p + small_p) & (draw < cont_p + small_p + far_p)
+                        zero_mask = draw >= (cont_p + small_p + far_p)
+
+                        frac = torch.zeros(B, 1, 1, device=device, dtype=full_disp.dtype)
+
+                        def _sample_frac(mask, min_name, max_name, default_min, default_max):
+                            if not mask.any():
+                                return
+                            min_frac = min(max(float(getattr(global_cfg, min_name, default_min)), 0.0), 0.999)
+                            max_frac = min(max(float(getattr(global_cfg, max_name, default_max)), min_frac), 0.999)
+                            frac[mask] = torch.empty(
+                                int(mask.sum().item()), 1, 1,
+                                device=device, dtype=full_disp.dtype,
+                            ).uniform_(min_frac, max_frac)
+
+                        _sample_frac(
+                            cont_mask,
+                            'v4_9_continuous_min_frac',
+                            'v4_9_continuous_max_frac',
+                            0.05,
+                            0.85,
+                        )
+                        if small_mask.any():
+                            min_frac = min(max(self._small_disp_min_frac, 0.0), 0.999)
+                            max_frac = min(max(self._small_disp_max_frac, min_frac), 0.999)
+                            frac[small_mask] = torch.empty(
+                                int(small_mask.sum().item()), 1, 1,
+                                device=device, dtype=full_disp.dtype,
+                            ).uniform_(min_frac, max_frac)
+                        _sample_frac(
+                            far_mask,
+                            'v4_9_hard_far_min_frac',
+                            'v4_9_hard_far_max_frac',
+                            0.0,
+                            0.20,
+                        )
+                        _sample_frac(
+                            zero_mask,
+                            'v4_9_near_zero_min_frac',
+                            'v4_9_near_zero_max_frac',
+                            0.95,
+                            0.995,
+                        )
+                        used_mixed_iter_interp = True
+                    else:
+                        situations = torch.randint(0, iter_steps, (B,), device=device)
+                        frac = situations.to(dtype=full_disp.dtype).view(B, 1, 1) / float(max(iter_steps, 1))
+                elif use_mixed_iter_interp:
                     cont_p = max(float(getattr(global_cfg, 'v4_4_continuous_interp_prob', 0.70)), 0.0)
                     disc_p = max(float(getattr(global_cfg, 'v4_4_discrete_interp_prob', 0.20)), 0.0)
                     small_p = max(float(getattr(global_cfg, 'v4_4_small_interp_prob', self._small_disp_prob)), 0.0)

@@ -63,10 +63,12 @@ def load_model(ckpt_path):
 
 
 def save_checkpoint(model, step, save_dir):
-    """Save checkpoint in grpo_train_v2-compatible format."""
+    """Save checkpoint in grpo_train_v2-compatible format (net.* key prefix)."""
     os.makedirs(os.path.join(save_dir, 'checkpoints'), exist_ok=True)
+    # trainer.network (or its .module) holds state_dict with 'net.*' prefix
+    # — same layout the original training and eval scripts expect.
     wrapper = model.module if hasattr(model, 'module') else model
-    sd = (wrapper.net if hasattr(wrapper, 'net') else wrapper).state_dict()
+    sd = wrapper.state_dict()
     ckpt = {'state_dict': sd, 'step': step}
     path = os.path.join(save_dir, 'checkpoints', f'step{step:03d}.pt')
     torch.save(ckpt, path)
@@ -76,12 +78,19 @@ def save_checkpoint(model, step, save_dir):
 
 # ─── per-batch fine-tuning step ───────────────────────────────────────────────
 
-def finetune_step(model, device, batch, pl_entry, optimizer, grad_clip=0.5):
+def finetune_step(model, device, batch, pl_entry, optimizer, grad_clip=0.5, iter_steps=3,
+                  anchor_weights=None, anchor_lambda=0.0):
     """
     One FM fine-tuning step using offline pseudo-label targets.
 
+    Samples frac ∈ {0, 1/iter_steps, ..., (iter_steps-1)/iter_steps} to match the
+    original iterative-refinement training distribution (V4.4 code path).  This is
+    critical: training only at frac=0 breaks the model's ability to refine at fracs
+    1/3 and 2/3, causing catastrophic regression after iterative inference.
+
     Args:
-      pl_entry: single pseudo-label entry dict for this batch (already looked up)
+      pl_entry:    single pseudo-label entry for this batch (pre-looked-up)
+      iter_steps:  number of refinement iterations (default 3, matching config)
     Returns:
       loss_val (float), grad_norm (float)
     """
@@ -93,7 +102,7 @@ def finetune_step(model, device, batch, pl_entry, optimizer, grad_clip=0.5):
     gcn = core.gcn
 
     # ----- CNN features (frozen — eval mode) -----
-    model.eval()
+    model.eval()  # freeze BN/Dropout in CNN backbone
     with torch.no_grad():
         yolo_out = core.yolo(batch['inp'])
         feat_list = yolo_out[1] if isinstance(yolo_out, (list, tuple)) and len(yolo_out) > 1 else None
@@ -107,9 +116,11 @@ def finetune_step(model, device, batch, pl_entry, optimizer, grad_clip=0.5):
                 cnn_feature = cnn_feature + core.cnn_proj_p3(feat_p3_up)
         cnn_feature = cnn_feature.detach()
 
+    # Put denoiser in train mode (enables Dropout regularization if present)
+    gcn.train()
+
     # ----- Initial polygon -----
     i_init = batch['i_it_py'].view(-1, batch['i_it_py'].shape[-2], 2).detach()
-    c_init = snake_gcn_utils.img_poly_to_can_poly(i_init)
     py_ind = torch.zeros(i_init.size(0), dtype=torch.long, device=device)
 
     # ----- Load pseudo-label displacement -----
@@ -120,15 +131,35 @@ def finetune_step(model, device, batch, pl_entry, optimizer, grad_clip=0.5):
     n = min(i_init.size(0), pl_disp_raw.size(0))
     if n == 0:
         return None, None
-    i_init_n = i_init[:n]
-    c_init_n = c_init[:n]
+    i_init_n = i_init[:n].float()
     py_ind_n = py_ind[:n]
     cnn_feat_n = cnn_feature  # shape unchanged for single image
-    pl_disp_n = pl_disp_raw[:n]
+    pl_disp_n = pl_disp_raw[:n].float()  # full displacement from i_init → GT (pixel space)
 
-    # ----- FM training step -----
-    contour_scale = gcn.compute_contour_scale(i_init_n).detach()  # (N, 1, 1)
-    x1 = gcn.normalize_target_disp(pl_disp_n, contour_scale).detach()
+    # ----- Multi-frac training: mirror the original iterative-refinement distribution -----
+    # Sample frac ∈ {0, 1/iter_steps, ..., (iter_steps-1)/iter_steps} per contour.
+    # frac > 0 simulates starting mid-way through the refinement chain, forcing the
+    # denoiser to learn good velocities for ALL iteration positions, not just frac=0.
+    if iter_steps > 1:
+        situations = torch.randint(0, iter_steps, (n,), device=device)
+        frac = situations.float().view(n, 1, 1) / float(iter_steps)
+    else:
+        frac = torch.zeros(n, 1, 1, device=device, dtype=pl_disp_n.dtype)
+
+    # Shift starting polygon to the frac-interpolated position along total displacement
+    i_init_adj = i_init_n + pl_disp_n * frac          # [N, 128, 2]
+    c_init_adj = snake_gcn_utils.img_poly_to_can_poly(i_init_adj)
+
+    # Remaining displacement from the adjusted starting position to GT
+    pl_disp_remaining = pl_disp_n * (1.0 - frac)      # [N, 128, 2]
+
+    # ----- FM training step (using adjusted polygon) -----
+    # Compute features and scale from the adjusted starting polygon
+    with torch.no_grad():
+        distill_ctx = gcn.prepare_sampling_context(cnn_feat_n, i_init_adj, py_ind_n)
+
+    contour_scale = distill_ctx['contour_scale'].detach()  # (N, 1, 1)
+    x1 = gcn.normalize_target_disp(pl_disp_remaining, contour_scale).detach()
     t = gcn.sample_train_t(n, device=device, dtype=x1.dtype)
     x0 = gcn.sample_train_x0(x1).detach()
     x_t = (1.0 - t) * x0 + t * x1
@@ -136,14 +167,11 @@ def finetune_step(model, device, batch, pl_entry, optimizer, grad_clip=0.5):
 
     contour_scale_flat = contour_scale.view(-1).to(dtype=x1.dtype)
 
-    with torch.no_grad():
-        distill_ctx = gcn.prepare_sampling_context(cnn_feat_n, i_init_n, py_ind_n)
-
     # Only denoiser trains; backbone is frozen
     v_pred, l_reg = gcn.predict_velocity(
         cnn_feat_n,
-        i_init_n,
-        c_init_n,
+        i_init_adj,
+        c_init_adj,
         distill_ctx['sampled_feat'],
         distill_ctx['detail_feat'],
         py_ind_n,
@@ -156,6 +184,15 @@ def finetune_step(model, device, batch, pl_entry, optimizer, grad_clip=0.5):
     loss = F.mse_loss(v_pred, v_target, reduction='mean')
     if isinstance(l_reg, torch.Tensor):
         loss = loss + l_reg.mean() * 0.0  # keep l_reg hooks alive but zeroed
+
+    # Anchor regularization: L2 penalty toward baseline weights (prevents catastrophic forgetting)
+    if anchor_weights is not None and anchor_lambda > 0:
+        anchor_loss = sum(
+            (p - anchor_weights[name].to(p.device)).pow(2).mean()
+            for name, p in model.named_parameters()
+            if p.requires_grad and name in anchor_weights
+        )
+        loss = loss + anchor_lambda * anchor_loss
 
     optimizer.zero_grad(set_to_none=True)
     loss.backward()
@@ -179,6 +216,9 @@ def main():
     batch_size = int(os.environ.get('BATCH_SIZE', '4'))
     save_every = int(os.environ.get('SAVE_EVERY', '20'))
     grad_clip = float(os.environ.get('GRAD_CLIP', '0.5'))
+    iter_steps = int(os.environ.get('ITER_STEPS', '3'))  # must match config iterative_num_steps
+    gain_threshold = float(os.environ.get('GAIN_THRESHOLD', '0.0'))  # filter by pseudo-label gain
+    anchor_lambda = float(os.environ.get('ANCHOR_LAMBDA', '0.0'))  # L2 reg toward baseline weights
     save_dir_rel = os.environ.get('SAVE_DIR', 'data/outputs/btcv_fm_pl_finetune_k8_lr1e5')
 
     save_dir = os.path.join(_THIS_DIR, save_dir_rel)
@@ -190,9 +230,16 @@ def main():
     with open(pseudo_path) as f:
         pl_data = json.load(f)
 
-    # Build idx → pseudo-label lookup
-    pseudo_labels_map = {s['idx']: s for s in pl_data['samples'] if 'error' not in s}
-    print(f'[*] Loaded {len(pseudo_labels_map)} pseudo-labels (k={pl_data["meta"]["k"]})')
+    # Build idx → pseudo-label lookup, optionally filtering by gain quality
+    def _gain(s):
+        return float(s.get('best_iou', 0)) - float(s.get('det_iou', 0))
+
+    pseudo_labels_map = {
+        s['idx']: s for s in pl_data['samples']
+        if 'error' not in s and _gain(s) >= gain_threshold
+    }
+    print(f'[*] Loaded {len(pseudo_labels_map)} pseudo-labels (k={pl_data["meta"]["k"]}, '
+          f'gain_threshold={gain_threshold})')
     print(f'    mean_gain={pl_data["meta"].get("mean_gain", "?"):+}  '
           f'median_best={pl_data["meta"].get("median_best", "?")}')
 
@@ -220,12 +267,26 @@ def main():
     print(f'[*] Trainable params: {sum(p.numel() for p in trainable):,}')
     optimizer = torch.optim.Adam(trainable, lr=lr)
 
-    # Load training dataset (for i_it_py and batch structure)
-    dataset = make_dataset(cfg, cfg.train.dataset, make_transforms(cfg, True), True)
+    # Anchor weights for L2 regularization — keeps model close to baseline
+    anchor_weights = None
+    if anchor_lambda > 0:
+        anchor_weights = {
+            name: p.detach().clone()
+            for name, p in model.named_parameters()
+            if p.requires_grad
+        }
+        print(f'[*] Anchor regularization: lambda={anchor_lambda}')
+
+    # Load dataset (supports 'train' or 'test' split via SPLIT env var)
+    split = os.environ.get('SPLIT', 'train')
+    if split == 'test':
+        dataset = make_dataset(cfg, cfg.test.dataset, make_transforms(cfg, False), False)
+    else:
+        dataset = make_dataset(cfg, cfg.train.dataset, make_transforms(cfg, True), True)
     collator = make_collator(cfg)
     available_idxs = sorted(pseudo_labels_map.keys())
     n_avail = len(available_idxs)
-    print(f'[*] Training on {n_avail} samples  lr={lr}  steps={steps}')
+    print(f'[*] Training on {n_avail} samples  lr={lr}  steps={steps}  iter_steps={iter_steps}')
 
     step = 0
     losses = []
@@ -241,7 +302,10 @@ def main():
             pl_entry = pseudo_labels_map[sample_idx]
             b = collator([dataset[sample_idx]])
             loss_val, gnorm = finetune_step(
-                model, device, b, pl_entry, optimizer, grad_clip
+                model, device, b, pl_entry, optimizer, grad_clip,
+                iter_steps=iter_steps,
+                anchor_weights=anchor_weights,
+                anchor_lambda=anchor_lambda,
             )
             if loss_val is not None:
                 batch_loss += loss_val

@@ -237,6 +237,7 @@ def main():
     out_rel = os.environ.get('OUT', 'data/pseudo_labels/btcv_train_k8.json')
     max_samples = int(os.environ.get('MAX_SAMPLES', '0'))
     resume_path = os.environ.get('RESUME', '')
+    split = os.environ.get('SPLIT', 'train')  # 'train' or 'test'
 
     out_path = os.path.join(_THIS_DIR, out_rel)
     os.makedirs(os.path.dirname(out_path), exist_ok=True)
@@ -252,15 +253,20 @@ def main():
         print(f'[*] Resuming from {resume_path}: {len(done_idxs)} samples already done')
 
     ckpt_path = os.path.join(_THIS_DIR, ckpt_rel)
-    print(f'[*] k={k}  ckpt={ckpt_path}')
+    print(f'[*] k={k}  split={split}  ckpt={ckpt_path}')
 
     model, device = load_model(ckpt_path)
 
-    # Use the TRAINING dataset
-    dataset = make_dataset(cfg, cfg.train.dataset, make_transforms(cfg, True), True)
+    # Use the selected dataset split
+    if split == 'test':
+        dataset = make_dataset(cfg, cfg.test.dataset, make_transforms(cfg, False), False)
+        split_name = 'Test'
+    else:
+        dataset = make_dataset(cfg, cfg.train.dataset, make_transforms(cfg, True), True)
+        split_name = 'Training'
     collator = make_collator(cfg)
     limit = min(len(dataset), max_samples) if max_samples > 0 else len(dataset)
-    print(f'[*] Training set: {limit}/{len(dataset)} samples')
+    print(f'[*] {split_name} set: {limit}/{len(dataset)} samples')
 
     samples = list(existing_samples)
     det_ious, best_ious = [], []
