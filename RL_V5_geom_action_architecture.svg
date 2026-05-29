@@ -1,0 +1,427 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="2400" height="1350" viewBox="0 0 2400 1350">
+
+<defs>
+  <marker id="arrow" markerWidth="12" markerHeight="8" refX="11" refY="4" orient="auto">
+    <path d="M0,0 L12,4 L0,8 Z" fill="#263849"/>
+  </marker>
+  <filter id="shadow" x="-5%" y="-5%" width="110%" height="110%">
+    <feDropShadow dx="0" dy="2" stdDeviation="3" flood-color="#000000" flood-opacity="0.12"/>
+  </filter>
+  <style>
+    text { font-family: DejaVu Sans, Arial, Helvetica, sans-serif; letter-spacing: 0; }
+  </style>
+</defs>
+
+<rect x="0" y="0" width="2400" height="1350" rx="0" fill="white" stroke="white" stroke-width="0" opacity="1.0"/>
+<text x="1200.0" y="48" font-size="42" font-weight="900" fill="#17212b" text-anchor="middle" dominant-baseline="middle">
+<tspan x="1200.0" dy="-0.0">RL V5 Geom: Low-Frequency Normal-Direction Action Policy</tspan>
+</text>
+<text x="1200.0" y="90" font-size="20" font-weight="520" fill="#5d6b78" text-anchor="middle" dominant-baseline="middle">
+<tspan x="1200.0" dy="-0.0">Three outer contour refinements; PPO acts in a reversible low-dimensional geometric subspace.</tspan>
+</text>
+<rect x="45" y="130" width="300" height="58" rx="10" fill="#174e9a" stroke="#174e9a" stroke-width="0" opacity="1.0"/>
+<text x="195.0" y="159" font-size="23" font-weight="850" fill="white" text-anchor="middle" dominant-baseline="middle">
+<tspan x="195.0" dy="-0.0">1. Base</tspan>
+</text>
+<rect x="390" y="130" width="300" height="58" rx="10" fill="#0b7d7b" stroke="#0b7d7b" stroke-width="0" opacity="1.0"/>
+<text x="540.0" y="159" font-size="23" font-weight="850" fill="white" text-anchor="middle" dominant-baseline="middle">
+<tspan x="540.0" dy="-0.0">2. State</tspan>
+</text>
+<rect x="735" y="130" width="330" height="58" rx="10" fill="#174e9a" stroke="#174e9a" stroke-width="0" opacity="1.0"/>
+<text x="900.0" y="159" font-size="23" font-weight="850" fill="white" text-anchor="middle" dominant-baseline="middle">
+<tspan x="900.0" dy="-0.0">3. FM Mean</tspan>
+</text>
+<rect x="1110" y="130" width="435" height="58" rx="10" fill="#6750a4" stroke="#6750a4" stroke-width="0" opacity="1.0"/>
+<text x="1327.5" y="159" font-size="23" font-weight="850" fill="white" text-anchor="middle" dominant-baseline="middle">
+<tspan x="1327.5" dy="-0.0">4. Geom Policy</tspan>
+</text>
+<rect x="1590" y="130" width="330" height="58" rx="10" fill="#b46a00" stroke="#b46a00" stroke-width="0" opacity="1.0"/>
+<text x="1755.0" y="159" font-size="23" font-weight="850" fill="white" text-anchor="middle" dominant-baseline="middle">
+<tspan x="1755.0" dy="-0.0">5. Reward and Gate</tspan>
+</text>
+<rect x="1965" y="130" width="390" height="58" rx="10" fill="#b93a2d" stroke="#b93a2d" stroke-width="0" opacity="1.0"/>
+<text x="2160.0" y="159" font-size="23" font-weight="850" fill="white" text-anchor="middle" dominant-baseline="middle">
+<tspan x="2160.0" dy="-0.0">6. PPO / Eval</tspan>
+</text>
+<rect x="45" y="205" width="300" height="845" rx="18" fill="#f8fbff" stroke="#174e9a" stroke-width="2.5" opacity="1.0"/>
+<rect x="70" y="235" width="250" height="115" rx="13" fill="white" stroke="#174e9a" stroke-width="2.1" opacity="1.0"/>
+<text x="195.0" y="262" font-size="20" font-weight="850" fill="#174e9a" text-anchor="middle" dominant-baseline="middle">
+<tspan x="195.0" dy="-0.0">V4.6c checkpoint</tspan>
+</text>
+<text x="195.0" y="309.5" font-size="17" font-weight="560" fill="#17212b" text-anchor="middle" dominant-baseline="middle">
+<tspan x="195.0" dy="-10.625">DiT-FM + MoE head</tspan>
+<tspan x="195.0" dy="21.25">resume_path: latest.pt</tspan>
+</text>
+<rect x="70" y="385" width="250" height="110" rx="13" fill="#eaf3ff" stroke="#174e9a" stroke-width="2.1" opacity="1.0"/>
+<text x="195.0" y="412" font-size="20" font-weight="850" fill="#174e9a" text-anchor="middle" dominant-baseline="middle">
+<tspan x="195.0" dy="-0.0">freeze detector</tspan>
+</text>
+<text x="195.0" y="457.0" font-size="17" font-weight="560" fill="#17212b" text-anchor="middle" dominant-baseline="middle">
+<tspan x="195.0" dy="-10.625">YOLO / feature proj</tspan>
+<tspan x="195.0" dy="21.25">BN running stats fixed</tspan>
+</text>
+<rect x="70" y="535" width="250" height="125" rx="13" fill="#eef5ff" stroke="#174e9a" stroke-width="2.1" opacity="1.0"/>
+<text x="195.0" y="562" font-size="20" font-weight="850" fill="#174e9a" text-anchor="middle" dominant-baseline="middle">
+<tspan x="195.0" dy="-0.0">trainable module</tspan>
+</text>
+<text x="195.0" y="614.5" font-size="17" font-weight="560" fill="#17212b" text-anchor="middle" dominant-baseline="middle">
+<tspan x="195.0" dy="-10.625">inner.gcn / flow</tspan>
+<tspan x="195.0" dy="21.25">optimizer lr = 5e-8</tspan>
+</text>
+<rect x="70" y="710" width="250" height="120" rx="13" fill="white" stroke="#5c7085" stroke-width="2.1" opacity="1.0"/>
+<text x="195.0" y="737" font-size="20" font-weight="850" fill="#34495e" text-anchor="middle" dominant-baseline="middle">
+<tspan x="195.0" dy="-0.0">frozen reference flow</tspan>
+</text>
+<text x="195.0" y="787.0" font-size="17" font-weight="560" fill="#17212b" text-anchor="middle" dominant-baseline="middle">
+<tspan x="195.0" dy="-10.625">ref_flow snapshot</tspan>
+<tspan x="195.0" dy="21.25">KL anchor</tspan>
+</text>
+<path d="M 254.8 940.0 L 256.9 946.1 L 253.8 952.0 L 247.7 956.9 L 240.8 961.2 L 233.9 965.1 L 226.4 968.5 L 217.5 970.5 L 207.8 970.1 L 198.9 967.9 L 191.5 965.3 L 184.7 964.2 L 176.3 965.2 L 165.1 967.2 L 152.1 967.7 L 140.8 965.1 L 134.8 959.3 L 135.4 952.2 L 140.4 945.4 L 146.0 940.0 L 149.6 935.5 L 150.9 931.0 L 152.0 926.2 L 154.9 921.5 L 160.2 917.6 L 166.9 914.4 L 173.8 911.3 L 181.1 907.5 L 189.9 903.5 L 200.5 900.9 L 211.4 901.6 L 220.1 906.1 L 224.6 913.1 L 225.8 920.2 L 226.6 925.4 L 230.5 928.6 L 238.3 931.2 L 247.7 934.8 Z" stroke="#174e9a" stroke-width="2.55" fill="none"/>
+<circle cx="254.8" cy="940.0" r="2.7" fill="#174e9a"/>
+<circle cx="247.7" cy="956.9" r="2.7" fill="#174e9a"/>
+<circle cx="226.4" cy="968.5" r="2.7" fill="#174e9a"/>
+<circle cx="198.9" cy="967.9" r="2.7" fill="#174e9a"/>
+<circle cx="176.3" cy="965.2" r="2.7" fill="#174e9a"/>
+<circle cx="140.8" cy="965.1" r="2.7" fill="#174e9a"/>
+<circle cx="140.4" cy="945.4" r="2.7" fill="#174e9a"/>
+<circle cx="150.9" cy="931.0" r="2.7" fill="#174e9a"/>
+<circle cx="160.2" cy="917.6" r="2.7" fill="#174e9a"/>
+<circle cx="181.1" cy="907.5" r="2.7" fill="#174e9a"/>
+<circle cx="211.4" cy="901.6" r="2.7" fill="#174e9a"/>
+<circle cx="225.8" cy="920.2" r="2.7" fill="#174e9a"/>
+<circle cx="238.3" cy="931.2" r="2.7" fill="#174e9a"/>
+<text x="195" y="1010" font-size="19" font-weight="750" fill="#174e9a" text-anchor="middle" dominant-baseline="middle">
+<tspan x="195" dy="-0.0">base contour refiner</tspan>
+</text>
+<rect x="390" y="205" width="300" height="845" rx="18" fill="#f8fffd" stroke="#0b7d7b" stroke-width="2.5" opacity="1.0"/>
+<rect x="420" y="239" width="240" height="112" rx="13" fill="white" stroke="#0b7d7b" stroke-width="2.1" opacity="1.0"/>
+<text x="540.0" y="266" font-size="20" font-weight="850" fill="#0b7d7b" text-anchor="middle" dominant-baseline="middle">
+<tspan x="540.0" dy="-0.0">manual context</tspan>
+</text>
+<text x="540.0" y="312.0" font-size="17" font-weight="560" fill="#17212b" text-anchor="middle" dominant-baseline="middle">
+<tspan x="540.0" dy="-10.625">cnn_feature</tspan>
+<tspan x="540.0" dy="21.25">P2 + P3/detail</tspan>
+</text>
+<rect x="453" y="323" width="16" height="16" rx="2" fill="#0b7d7b" stroke="#064044" stroke-width="1" opacity="1.0"/>
+<rect x="477" y="323" width="16" height="16" rx="2" fill="#0b7d7b" stroke="#064044" stroke-width="1" opacity="1.0"/>
+<rect x="501" y="323" width="16" height="16" rx="2" fill="#0b7d7b" stroke="#064044" stroke-width="1" opacity="1.0"/>
+<rect x="525" y="323" width="16" height="16" rx="2" fill="#0b7d7b" stroke="#064044" stroke-width="1" opacity="1.0"/>
+<rect x="549" y="323" width="16" height="16" rx="2" fill="#0b7d7b" stroke="#064044" stroke-width="1" opacity="1.0"/>
+<rect x="573" y="323" width="16" height="16" rx="2" fill="#0b7d7b" stroke="#064044" stroke-width="1" opacity="1.0"/>
+<rect x="597" y="323" width="16" height="16" rx="2" fill="#0b7d7b" stroke="#064044" stroke-width="1" opacity="1.0"/>
+<text x="639" y="331" font-size="24" font-weight="800" fill="#5d6b78" text-anchor="middle" dominant-baseline="middle">
+<tspan x="639" dy="-0.0">...</tspan>
+</text>
+<rect x="420" y="395" width="240" height="120" rx="13" fill="#e6f8f6" stroke="#0b7d7b" stroke-width="2.1" opacity="1.0"/>
+<text x="540.0" y="422" font-size="20" font-weight="850" fill="#0b7d7b" text-anchor="middle" dominant-baseline="middle">
+<tspan x="540.0" dy="-0.0">contour state</tspan>
+</text>
+<text x="540.0" y="472.0" font-size="17" font-weight="560" fill="#17212b" text-anchor="middle" dominant-baseline="middle">
+<tspan x="540.0" dy="-10.625">i_it_py, c_it_py</tspan>
+<tspan x="540.0" dy="21.25">py_ind</tspan>
+</text>
+<path d="M 573.8 475.0 L 574.9 478.5 L 573.2 481.8 L 569.7 484.6 L 565.8 486.9 L 562.0 489.2 L 557.7 491.1 L 552.7 492.2 L 547.3 492.0 L 542.2 490.7 L 538.0 489.3 L 534.2 488.7 L 529.5 489.3 L 523.1 490.3 L 515.8 490.6 L 509.4 489.2 L 506.0 485.9 L 506.3 481.9 L 509.2 478.1 L 512.4 475.0 L 514.3 472.5 L 515.1 469.9 L 515.7 467.2 L 517.4 464.5 L 520.4 462.3 L 524.1 460.6 L 528.0 458.8 L 532.2 456.6 L 537.1 454.4 L 543.1 452.9 L 549.3 453.3 L 554.1 455.9 L 556.7 459.8 L 557.4 463.8 L 557.9 466.7 L 560.0 468.6 L 564.4 470.0 L 569.8 472.1 Z" stroke="#0b7d7b" stroke-width="2" fill="none"/>
+<circle cx="573.8" cy="475.0" r="1.5" fill="#0b7d7b"/>
+<circle cx="569.7" cy="484.6" r="1.5" fill="#0b7d7b"/>
+<circle cx="557.7" cy="491.1" r="1.5" fill="#0b7d7b"/>
+<circle cx="542.2" cy="490.7" r="1.5" fill="#0b7d7b"/>
+<circle cx="529.5" cy="489.3" r="1.5" fill="#0b7d7b"/>
+<circle cx="509.4" cy="489.2" r="1.5" fill="#0b7d7b"/>
+<circle cx="509.2" cy="478.1" r="1.5" fill="#0b7d7b"/>
+<circle cx="515.1" cy="469.9" r="1.5" fill="#0b7d7b"/>
+<circle cx="520.4" cy="462.3" r="1.5" fill="#0b7d7b"/>
+<circle cx="532.2" cy="456.6" r="1.5" fill="#0b7d7b"/>
+<circle cx="549.3" cy="453.3" r="1.5" fill="#0b7d7b"/>
+<circle cx="557.4" cy="463.8" r="1.5" fill="#0b7d7b"/>
+<circle cx="564.4" cy="470.0" r="1.5" fill="#0b7d7b"/>
+<rect x="420" y="555" width="240" height="120" rx="13" fill="white" stroke="#0b7d7b" stroke-width="2.1" opacity="1.0"/>
+<text x="540.0" y="582" font-size="20" font-weight="850" fill="#0b7d7b" text-anchor="middle" dominant-baseline="middle">
+<tspan x="540.0" dy="-0.0">aligned target</tspan>
+</text>
+<text x="540.0" y="632.0" font-size="17" font-weight="560" fill="#17212b" text-anchor="middle" dominant-baseline="middle">
+<tspan x="540.0" dy="-10.625">i_gt_py</tspan>
+<tspan x="540.0" dy="21.25">orientation + roll</tspan>
+</text>
+<path d="M 573.8 635.0 L 574.9 638.5 L 573.2 641.8 L 569.7 644.6 L 565.8 646.9 L 562.0 649.2 L 557.7 651.1 L 552.7 652.2 L 547.3 652.0 L 542.2 650.7 L 538.0 649.3 L 534.2 648.7 L 529.5 649.3 L 523.1 650.3 L 515.8 650.6 L 509.4 649.2 L 506.0 645.9 L 506.3 641.9 L 509.2 638.1 L 512.4 635.0 L 514.3 632.5 L 515.1 629.9 L 515.7 627.2 L 517.4 624.5 L 520.4 622.3 L 524.1 620.6 L 528.0 618.8 L 532.2 616.6 L 537.1 614.4 L 543.1 612.9 L 549.3 613.3 L 554.1 615.9 L 556.7 619.8 L 557.4 623.8 L 557.9 626.7 L 560.0 628.6 L 564.4 630.0 L 569.8 632.1 Z" stroke="#246f9e" stroke-width="2" fill="none"/>
+<circle cx="573.8" cy="635.0" r="1.5" fill="#246f9e"/>
+<circle cx="569.7" cy="644.6" r="1.5" fill="#246f9e"/>
+<circle cx="557.7" cy="651.1" r="1.5" fill="#246f9e"/>
+<circle cx="542.2" cy="650.7" r="1.5" fill="#246f9e"/>
+<circle cx="529.5" cy="649.3" r="1.5" fill="#246f9e"/>
+<circle cx="509.4" cy="649.2" r="1.5" fill="#246f9e"/>
+<circle cx="509.2" cy="638.1" r="1.5" fill="#246f9e"/>
+<circle cx="515.1" cy="629.9" r="1.5" fill="#246f9e"/>
+<circle cx="520.4" cy="622.3" r="1.5" fill="#246f9e"/>
+<circle cx="532.2" cy="616.6" r="1.5" fill="#246f9e"/>
+<circle cx="549.3" cy="613.3" r="1.5" fill="#246f9e"/>
+<circle cx="557.4" cy="623.8" r="1.5" fill="#246f9e"/>
+<circle cx="564.4" cy="630.0" r="1.5" fill="#246f9e"/>
+<rect x="420" y="715" width="240" height="112" rx="13" fill="white" stroke="#5c7085" stroke-width="2.1" opacity="1.0"/>
+<text x="540.0" y="742" font-size="20" font-weight="850" fill="#34495e" text-anchor="middle" dominant-baseline="middle">
+<tspan x="540.0" dy="-0.0">fixed eval batches</tspan>
+</text>
+<text x="540.0" y="788.0" font-size="17" font-weight="560" fill="#17212b" text-anchor="middle" dominant-baseline="middle">
+<tspan x="540.0" dy="-10.625">8 validation batches</tspan>
+<tspan x="540.0" dy="21.25">deterministic smoke eval</tspan>
+</text>
+<text x="540" y="925" font-size="24" font-weight="900" fill="#0b7d7b" text-anchor="middle" dominant-baseline="middle">
+<tspan x="540" dy="-15.0">state s_j =</tspan>
+<tspan x="540" dy="30.0">current contour + context</tspan>
+</text>
+<rect x="735" y="205" width="330" height="845" rx="18" fill="#f8fbff" stroke="#174e9a" stroke-width="2.5" opacity="1.0"/>
+<text x="900" y="247" font-size="24" font-weight="900" fill="#174e9a" text-anchor="middle" dominant-baseline="middle">
+<tspan x="900" dy="-0.0">Outer refinement mean</tspan>
+</text>
+<rect x="770" y="315" width="260" height="92" rx="13" fill="white" stroke="#174e9a" stroke-width="2.1" opacity="1.0"/>
+<text x="900.0" y="342" font-size="20" font-weight="850" fill="#174e9a" text-anchor="middle" dominant-baseline="middle">
+<tspan x="900.0" dy="-0.0">outer step 1</tspan>
+</text>
+<text x="900.0" y="378.0" font-size="17" font-weight="560" fill="#17212b" text-anchor="middle" dominant-baseline="middle">
+<tspan x="900.0" dy="-10.625">frac = 0.3333</tspan>
+<tspan x="900.0" dy="21.25">ODE steps = 20</tspan>
+</text>
+<line x1="900" y1="407" x2="900" y2="455" stroke="#174e9a" stroke-width="2.4" marker-end="url(#arrow)"/>
+<rect x="770" y="505" width="260" height="92" rx="13" fill="white" stroke="#174e9a" stroke-width="2.1" opacity="1.0"/>
+<text x="900.0" y="532" font-size="20" font-weight="850" fill="#174e9a" text-anchor="middle" dominant-baseline="middle">
+<tspan x="900.0" dy="-0.0">outer step 2</tspan>
+</text>
+<text x="900.0" y="568.0" font-size="17" font-weight="560" fill="#17212b" text-anchor="middle" dominant-baseline="middle">
+<tspan x="900.0" dy="-10.625">frac = 0.5</tspan>
+<tspan x="900.0" dy="21.25">ODE steps = 20</tspan>
+</text>
+<line x1="900" y1="597" x2="900" y2="645" stroke="#174e9a" stroke-width="2.4" marker-end="url(#arrow)"/>
+<rect x="770" y="695" width="260" height="92" rx="13" fill="white" stroke="#174e9a" stroke-width="2.1" opacity="1.0"/>
+<text x="900.0" y="722" font-size="20" font-weight="850" fill="#174e9a" text-anchor="middle" dominant-baseline="middle">
+<tspan x="900.0" dy="-0.0">outer step 3</tspan>
+</text>
+<text x="900.0" y="758.0" font-size="17" font-weight="560" fill="#17212b" text-anchor="middle" dominant-baseline="middle">
+<tspan x="900.0" dy="-10.625">frac = 1.0</tspan>
+<tspan x="900.0" dy="21.25">ODE steps = 20</tspan>
+</text>
+<line x1="900" y1="787" x2="900" y2="835" stroke="#174e9a" stroke-width="2.4" marker-end="url(#arrow)"/>
+<rect x="770" y="895" width="260" height="100" rx="13" fill="#eaf3ff" stroke="#174e9a" stroke-width="2.1" opacity="1.0"/>
+<text x="900.0" y="922" font-size="20" font-weight="850" fill="#174e9a" text-anchor="middle" dominant-baseline="middle">
+<tspan x="900.0" dy="-0.0">policy mean</tspan>
+</text>
+<text x="900.0" y="962.0" font-size="17" font-weight="560" fill="#17212b" text-anchor="middle" dominant-baseline="middle">
+<tspan x="900.0" dy="-10.625">mu_j = FM_disp(s_j)</tspan>
+<tspan x="900.0" dy="21.25">action baseline</tspan>
+</text>
+<line x1="690" y1="625" x2="735" y2="625" stroke="#263849" stroke-width="2.8" marker-end="url(#arrow)"/>
+<rect x="1110" y="205" width="435" height="845" rx="18" fill="#fcfbff" stroke="#6750a4" stroke-width="2.5" opacity="1.0"/>
+<text x="1328" y="243" font-size="24" font-weight="900" fill="#6750a4" text-anchor="middle" dominant-baseline="middle">
+<tspan x="1328" dy="-0.0">Low-frequency geometric action</tspan>
+</text>
+<rect x="1140" y="290" width="160" height="85" rx="13" fill="white" stroke="#6750a4" stroke-width="2.1" opacity="1.0"/>
+<text x="1220.0" y="317" font-size="20" font-weight="850" fill="#6750a4" text-anchor="middle" dominant-baseline="middle">
+<tspan x="1220.0" dy="-0.0">sample z</tspan>
+</text>
+<text x="1220.0" y="349.5" font-size="17" font-weight="560" fill="#17212b" text-anchor="middle" dominant-baseline="middle">
+<tspan x="1220.0" dy="-10.625">z ~ N(0, I)</tspan>
+<tspan x="1220.0" dy="21.25">shape: B x 8</tspan>
+</text>
+<rect x="1340" y="290" width="170" height="85" rx="13" fill="white" stroke="#6750a4" stroke-width="2.1" opacity="1.0"/>
+<text x="1425.0" y="317" font-size="20" font-weight="850" fill="#6750a4" text-anchor="middle" dominant-baseline="middle">
+<tspan x="1425.0" dy="-0.0">Fourier basis</tspan>
+</text>
+<text x="1425.0" y="349.5" font-size="17" font-weight="560" fill="#17212b" text-anchor="middle" dominant-baseline="middle">
+<tspan x="1425.0" dy="-10.625">constant + cos/sin</tspan>
+<tspan x="1425.0" dy="21.25">8 low modes</tspan>
+</text>
+<line x1="1300" y1="333" x2="1340" y2="333" stroke="#6750a4" stroke-width="2.4" marker-end="url(#arrow)"/>
+<rect x="1140" y="425" width="370" height="100" rx="13" fill="#f2edff" stroke="#6750a4" stroke-width="2.1" opacity="1.0"/>
+<text x="1325.0" y="452" font-size="20" font-weight="850" fill="#6750a4" text-anchor="middle" dominant-baseline="middle">
+<tspan x="1325.0" dy="-0.0">normal-direction projection</tspan>
+</text>
+<text x="1325.0" y="492.0" font-size="17" font-weight="560" fill="#17212b" text-anchor="middle" dominant-baseline="middle">
+<tspan x="1325.0" dy="-10.625">delta = normal * lowfreq(z)</tspan>
+<tspan x="1325.0" dy="21.25">sigma_px = [1.2, 0.8, 0.5]</tspan>
+</text>
+<line x1="1200" y1="595" x2="1200" y2="559" stroke="#b93a2d" stroke-width="2.2" marker-end="url(#arrow)"/>
+<line x1="1234" y1="613" x2="1234" y2="577" stroke="#b93a2d" stroke-width="2.2" marker-end="url(#arrow)"/>
+<line x1="1268" y1="595" x2="1268" y2="559" stroke="#b93a2d" stroke-width="2.2" marker-end="url(#arrow)"/>
+<line x1="1302" y1="613" x2="1302" y2="577" stroke="#b93a2d" stroke-width="2.2" marker-end="url(#arrow)"/>
+<line x1="1336" y1="595" x2="1336" y2="559" stroke="#b93a2d" stroke-width="2.2" marker-end="url(#arrow)"/>
+<line x1="1370" y1="613" x2="1370" y2="577" stroke="#b93a2d" stroke-width="2.2" marker-end="url(#arrow)"/>
+<line x1="1404" y1="595" x2="1404" y2="559" stroke="#b93a2d" stroke-width="2.2" marker-end="url(#arrow)"/>
+<path d="M 1377.3 609.0 L 1379.0 614.0 L 1376.4 618.9 L 1371.4 622.9 L 1365.7 626.4 L 1360.0 629.7 L 1353.8 632.5 L 1346.5 634.1 L 1338.6 633.8 L 1331.2 631.9 L 1325.1 629.8 L 1319.5 628.9 L 1312.6 629.8 L 1303.4 631.4 L 1292.6 631.8 L 1283.3 629.6 L 1278.4 624.9 L 1278.9 619.0 L 1283.0 613.5 L 1287.7 609.0 L 1290.6 605.3 L 1291.7 601.6 L 1292.6 597.6 L 1295.0 593.7 L 1299.4 590.5 L 1304.8 587.9 L 1310.5 585.4 L 1316.6 582.2 L 1323.8 578.9 L 1332.5 576.8 L 1341.5 577.4 L 1348.6 581.1 L 1352.4 586.8 L 1353.3 592.7 L 1354.0 597.0 L 1357.2 599.6 L 1363.6 601.7 L 1371.4 604.7 Z" stroke="#6750a4" stroke-width="2.0999999999999996" fill="none"/>
+<circle cx="1377.3" cy="609.0" r="2.2" fill="#6750a4"/>
+<circle cx="1371.4" cy="622.9" r="2.2" fill="#6750a4"/>
+<circle cx="1353.8" cy="632.5" r="2.2" fill="#6750a4"/>
+<circle cx="1331.2" cy="631.9" r="2.2" fill="#6750a4"/>
+<circle cx="1312.6" cy="629.8" r="2.2" fill="#6750a4"/>
+<circle cx="1283.3" cy="629.6" r="2.2" fill="#6750a4"/>
+<circle cx="1283.0" cy="613.5" r="2.2" fill="#6750a4"/>
+<circle cx="1291.7" cy="601.6" r="2.2" fill="#6750a4"/>
+<circle cx="1299.4" cy="590.5" r="2.2" fill="#6750a4"/>
+<circle cx="1316.6" cy="582.2" r="2.2" fill="#6750a4"/>
+<circle cx="1341.5" cy="577.4" r="2.2" fill="#6750a4"/>
+<circle cx="1353.3" cy="592.7" r="2.2" fill="#6750a4"/>
+<circle cx="1363.6" cy="601.7" r="2.2" fill="#6750a4"/>
+<rect x="1140" y="710" width="370" height="100" rx="13" fill="white" stroke="#6750a4" stroke-width="2.1" opacity="1.0"/>
+<text x="1325.0" y="737" font-size="20" font-weight="850" fill="#6750a4" text-anchor="middle" dominant-baseline="middle">
+<tspan x="1325.0" dy="-0.0">sampled action</tspan>
+</text>
+<text x="1325.0" y="777.0" font-size="17" font-weight="560" fill="#17212b" text-anchor="middle" dominant-baseline="middle">
+<tspan x="1325.0" dy="-10.625">a_j = mu_j + delta_j</tspan>
+<tspan x="1325.0" dy="21.25">current &lt;- current + a_j</tspan>
+</text>
+<rect x="1140" y="865" width="370" height="105" rx="13" fill="white" stroke="#5c4e91" stroke-width="2.1" opacity="1.0"/>
+<text x="1325.0" y="892" font-size="20" font-weight="850" fill="#6750a4" text-anchor="middle" dominant-baseline="middle">
+<tspan x="1325.0" dy="-0.0">exact log-prob</tspan>
+</text>
+<text x="1325.0" y="934.5" font-size="17" font-weight="560" fill="#17212b" text-anchor="middle" dominant-baseline="middle">
+<tspan x="1325.0" dy="-10.625">project(a_j - mu_j) -&gt; z_hat</tspan>
+<tspan x="1325.0" dy="21.25">old_log = log N(z_hat; 0, I)</tspan>
+</text>
+<line x1="1065" y1="945" x2="1110" y2="945" stroke="#263849" stroke-width="2.8" marker-end="url(#arrow)"/>
+<rect x="1590" y="205" width="330" height="845" rx="18" fill="#fffdf8" stroke="#b46a00" stroke-width="2.5" opacity="1.0"/>
+<text x="1755" y="243" font-size="24" font-weight="900" fill="#b46a00" text-anchor="middle" dominant-baseline="middle">
+<tspan x="1755" dy="-0.0">V5 reward</tspan>
+</text>
+<rect x="1625" y="290" width="260" height="50" rx="13" fill="#fff4dc" stroke="#b46a00" stroke-width="2.1" opacity="1.0"/>
+<text x="1755.0" y="315.0" font-size="18" font-weight="780" fill="#b46a00" text-anchor="middle" dominant-baseline="middle">
+<tspan x="1755.0" dy="-0.0">0.30 mBoundF</tspan>
+</text>
+<rect x="1625" y="364" width="260" height="50" rx="13" fill="#fff4dc" stroke="#b46a00" stroke-width="2.1" opacity="1.0"/>
+<text x="1755.0" y="389.0" font-size="18" font-weight="780" fill="#b46a00" text-anchor="middle" dominant-baseline="middle">
+<tspan x="1755.0" dy="-0.0">0.10 Dice</tspan>
+</text>
+<rect x="1625" y="438" width="260" height="50" rx="13" fill="#fff4dc" stroke="#b46a00" stroke-width="2.1" opacity="1.0"/>
+<text x="1755.0" y="463.0" font-size="18" font-weight="780" fill="#b46a00" text-anchor="middle" dominant-baseline="middle">
+<tspan x="1755.0" dy="-0.0">0.25 IoU</tspan>
+</text>
+<rect x="1625" y="512" width="260" height="50" rx="13" fill="#fff4dc" stroke="#b46a00" stroke-width="2.1" opacity="1.0"/>
+<text x="1755.0" y="537.0" font-size="18" font-weight="780" fill="#b46a00" text-anchor="middle" dominant-baseline="middle">
+<tspan x="1755.0" dy="-0.0">0.35 Dist</tspan>
+</text>
+<rect x="1625" y="615" width="260" height="86" rx="13" fill="#fff0ee" stroke="#b93a2d" stroke-width="2.1" opacity="1.0"/>
+<text x="1755.0" y="642" font-size="20" font-weight="850" fill="#b93a2d" text-anchor="middle" dominant-baseline="middle">
+<tspan x="1755.0" dy="-0.0">burr penalty</tspan>
+</text>
+<text x="1755.0" y="675.0" font-size="17" font-weight="560" fill="#17212b" text-anchor="middle" dominant-baseline="middle">
+<tspan x="1755.0" dy="-10.625">Laplacian spike excess</tspan>
+<tspan x="1755.0" dy="21.25">weight = 0.06</tspan>
+</text>
+<rect x="1625" y="750" width="260" height="92" rx="13" fill="white" stroke="#b46a00" stroke-width="2.1" opacity="1.0"/>
+<text x="1755.0" y="777" font-size="20" font-weight="850" fill="#b46a00" text-anchor="middle" dominant-baseline="middle">
+<tspan x="1755.0" dy="-0.0">quality</tspan>
+</text>
+<text x="1755.0" y="813.0" font-size="17" font-weight="560" fill="#17212b" text-anchor="middle" dominant-baseline="middle">
+<tspan x="1755.0" dy="-10.625">Q_k = reward_k - baseline</tspan>
+<tspan x="1755.0" dy="21.25">baseline = deterministic 3-step</tspan>
+</text>
+<rect x="1625" y="895" width="260" height="82" rx="13" fill="#fff4dc" stroke="#b46a00" stroke-width="2.1" opacity="1.0"/>
+<text x="1755.0" y="922" font-size="20" font-weight="850" fill="#b46a00" text-anchor="middle" dominant-baseline="middle">
+<tspan x="1755.0" dy="-0.0">group gate</tspan>
+</text>
+<text x="1755.0" y="953.0" font-size="17" font-weight="560" fill="#17212b" text-anchor="middle" dominant-baseline="middle">
+<tspan x="1755.0" dy="-10.625">max_k Q_k &gt; 0.0</tspan>
+<tspan x="1755.0" dy="21.25">adv = clip(norm(Q)) * gate</tspan>
+</text>
+<line x1="1545" y1="760" x2="1590" y2="760" stroke="#263849" stroke-width="2.8" marker-end="url(#arrow)"/>
+<rect x="1965" y="205" width="390" height="845" rx="18" fill="#fffafa" stroke="#b93a2d" stroke-width="2.5" opacity="1.0"/>
+<text x="2160" y="243" font-size="24" font-weight="900" fill="#b93a2d" text-anchor="middle" dominant-baseline="middle">
+<tspan x="2160" dy="-0.0">PPO / GRPO-style update</tspan>
+</text>
+<rect x="2000" y="297" width="320" height="95" rx="13" fill="white" stroke="#b93a2d" stroke-width="2.1" opacity="1.0"/>
+<text x="2160.0" y="324" font-size="20" font-weight="850" fill="#b93a2d" text-anchor="middle" dominant-baseline="middle">
+<tspan x="2160.0" dy="-0.0">recompute log-prob</tspan>
+</text>
+<text x="2160.0" y="361.5" font-size="17" font-weight="560" fill="#17212b" text-anchor="middle" dominant-baseline="middle">
+<tspan x="2160.0" dy="-10.625">lp_cur via lowfreq projection</tspan>
+<tspan x="2160.0" dy="21.25">ratio = exp(lp_cur - old_log)</tspan>
+</text>
+<rect x="2000" y="440" width="320" height="90" rx="13" fill="#fff0ee" stroke="#b93a2d" stroke-width="2.1" opacity="1.0"/>
+<text x="2160.0" y="467" font-size="20" font-weight="850" fill="#b93a2d" text-anchor="middle" dominant-baseline="middle">
+<tspan x="2160.0" dy="-0.0">clipped policy loss</tspan>
+</text>
+<text x="2160.0" y="502.0" font-size="17" font-weight="560" fill="#17212b" text-anchor="middle" dominant-baseline="middle">
+<tspan x="2160.0" dy="-10.625">clip = 0.05</tspan>
+<tspan x="2160.0" dy="21.25">inner epochs = 2</tspan>
+</text>
+<rect x="2000" y="575" width="320" height="96" rx="13" fill="white" stroke="#b93a2d" stroke-width="2.1" opacity="1.0"/>
+<text x="2160.0" y="602" font-size="20" font-weight="850" fill="#b93a2d" text-anchor="middle" dominant-baseline="middle">
+<tspan x="2160.0" dy="-0.0">reference KL</tspan>
+</text>
+<text x="2160.0" y="640.0" font-size="17" font-weight="560" fill="#17212b" text-anchor="middle" dominant-baseline="middle">
+<tspan x="2160.0" dy="-10.625">KL in z-space against ref_flow</tspan>
+<tspan x="2160.0" dy="21.25">beta = 0.01; target = 0.002</tspan>
+</text>
+<rect x="2000" y="725" width="320" height="92" rx="13" fill="#fff0ee" stroke="#b93a2d" stroke-width="2.1" opacity="1.0"/>
+<text x="2160.0" y="752" font-size="20" font-weight="850" fill="#b93a2d" text-anchor="middle" dominant-baseline="middle">
+<tspan x="2160.0" dy="-0.0">optimizer step</tspan>
+</text>
+<text x="2160.0" y="788.0" font-size="17" font-weight="560" fill="#17212b" text-anchor="middle" dominant-baseline="middle">
+<tspan x="2160.0" dy="-10.625">train GCN / flow only</tspan>
+<tspan x="2160.0" dy="21.25">grad clip = 0.3</tspan>
+</text>
+<rect x="2000" y="885" width="320" height="105" rx="13" fill="#ebf8ee" stroke="#217a3a" stroke-width="2.1" opacity="1.0"/>
+<text x="2160.0" y="912" font-size="20" font-weight="850" fill="#217a3a" text-anchor="middle" dominant-baseline="middle">
+<tspan x="2160.0" dy="-0.0">deterministic eval</tspan>
+</text>
+<text x="2160.0" y="954.5" font-size="17" font-weight="560" fill="#17212b" text-anchor="middle" dominant-baseline="middle">
+<tspan x="2160.0" dy="-10.625">3-step FM mean only</tspan>
+<tspan x="2160.0" dy="21.25">best_iou / latest checkpoints</tspan>
+</text>
+<line x1="1920" y1="915" x2="1965" y2="915" stroke="#263849" stroke-width="2.8" marker-end="url(#arrow)"/>
+<line x1="345" y1="625" x2="390" y2="625" stroke="#263849" stroke-width="2.8" marker-end="url(#arrow)"/>
+<line x1="690" y1="625" x2="735" y2="625" stroke="#263849" stroke-width="2.8" marker-end="url(#arrow)"/>
+<line x1="1065" y1="625" x2="1110" y2="625" stroke="#263849" stroke-width="2.8" marker-end="url(#arrow)"/>
+<line x1="1545" y1="625" x2="1590" y2="625" stroke="#263849" stroke-width="2.8" marker-end="url(#arrow)"/>
+<line x1="1920" y1="625" x2="1965" y2="625" stroke="#263849" stroke-width="2.8" marker-end="url(#arrow)"/>
+<rect x="45" y="1098" width="710" height="190" rx="15" fill="white" stroke="#95a3b2" stroke-width="2" opacity="1.0"/>
+<text x="70" y="1128" font-size="22" font-weight="900" fill="#17212b" text-anchor="start" dominant-baseline="middle">
+<tspan x="70" dy="-0.0">Config-grounded hyperparameters</tspan>
+</text>
+<text x="78" y="1170" font-size="18" font-weight="560" fill="#17212b" text-anchor="start" dominant-baseline="middle">
+<tspan x="78" dy="-0.0">- k=8 rollouts; outer_steps=3; fractions=[0.3333, 0.5, 1.0]</tspan>
+</text>
+<text x="78" y="1199" font-size="18" font-weight="560" fill="#17212b" text-anchor="start" dominant-baseline="middle">
+<tspan x="78" dy="-0.0">- geom_lowfreq_modes=8; geom_sigma_px=[1.2, 0.8, 0.5]</tspan>
+</text>
+<text x="78" y="1228" font-size="18" font-weight="560" fill="#17212b" text-anchor="start" dominant-baseline="middle">
+<tspan x="78" dy="-0.0">- gate_margin=0.0; ppo_clip=0.05; kl_beta=0.01; lr=5e-8</tspan>
+</text>
+<text x="78" y="1257" font-size="18" font-weight="560" fill="#17212b" text-anchor="start" dominant-baseline="middle">
+<tspan x="78" dy="-0.0">- reward = region/dice/iou/dist minus gt-relative burr penalty</tspan>
+</text>
+<rect x="800" y="1098" width="700" height="150" rx="15" fill="white" stroke="#95a3b2" stroke-width="2" opacity="1.0"/>
+<rect x="830" y="1132" width="34" height="22" rx="4" fill="#eaf3ff" stroke="#174e9a" stroke-width="2" opacity="1.0"/>
+<text x="875" y="1143" font-size="17" font-weight="650" fill="#17212b" text-anchor="start" dominant-baseline="middle">
+<tspan x="875" dy="-0.0">V4.6c FM refiner / trainable flow</tspan>
+</text>
+<rect x="830" y="1172" width="34" height="22" rx="4" fill="#e6f8f6" stroke="#0b7d7b" stroke-width="2" opacity="1.0"/>
+<text x="875" y="1183" font-size="17" font-weight="650" fill="#17212b" text-anchor="start" dominant-baseline="middle">
+<tspan x="875" dy="-0.0">state and image context</tspan>
+</text>
+<rect x="830" y="1212" width="34" height="22" rx="4" fill="#f2edff" stroke="#6750a4" stroke-width="2" opacity="1.0"/>
+<text x="875" y="1223" font-size="17" font-weight="650" fill="#17212b" text-anchor="start" dominant-baseline="middle">
+<tspan x="875" dy="-0.0">policy action space</tspan>
+</text>
+<rect x="1160" y="1132" width="34" height="22" rx="4" fill="#fff4dc" stroke="#b46a00" stroke-width="2" opacity="1.0"/>
+<text x="1205" y="1143" font-size="17" font-weight="650" fill="#17212b" text-anchor="start" dominant-baseline="middle">
+<tspan x="1205" dy="-0.0">reward / gate</tspan>
+</text>
+<rect x="1160" y="1172" width="34" height="22" rx="4" fill="#fff0ee" stroke="#b93a2d" stroke-width="2" opacity="1.0"/>
+<text x="1205" y="1183" font-size="17" font-weight="650" fill="#17212b" text-anchor="start" dominant-baseline="middle">
+<tspan x="1205" dy="-0.0">PPO / KL update</tspan>
+</text>
+<rect x="1160" y="1212" width="34" height="22" rx="4" fill="#ebf8ee" stroke="#217a3a" stroke-width="2" opacity="1.0"/>
+<text x="1205" y="1223" font-size="17" font-weight="650" fill="#17212b" text-anchor="start" dominant-baseline="middle">
+<tspan x="1205" dy="-0.0">deterministic eval / output</tspan>
+</text>
+<rect x="1540" y="1098" width="815" height="150" rx="15" fill="white" stroke="#95a3b2" stroke-width="2" opacity="1.0"/>
+<text x="1565" y="1128" font-size="22" font-weight="900" fill="#17212b" text-anchor="start" dominant-baseline="middle">
+<tspan x="1565" dy="-0.0">Implementation anchors</tspan>
+</text>
+<text x="1575" y="1170" font-size="18" font-weight="560" fill="#17212b" text-anchor="start" dominant-baseline="middle">
+<tspan x="1575" dy="-0.0">- grpo_train_v5_geom_action.py: rollout, reward, PPO ratio, KL, logging</tspan>
+</text>
+<text x="1575" y="1199" font-size="18" font-weight="560" fill="#17212b" text-anchor="start" dominant-baseline="middle">
+<tspan x="1575" dy="-0.0">- lib/train/rewards/region_reward.py and curvature_detail_reward.py</tspan>
+</text>
+<text x="1575" y="1228" font-size="18" font-weight="560" fill="#17212b" text-anchor="start" dominant-baseline="middle">
+<tspan x="1575" dy="-0.0">- configs/btcv_select_v4_6c_rl_v5_geom_action_gpu3.yaml</tspan>
+</text>
+</svg>

@@ -203,6 +203,11 @@ def _align_gt(i_init: torch.Tensor, i_gt: torch.Tensor) -> torch.Tensor:
     return torch.stack(rolled, dim=0)
 
 
+def _contour_laplacian_px(poly: torch.Tensor, coord_scale: float) -> torch.Tensor:
+    poly_px = poly * float(coord_scale)
+    return torch.roll(poly_px, 1, dims=1) - 2.0 * poly_px + torch.roll(poly_px, -1, dims=1)
+
+
 # ---------- main ----------
 
 def main():
@@ -248,6 +253,10 @@ def main():
         if v2 is not None and name in v2:
             return v2[name]
         return getattr(cfg, f'grpo_v2_{name}', default)
+    def as_bool(v) -> bool:
+        if isinstance(v, str):
+            return v.strip().lower() in ('1', 'true', 'yes', 'y', 'on')
+        return bool(v)
     gpu_override = os.environ.get('GRPO_V2_GPU', '').strip()
     if gpu_override:
         cfg.gpus = [int(gpu_override)]
@@ -256,11 +265,17 @@ def main():
     train_steps  = int(os.environ.get('GRPO_V2_STEPS', cv('train_steps', 1000)))
     k            = int(cv('k', 6))
     rollout_steps= int(cv('rollout_steps', getattr(cfg, 'grpo_steps', 20)))
+    rollout_noise_scale = float(cv('rollout_noise_scale', -1.0))
+    rollout_noise_scale = None if rollout_noise_scale < 0 else rollout_noise_scale
+    det_rollout_steps = int(cv('det_rollout_steps', 0))
     window_size  = int(cv('window_size', max(rollout_steps // 4, 3)))
     window_range = tuple(cv('window_range', (max(rollout_steps // 4, 1), rollout_steps)))
     action_std0  = float(cv('action_std', 0.15))
     action_std_min = float(cv('action_std_min', 0.05))
     action_std_decay = float(cv('action_std_decay', 0.9999))
+    step_mode = str(cv('step_mode', 'gaussian')).strip().lower()
+    noise_level = float(cv('noise_level', 0.8))
+    sde_type = str(cv('sde_type', 'sde')).strip().lower()
     ppo_inner_epochs = int(cv('ppo_inner_epochs', 3))
     ppo_clip     = float(cv('ppo_clip', 0.2))
     ppo_kl_target= float(cv('ppo_kl_target', 0.02))
@@ -271,6 +286,13 @@ def main():
     reward_w_region = float(cv('reward_w_region', 1.0))
     reward_w_dice = float(cv('reward_w_dice', 0.0))
     reward_w_iou  = float(cv('reward_w_iou', 0.0))
+    reward_w_dist = float(cv('reward_w_dist', 0.0))
+    reward_dist_max_px = float(cv('reward_dist_max_px', 8.0))
+    reward_dist_quantile = float(cv('reward_dist_quantile', 95.0))
+    reward_dist_quantile_weight = float(cv('reward_dist_quantile_weight', 0.5))
+    reward_burr_weight = float(cv('reward_burr_weight', 0.0))
+    reward_burr_max_px = float(cv('reward_burr_max_px', 2.0))
+    reward_burr_margin_px = float(cv('reward_burr_margin_px', 0.25))
     ema_decay    = float(cv('ema_decay', 0.99))
     grad_clip_norm = float(cv('grad_clip_norm', 1.0))
     distill_weight = float(cv('distill_weight', 0.0))
@@ -283,13 +305,73 @@ def main():
     # Clip individual distillation loss to prevent catastrophic update from outlier batches.
     # Set to 0 to disable. Recommended 0.02-0.05 when lr >= 1e-6 with large action_std.
     distill_loss_clip = float(cv('distill_loss_clip', 0.0))
+    # Advantage-weighted multi-rollout distillation (adv_distill=1):
+    # Instead of distilling only the best-of-K rollout, use ALL K rollouts that have
+    # positive advantage, weighted by their normalized advantage.  This provides ~K/2
+    # independent gradient targets per step (vs 1), substantially stronger signal.
+    adv_distill = bool(int(cv('adv_distill', 0)))
+    distill_t_late_prob = float(cv('distill_t_late_prob', 0.0))
+    distill_t_late_min = float(cv('distill_t_late_min', 0.75))
     rollout_source = str(cv('rollout_source', 'manual_gt_init')).strip().lower()
     rollout_iterative = bool(cv('rollout_iterative', True))
+    train_midstate_mode = rollout_source in (
+        'train_state_mid', 'train_midstate', 'train_state_structured_mid',
+        'train_structured_mid', 'v3b_structured', 'v3b_train_state',
+    )
+    structured_mode = rollout_source in (
+        'train_state_structured', 'train_structured', 'structured', 'v3_structured',
+        'train_state_structured_mid', 'train_structured_mid', 'v3b_structured',
+    )
+    onestep_mode = as_bool(cv('onestep', rollout_source in ('train_state_onestep', 'train_onestep') or structured_mode))
+    onestep_steps = int(cv('onestep_steps', 1))
+    structured_normal_std_px = float(cv('structured_normal_std_px', 2.0))
+    structured_gt_pull_px = float(cv('structured_gt_pull_px', 2.0))
+    structured_noise_std_px = float(cv('structured_noise_std_px', 0.25))
+    structured_segment_min_frac = float(cv('structured_segment_min_frac', 0.08))
+    structured_segment_max_frac = float(cv('structured_segment_max_frac', 0.25))
+    structured_max_delta_px = float(cv('structured_max_delta_px', 4.0))
+    update_only_if_beats_det = as_bool(cv('update_only_if_beats_det', False))
+    dump_trajectory_viz = as_bool(cv('dump_trajectory_viz', True))
     eval_every   = int(cv('eval_every', 50))
     viz_every    = int(cv('viz_every', 50))
     save_every   = int(cv('save_every', 100))
     log_every    = int(cv('log_every', 1))
     seed         = int(cv('seed', 20260515))
+    latent_policy = as_bool(cv('latent_policy', False))
+    latent_ppo_weight = float(cv('latent_ppo_weight', 1.0))
+    latent_elite_only = as_bool(cv('latent_elite_only', False))
+    latent_elite_min_gain = float(cv('latent_elite_min_gain', 0.0))
+    latent_elite_weight_clip = float(cv('latent_elite_weight_clip', 10.0))
+    latent_ranker = as_bool(cv('latent_ranker', False))
+    latent_ranker_weight = float(cv('latent_ranker_weight', 1.0))
+    latent_ranker_temp = float(cv('latent_ranker_temp', 0.01))
+    latent_ranker_top1 = as_bool(cv('latent_ranker_top1', True))
+    aligned_policy_only = as_bool(cv('aligned_policy_only', False))
+    if aligned_policy_only:
+        if action_std0 <= 0.0:
+            raise ValueError('grpo_v2_aligned_policy_only requires grpo_v2_action_std > 0.')
+        if distill_weight != 0.0:
+            print('[GRPO-V2] aligned policy mode: forcing distill_weight=0.0')
+            distill_weight = 0.0
+        if adv_distill:
+            print('[GRPO-V2] aligned policy mode: forcing adv_distill=0')
+            adv_distill = False
+        if latent_ranker:
+            print('[GRPO-V2] aligned policy mode: forcing latent_ranker=0')
+            latent_ranker = False
+            latent_ranker_weight = 0.0
+        if latent_elite_only:
+            print('[GRPO-V2] aligned policy mode: forcing latent_elite_only=0')
+            latent_elite_only = False
+        if latent_policy:
+            print('[GRPO-V2] aligned policy mode: forcing latent_policy=0; only step logprob actions are updated')
+            latent_policy = False
+    if latent_policy:
+        cfg.flow_use_latent_policy = True
+    if latent_ranker:
+        latent_policy = True
+        cfg.flow_use_latent_policy = True
+        cfg.flow_use_latent_ranker = True
 
     _set_seed(seed)
 
@@ -360,17 +442,49 @@ def main():
     with open(log_dir / 'v2_hparams.json', 'w') as f:
         json.dump({
             'train_steps': train_steps, 'k': k, 'rollout_steps': rollout_steps,
+            'rollout_noise_scale': rollout_noise_scale, 'det_rollout_steps': det_rollout_steps,
             'window_size': window_size, 'window_range': list(window_range),
             'action_std0': action_std0, 'action_std_min': action_std_min,
             'action_std_decay': action_std_decay,
+            'step_mode': step_mode, 'noise_level': noise_level, 'sde_type': sde_type,
             'ppo_inner_epochs': ppo_inner_epochs, 'ppo_clip': ppo_clip,
             'ppo_kl_target': ppo_kl_target, 'kl_beta': kl_beta,
             'adv_clip_max': adv_clip_max,
             'reward_abs_weight': reward_abs_w, 'reward_delta_weight': reward_delta_w,
-            'reward_w_region': reward_w_region, 'reward_w_dice': reward_w_dice, 'reward_w_iou': reward_w_iou,
+            'reward_w_region': reward_w_region, 'reward_w_dice': reward_w_dice,
+            'reward_w_iou': reward_w_iou, 'reward_w_dist': reward_w_dist,
+            'reward_dist_max_px': reward_dist_max_px,
+            'reward_dist_quantile': reward_dist_quantile,
+            'reward_dist_quantile_weight': reward_dist_quantile_weight,
+            'reward_burr_weight': reward_burr_weight,
+            'reward_burr_max_px': reward_burr_max_px,
+            'reward_burr_margin_px': reward_burr_margin_px,
             'rollout_source': rollout_source, 'rollout_iterative': rollout_iterative,
+            'train_midstate_mode': train_midstate_mode,
+            'structured_mode': structured_mode,
+            'structured_normal_std_px': structured_normal_std_px,
+            'structured_gt_pull_px': structured_gt_pull_px,
+            'structured_noise_std_px': structured_noise_std_px,
+            'structured_segment_min_frac': structured_segment_min_frac,
+            'structured_segment_max_frac': structured_segment_max_frac,
+            'structured_max_delta_px': structured_max_delta_px,
+            'onestep_mode': onestep_mode,
+            'onestep_steps': onestep_steps,
+            'update_only_if_beats_det': update_only_if_beats_det,
+            'dump_trajectory_viz': dump_trajectory_viz,
             'distill_weight': distill_weight, 'distill_min_delta': distill_min_delta,
             'distill_compare_det': distill_compare_det, 'distill_det_margin': distill_det_margin,
+            'distill_t_late_prob': distill_t_late_prob,
+            'distill_t_late_min': distill_t_late_min,
+            'latent_policy': latent_policy, 'latent_ppo_weight': latent_ppo_weight,
+            'latent_elite_only': latent_elite_only,
+            'latent_elite_min_gain': latent_elite_min_gain,
+            'latent_elite_weight_clip': latent_elite_weight_clip,
+            'latent_ranker': latent_ranker,
+            'latent_ranker_weight': latent_ranker_weight,
+            'latent_ranker_temp': latent_ranker_temp,
+            'latent_ranker_top1': latent_ranker_top1,
+            'aligned_policy_only': aligned_policy_only,
             'ema_decay': ema_decay, 'grad_clip_norm': grad_clip_norm,
             'eval_every': eval_every, 'viz_every': viz_every, 'save_every': save_every,
             'seed': seed, 'base_ckpt': str(ckpt_path),
@@ -432,35 +546,288 @@ def main():
             'feat_hw': tuple(cnn_feature.shape[-2:]),
         }
 
+    def _sample_pretrain_state_frac(n: int, device, dtype) -> torch.Tensor:
+        """Mirror FlowMatchingEvolution.forward rich-state interpolation."""
+        if n <= 0:
+            return torch.zeros((0, 1, 1), device=device, dtype=dtype)
+        if bool(getattr(cfg, 'v4_9_use_rich_state_sampling', False)):
+            cont_p = max(float(getattr(cfg, 'v4_9_continuous_state_prob', 0.60)), 0.0)
+            disc_p = max(float(getattr(cfg, 'v4_9_discrete_state_prob', 0.0)), 0.0)
+            small_p = max(float(getattr(cfg, 'v4_9_small_state_prob', 0.25)), 0.0)
+            far_p = max(float(getattr(cfg, 'v4_9_hard_far_state_prob', 0.10)), 0.0)
+            zero_p = max(float(getattr(cfg, 'v4_9_near_zero_state_prob', 0.05)), 0.0)
+            exact_zero_p = max(float(getattr(cfg, 'v4_9_exact_zero_state_prob', 0.0)), 0.0)
+            total_p = cont_p + disc_p + small_p + far_p + zero_p + exact_zero_p
+            if total_p > 0:
+                cont_p, disc_p, small_p, far_p, zero_p, exact_zero_p = (
+                    cont_p / total_p,
+                    disc_p / total_p,
+                    small_p / total_p,
+                    far_p / total_p,
+                    zero_p / total_p,
+                    exact_zero_p / total_p,
+                )
+                draw = torch.rand(n, device=device)
+                cont_mask = draw < cont_p
+                disc_mask = (draw >= cont_p) & (draw < cont_p + disc_p)
+                small_mask = (draw >= cont_p + disc_p) & (draw < cont_p + disc_p + small_p)
+                far_mask = (
+                    (draw >= cont_p + disc_p + small_p)
+                    & (draw < cont_p + disc_p + small_p + far_p)
+                )
+                zero_start = cont_p + disc_p + small_p + far_p
+                zero_mask = (draw >= zero_start) & (draw < zero_start + zero_p)
+                exact_zero_mask = draw >= (zero_start + zero_p)
+                frac = torch.zeros(n, 1, 1, device=device, dtype=dtype)
+
+                def _sample_frac(mask, min_name, max_name, default_min, default_max):
+                    if not bool(mask.any().item()):
+                        return
+                    min_frac = min(max(float(getattr(cfg, min_name, default_min)), 0.0), 0.999)
+                    max_frac = min(max(float(getattr(cfg, max_name, default_max)), min_frac), 0.999)
+                    frac[mask] = torch.empty(
+                        int(mask.sum().item()), 1, 1,
+                        device=device, dtype=dtype,
+                    ).uniform_(min_frac, max_frac)
+
+                _sample_frac(cont_mask, 'v4_9_continuous_min_frac', 'v4_9_continuous_max_frac', 0.05, 0.85)
+                if bool(disc_mask.any().item()):
+                    fractions = getattr(cfg, 'v4_9_discrete_fractions', None)
+                    if fractions is None:
+                        fractions = getattr(cfg, 'iterative_fractions', None)
+                    if fractions:
+                        choices = torch.tensor([float(f) for f in fractions], device=device, dtype=dtype).clamp_(0.0, 0.999)
+                        choice_idx = torch.randint(0, int(choices.numel()), (int(disc_mask.sum().item()),), device=device)
+                        frac[disc_mask] = choices[choice_idx].view(-1, 1, 1)
+                if bool(small_mask.any().item()):
+                    min_frac = min(max(float(getattr(cfg, 'v4_1_small_disp_min_frac', 0.80)), 0.0), 0.999)
+                    max_frac = min(max(float(getattr(cfg, 'v4_1_small_disp_max_frac', 0.95)), min_frac), 0.999)
+                    frac[small_mask] = torch.empty(
+                        int(small_mask.sum().item()), 1, 1,
+                        device=device, dtype=dtype,
+                    ).uniform_(min_frac, max_frac)
+                _sample_frac(far_mask, 'v4_9_hard_far_min_frac', 'v4_9_hard_far_max_frac', 0.0, 0.20)
+                _sample_frac(zero_mask, 'v4_9_near_zero_min_frac', 'v4_9_near_zero_max_frac', 0.95, 0.995)
+                if bool(exact_zero_mask.any().item()):
+                    frac[exact_zero_mask] = 1.0
+                return frac
+
+        iter_steps = int(getattr(cfg, 'iterative_num_steps', 3))
+        situations = torch.randint(0, max(iter_steps, 1), (n,), device=device)
+        return situations.to(dtype=dtype).view(n, 1, 1) / float(max(iter_steps, 1))
+
     def _train_branch_context(batch):
         """Legacy V2 context; kept only for ablation/debugging."""
         net_for_load.train()
         freeze_bn_running_stats(net_for_load)
         with torch.no_grad():
             output = inner(batch['inp'], batch)
+        if train_midstate_mode:
+            oct_init = output['i_it_py'].detach()
+            i_gt = output.get('i_gt_py', None)
+            if not isinstance(i_gt, torch.Tensor) or i_gt.numel() == 0:
+                raise RuntimeError('train_midstate rollout requires i_gt_py.')
+            i_gt = _align_gt(oct_init, i_gt.detach())
+            frac = _sample_pretrain_state_frac(oct_init.size(0), oct_init.device, oct_init.dtype)
+            mid_init = oct_init + (i_gt - oct_init) * frac
+            output = dict(output)
+            output['octagon_i_it_py'] = oct_init
+            output['i_it_py'] = mid_init
+            output['i_gt_py'] = i_gt
+            output['c_it_py'] = snake_gcn_utils.img_poly_to_can_poly(mid_init)
+            output['train_midstate_frac'] = frac.detach()
         return output
 
     def _forward_for_rollout(batch):
         if rollout_source in ('manual', 'manual_gt', 'manual_gt_init', 'eval_manual'):
             return _manual_gt_init_context(batch)
+        if rollout_source in (
+            'train_state_onestep', 'train_onestep', 'train_state_structured',
+            'train_structured', 'structured', 'v3_structured',
+            'train_state_mid', 'train_midstate', 'train_state_structured_mid',
+            'train_structured_mid', 'v3b_structured', 'v3b_train_state',
+        ):
+            return _train_branch_context(batch)
         if rollout_source in ('train', 'train_branch', 'legacy'):
             return _train_branch_context(batch)
         raise ValueError(f'Unknown grpo_v2_rollout_source={rollout_source!r}')
 
+    def _disp_delta_to_latent_delta(delta_raw: torch.Tensor, contour_scale: torch.Tensor) -> torch.Tensor:
+        zero = torch.zeros_like(delta_raw)
+        return gcn.normalize_target_disp(delta_raw, contour_scale) - gcn.normalize_target_disp(zero, contour_scale)
+
+    def _structured_segment_mask(n_inst: int, n_pts: int, device, dtype) -> torch.Tensor:
+        masks = torch.zeros((n_inst, n_pts, 1), device=device, dtype=dtype)
+        min_len = max(1, int(round(n_pts * max(0.0, structured_segment_min_frac))))
+        max_len = max(min_len, int(round(n_pts * max(structured_segment_min_frac, structured_segment_max_frac))))
+        max_len = min(max_len, n_pts)
+        for bi in range(n_inst):
+            seg_len = int(torch.randint(min_len, max_len + 1, (1,), device=device).item())
+            start = int(torch.randint(0, n_pts, (1,), device=device).item())
+            idx = (torch.arange(seg_len, device=device) + start) % n_pts
+            if seg_len <= 1:
+                win = torch.ones((1,), device=device, dtype=dtype)
+            else:
+                win = torch.hann_window(seg_len + 2, periodic=False, device=device, dtype=dtype)[1:-1]
+                win = win.clamp_min(0.05)
+            masks[bi, idx, 0] = win
+        return masks
+
+    def _structured_latent_delta(x_latent: torch.Tensor, i_init: torch.Tensor,
+                                 i_gt: torch.Tensor, contour_scale: torch.Tensor) -> torch.Tensor:
+        i_gt = _align_gt(i_init, i_gt)
+        cur_disp = gcn.denormalize_pred_disp(x_latent, contour_scale)
+        cur_poly = i_init + cur_disp
+        prev_p = torch.roll(cur_poly, shifts=1, dims=1)
+        next_p = torch.roll(cur_poly, shifts=-1, dims=1)
+        tangent = next_p - prev_p
+        normal = torch.stack([-tangent[..., 1], tangent[..., 0]], dim=-1)
+        normal = normal / normal.norm(dim=-1, keepdim=True).clamp_min(1e-6)
+
+        # Nearest-GT vector gives a supervised direction for exploration only.
+        dist = torch.cdist(cur_poly.float(), i_gt.float()).to(dtype=cur_poly.dtype)
+        nn_idx = dist.argmin(dim=-1)
+        nearest_gt = torch.gather(i_gt, 1, nn_idx.unsqueeze(-1).expand(-1, -1, 2))
+        gt_vec = nearest_gt - cur_poly
+        gt_on_normal = (gt_vec * normal).sum(dim=-1, keepdim=True) * normal
+
+        down = max(float(snake_config.down_ratio), 1.0)
+        normal_std = structured_normal_std_px / down
+        gt_pull = structured_gt_pull_px / down
+        noise_std = structured_noise_std_px / down
+        max_delta = structured_max_delta_px / down
+
+        seg_mask = _structured_segment_mask(cur_poly.size(0), cur_poly.size(1), cur_poly.device, cur_poly.dtype)
+        normal_delta = torch.randn((cur_poly.size(0), cur_poly.size(1), 1), device=cur_poly.device, dtype=cur_poly.dtype) * normal_std * normal
+        gt_norm = gt_vec.norm(dim=-1, keepdim=True).clamp_min(1e-6)
+        gt_step = gt_on_normal / gt_norm * torch.minimum(gt_norm, torch.full_like(gt_norm, gt_pull))
+        noise_delta = torch.randn_like(cur_poly) * noise_std
+        delta_raw = seg_mask * (normal_delta + gt_step + noise_delta)
+
+        delta_norm = delta_raw.norm(dim=-1, keepdim=True).clamp_min(1e-6)
+        delta_raw = delta_raw * torch.clamp(max_delta / delta_norm, max=1.0)
+        return _disp_delta_to_latent_delta(delta_raw, contour_scale)
+
     @torch.no_grad()
-    def _sample_rollout(output, action_std):
+    def _sample_rollout(output, action_std, steps_override=None, noise_scale_override=None):
         cnn_feature = output['cnn_feature']
         i_init = output['i_it_py']
         c_init = output['c_it_py']
         py_ind = output['py_ind']
+        i_gt = output.get('i_gt_py', None)
+        local_rollout_steps = int(steps_override) if steps_override is not None else rollout_steps
+        local_noise_scale = rollout_noise_scale if noise_scale_override is None else noise_scale_override
+        if structured_mode:
+            if not isinstance(i_gt, torch.Tensor) or i_gt.numel() == 0:
+                raise RuntimeError('structured rollout requires i_gt_py in output.')
+            local_steps = max(int(onestep_steps), 1)
+            if local_noise_scale is None:
+                local_noise_scale = 1.0
+            ctx = gcn.prepare_sampling_context(cnn_feature, i_init, py_ind)
+            x = torch.randn_like(i_init) * float(local_noise_scale)
+            if window_size and window_size > 0:
+                start_min = int(window_range[0]) if isinstance(window_range, (tuple, list)) and len(window_range) > 0 else 0
+                end_max = int(window_range[1]) if isinstance(window_range, (tuple, list)) and len(window_range) > 1 else local_steps
+                end_max = max(end_max, window_size)
+                if end_max <= start_min + window_size:
+                    s = max(0, min(start_min, max(local_steps - window_size, 0)))
+                else:
+                    s = int(np.random.randint(start_min, end_max - window_size + 1))
+                e = min(s + window_size, local_steps)
+            else:
+                s, e = 0, local_steps
+
+            ret = {
+                'latents': [], 'log_probs': [], 'timesteps': [], 'step_indices': [],
+                'x_ts': [], 'x_prevs': [], 'x_self_conds': [],
+                'sampled_feat': ctx['sampled_feat'], 'detail_feat': ctx['detail_feat'],
+                'contour_scale': ctx['contour_scale'],
+            }
+            x_self_cond = torch.zeros_like(x) if getattr(gcn, '_use_self_conditioning', False) else None
+            dt = 1.0 / float(local_steps)
+            for idx in range(local_steps):
+                t_value = idx * dt
+                in_policy_window = idx >= s and idx < e
+                if in_policy_window:
+                    x_mean, _, step_mean, _, next_self_cond = gcn.step_with_logprob(
+                        cnn_feature, i_init, c_init, py_ind,
+                        x_t=x, t_value=t_value, step_index=idx, total_steps=local_steps,
+                        action_std=0.0, prev_sample=None,
+                        sampled_feat=ctx['sampled_feat'], detail_feat=ctx['detail_feat'],
+                        contour_scale=ctx['contour_scale'], x_self_cond=x_self_cond,
+                        step_mode=step_mode, noise_level=noise_level, sde_type=sde_type,
+                    )
+                    x_struct = step_mean + _structured_latent_delta(step_mean, i_init, i_gt, ctx['contour_scale'])
+                    x_prev, log_prob, _, _, next_self_cond = gcn.step_with_logprob(
+                        cnn_feature, i_init, c_init, py_ind,
+                        x_t=x, t_value=t_value, step_index=idx, total_steps=local_steps,
+                        action_std=action_std, prev_sample=x_struct,
+                        sampled_feat=ctx['sampled_feat'], detail_feat=ctx['detail_feat'],
+                        contour_scale=ctx['contour_scale'], x_self_cond=x_self_cond,
+                        step_mode=step_mode, noise_level=noise_level, sde_type=sde_type,
+                    )
+                    ret['log_probs'].append(log_prob.detach())
+                    ret['timesteps'].append(torch.tensor(t_value, device=i_init.device, dtype=x.dtype))
+                    ret['step_indices'].append(torch.tensor(idx, device=i_init.device, dtype=torch.long))
+                    ret['x_ts'].append(x.detach())
+                    ret['x_prevs'].append(x_prev.detach())
+                    ret['x_self_conds'].append(None if x_self_cond is None else x_self_cond.detach())
+                    ret['latents'].append(x.detach())
+                else:
+                    x_prev, _, _, _, next_self_cond = gcn.step_with_logprob(
+                        cnn_feature, i_init, c_init, py_ind,
+                        x_t=x, t_value=t_value, step_index=idx, total_steps=local_steps,
+                        action_std=0.0, prev_sample=None,
+                        sampled_feat=ctx['sampled_feat'], detail_feat=ctx['detail_feat'],
+                        contour_scale=ctx['contour_scale'], x_self_cond=x_self_cond,
+                        step_mode=step_mode, noise_level=noise_level, sde_type=sde_type,
+                    )
+                x = x_prev.detach()
+                if getattr(gcn, '_use_self_conditioning', False):
+                    x_self_cond = next_self_cond
+            ret['disp'] = gcn.denormalize_pred_disp(x, ctx['contour_scale'])
+            ret['py'] = i_init + ret['disp']
+            n_log = len(ret['log_probs'])
+            ret['cnn_features'] = [cnn_feature.detach()] * n_log
+            ret['i_inits'] = [i_init.detach()] * n_log
+            ret['c_inits'] = [c_init.detach()] * n_log
+            ret['py_inds'] = [py_ind.detach()] * n_log
+            ret['sampled_feats'] = [ctx['sampled_feat'].detach()] * n_log
+            ret['detail_feats'] = [None if ctx.get('detail_feat') is None else ctx['detail_feat'].detach()] * n_log
+            ret['contour_scales'] = [ctx['contour_scale'].detach()] * n_log
+            ret['total_steps'] = [torch.tensor(local_steps, device=i_init.device, dtype=torch.long)] * n_log
+            return ret
+        if onestep_mode:
+            local_steps = max(int(onestep_steps), 1)
+            ret = gcn.sample_with_logprob(
+                cnn_feature, i_init, c_init, py_ind,
+                steps=local_steps,
+                window_size=window_size,
+                window_range=window_range,
+                action_std=action_std,
+                noise_scale=local_noise_scale,
+                step_mode=step_mode,
+                noise_level=noise_level,
+                sde_type=sde_type,
+            )
+            n_log = len(ret.get('log_probs', []))
+            ret['cnn_features'] = [cnn_feature.detach()] * n_log
+            ret['i_inits'] = [i_init.detach()] * n_log
+            ret['c_inits'] = [c_init.detach()] * n_log
+            ret['py_inds'] = [py_ind.detach()] * n_log
+            ret['sampled_feats'] = [ret['sampled_feat'].detach()] * n_log
+            ret['detail_feats'] = [None if ret.get('detail_feat') is None else ret['detail_feat'].detach()] * n_log
+            ret['contour_scales'] = [ret['contour_scale'].detach()] * n_log
+            ret['total_steps'] = [torch.tensor(local_steps, device=i_init.device, dtype=torch.long)] * n_log
+            return ret
         if rollout_iterative and getattr(gcn, 'use_iterative_refinement', False):
             iter_steps = int(getattr(cfg, 'iterative_num_steps', 3))
             fractions = list(getattr(cfg, 'iterative_fractions', []))
             if not fractions:
                 fractions = [1.0 / (iter_steps - i) for i in range(iter_steps)]
-            iter_ode_steps = int(getattr(cfg, 'iterative_ode_steps', getattr(cfg, 'iterative_ddim_steps', rollout_steps)))
+            iter_ode_steps = int(getattr(cfg, 'iterative_ode_steps', getattr(cfg, 'iterative_ddim_steps', local_rollout_steps)))
             if iter_ode_steps <= 0:
-                iter_ode_steps = rollout_steps
+                iter_ode_steps = local_rollout_steps
 
             current = i_init.detach()
             total_disp = torch.zeros_like(i_init)
@@ -470,6 +837,7 @@ def main():
                 'cnn_features': [], 'i_inits': [], 'c_inits': [], 'py_inds': [],
                 'sampled_feats': [], 'detail_feats': [], 'contour_scales': [],
                 'total_steps': [],
+                'latent_x0s': [], 'latent_log_probs': [], 'latent_sampled_feats': [], 'latent_noise_scales': [],
             }
             for frac in fractions[:iter_steps]:
                 c_cur = snake_gcn_utils.img_poly_to_can_poly(current)
@@ -477,6 +845,10 @@ def main():
                     cnn_feature, current, c_cur, py_ind,
                     steps=iter_ode_steps, window_size=window_size,
                     window_range=window_range, action_std=action_std,
+                    noise_scale=local_noise_scale,
+                    step_mode=step_mode,
+                    noise_level=noise_level,
+                    sde_type=sde_type,
                 )
                 n_log = len(ret.get('log_probs', []))
                 if n_log > 0:
@@ -495,17 +867,28 @@ def main():
                     merged['detail_feats'].extend([None if ret.get('detail_feat') is None else ret['detail_feat'].detach()] * n_log)
                     merged['contour_scales'].extend([ret['contour_scale'].detach()] * n_log)
                     merged['total_steps'].extend([torch.tensor(iter_ode_steps, device=i_init.device, dtype=torch.long)] * n_log)
+                if isinstance(ret.get('latent_log_prob', None), torch.Tensor):
+                    merged['latent_x0s'].append(ret['latent_x0'].detach())
+                    merged['latent_log_probs'].append(ret['latent_log_prob'].detach())
+                    merged['latent_sampled_feats'].append(ret['sampled_feat'].detach())
+                    merged['latent_noise_scales'].append(float(ret.get('latent_noise_scale', local_noise_scale or getattr(gcn, '_flow_train_noise_scale', 1.0))))
                 applied = ret['disp'] * float(frac)
                 current = (current + applied).detach()
                 total_disp = total_disp + applied
             merged['disp'] = total_disp
             merged['py'] = i_init + total_disp
+            if merged['latent_log_probs']:
+                merged['latent_log_prob'] = torch.stack(merged['latent_log_probs'], dim=0).sum(dim=0)
             return merged
 
         ret = gcn.sample_with_logprob(
             cnn_feature, i_init, c_init, py_ind,
-            steps=rollout_steps, window_size=window_size,
+            steps=local_rollout_steps, window_size=window_size,
             window_range=window_range, action_std=action_std,
+            noise_scale=local_noise_scale,
+            step_mode=step_mode,
+            noise_level=noise_level,
+            sde_type=sde_type,
         )
         n_log = len(ret.get('log_probs', []))
         ret['cnn_features'] = [cnn_feature.detach()] * n_log
@@ -515,8 +898,53 @@ def main():
         ret['sampled_feats'] = [ret['sampled_feat'].detach()] * n_log
         ret['detail_feats'] = [None if ret.get('detail_feat') is None else ret['detail_feat'].detach()] * n_log
         ret['contour_scales'] = [ret['contour_scale'].detach()] * n_log
-        ret['total_steps'] = [torch.tensor(rollout_steps, device=i_init.device, dtype=torch.long)] * n_log
+        ret['total_steps'] = [torch.tensor(local_rollout_steps, device=i_init.device, dtype=torch.long)] * n_log
         return ret
+
+    @torch.no_grad()
+    def _sample_deterministic_policy(output):
+        cnn_feature = output['cnn_feature']
+        i_init = output['i_it_py']
+        c_init = output['c_it_py']
+        py_ind = output['py_ind']
+        local_det_steps = det_rollout_steps
+        if onestep_mode:
+            local_steps = int(local_det_steps) if int(local_det_steps) > 0 else max(int(onestep_steps), 1)
+            disp = gcn.sample_disp(
+                cnn_feature, i_init, c_init, py_ind,
+                steps=local_steps,
+            )
+            return {'disp': disp, 'py': i_init + disp}
+        if getattr(gcn, 'use_iterative_refinement', False):
+            iter_steps = int(getattr(cfg, 'iterative_num_steps', 3))
+            fractions = list(getattr(cfg, 'iterative_fractions', []))
+            if not fractions:
+                fractions = [1.0 / (iter_steps - i) for i in range(iter_steps)]
+            iter_ode_steps = int(getattr(cfg, 'iterative_ode_steps', getattr(cfg, 'iterative_ddim_steps', rollout_steps)))
+            if local_det_steps > 0:
+                iter_ode_steps = local_det_steps
+            disp = gcn.sample_disp_iterative(
+                cnn_feature, i_init, c_init, py_ind,
+                num_iter_steps=iter_steps,
+                fractions=fractions,
+                ode_steps=iter_ode_steps,
+            )
+        else:
+            disp = gcn.sample_disp(
+                cnn_feature, i_init, c_init, py_ind,
+                steps=(local_det_steps if local_det_steps > 0 else rollout_steps),
+            )
+        return {'disp': disp, 'py': i_init + disp}
+
+    def _sample_distill_t(n: int, device, dtype):
+        t = gcn.sample_train_t(n, device=device, dtype=dtype)
+        p = min(max(float(distill_t_late_prob), 0.0), 1.0)
+        if p <= 0.0:
+            return t
+        late_min = min(max(float(distill_t_late_min), 0.0), 0.999)
+        mask = torch.rand(n, 1, 1, device=device, dtype=dtype) < p
+        late_t = torch.empty(n, 1, 1, device=device, dtype=dtype).uniform_(late_min, 1.0)
+        return torch.where(mask, late_t, t)
 
     def _compute_rewards(output, ret):
         i_init = output['i_it_py']
@@ -539,18 +967,36 @@ def main():
         init_score = compute_region_score(
             i_init, i_gt, H=H_img, W=W_img,
             w_boundary=reward_w_region, w_dice=reward_w_dice, w_iou=reward_w_iou,
+            w_dist=reward_w_dist,
+            dist_max_px=reward_dist_max_px,
+            dist_quantile=reward_dist_quantile,
+            dist_quantile_weight=reward_dist_quantile_weight,
             coord_scale=float(snake_config.down_ratio),
         ).detach()
         final_score = compute_region_reward(
             i_init, ret['disp'], i_gt, H=H_img, W=W_img,
             w1=reward_w_region, w_dice=reward_w_dice, w_iou=reward_w_iou,
+            w_dist=reward_w_dist,
+            dist_max_px=reward_dist_max_px,
+            dist_quantile=reward_dist_quantile,
+            dist_quantile_weight=reward_dist_quantile_weight,
             coord_scale=float(snake_config.down_ratio),
         ).detach()
         delta = (final_score - init_score)
-        reward = reward_abs_w * final_score + reward_delta_w * delta
+        final_poly = i_init + ret['disp']
+        coord_scale = float(snake_config.down_ratio)
+        lap_final = _contour_laplacian_px(final_poly, coord_scale).norm(dim=-1)
+        lap_gt = _contour_laplacian_px(i_gt, coord_scale).norm(dim=-1)
+        lap_disp = _contour_laplacian_px(ret['disp'], coord_scale).norm(dim=-1)
+        excess_burr = torch.relu(lap_final - lap_gt - float(reward_burr_margin_px))
+        burr_raw = 0.5 * lap_disp.mean(dim=1) + 0.5 * excess_burr.mean(dim=1)
+        burr_penalty = torch.clamp(burr_raw / max(float(reward_burr_max_px), 1e-6), min=0.0, max=2.0).detach()
+        reward = reward_abs_w * final_score + reward_delta_w * delta - reward_burr_weight * burr_penalty
         return {
             'final_score': final_score, 'init_score': init_score,
             'delta_score': delta, 'reward': reward,
+            'burr_penalty': burr_penalty,
+            'burr_raw_px': burr_raw.detach(),
         }
 
     @torch.no_grad()
@@ -644,6 +1090,8 @@ def main():
     action_std = float(action_std0)
 
     for step in range(1, train_steps + 1):
+        import time as _time_module
+        _t_step_start = _time_module.time()
         # keep BN running stats frozen (eval/train mode toggles can re-enable them)
         freeze_bn_running_stats(inner)
         # ---- get batch
@@ -653,6 +1101,8 @@ def main():
             it = iter(data_loader)
             batch = next(it)
         _move_batch(batch)
+        if step <= 3:
+            print(f'[TIME] step={step} batch_loaded: {_time_module.time()-_t_step_start:.2f}s', flush=True)
 
         # ---- forward (no grad) to get the rollout context
         output = _forward_for_rollout(batch)
@@ -664,6 +1114,8 @@ def main():
         if (not isinstance(i_init, torch.Tensor)) or i_init.numel() == 0 or (not isinstance(i_gt, torch.Tensor)):
             print(f'[GRPO-V2] step {step}: empty contour batch, skipping.')
             continue
+        if step <= 3:
+            print(f'[TIME] step={step} fwd_done B={i_init.shape[0]}: {_time_module.time()-_t_step_start:.2f}s', flush=True)
         i_gt_aligned = _align_gt(i_init, i_gt)
         base_device = cnn_feature.device
 
@@ -672,14 +1124,30 @@ def main():
         rewards_list = []
         final_scores_list = []
         delta_scores_list = []
+        burr_penalty_list = []
+        burr_raw_list = []
         disp_list = []
         old_logs_list = []  # (k, B, T)
-        for _ in range(k):
+        old_latent_logs_list = []  # (k, B)
+        step_log_count_list = []
+        for ri_dbg in range(k):
             ret = _sample_rollout(output, action_std)
-            if not isinstance(ret.get('log_probs', None), list) or len(ret['log_probs']) == 0:
+            if step <= 3 and ri_dbg == 0:
+                print(f'[TIME] step={step} rollout0_done: {_time_module.time()-_t_step_start:.2f}s', flush=True)
+            step_logs = ret.get('log_probs', [])
+            has_step_logs = isinstance(step_logs, list) and len(step_logs) > 0
+            latent_old_log = ret.get('latent_log_prob', None) if latent_policy else None
+            has_latent_log = isinstance(latent_old_log, torch.Tensor)
+            if (not has_step_logs) and (not has_latent_log):
                 continue
-            old_log = torch.stack(ret['log_probs'], dim=0).transpose(0, 1).contiguous().detach()
+            if has_step_logs:
+                old_log = torch.stack(step_logs, dim=0).transpose(0, 1).contiguous().detach()
+            else:
+                old_log = torch.empty((i_init.size(0), 0), device=base_device, dtype=i_init.dtype)
+            _t_rew = _time_module.time()
             rew = _compute_rewards(output, ret)
+            if step <= 3 and ri_dbg == 0:
+                print(f'[TIME] step={step} reward0: {_time_module.time()-_t_rew:.3f}s total={_time_module.time()-_t_step_start:.2f}s', flush=True)
             rollouts.append({
                 'x_ts': [x.detach() for x in ret['x_ts']],
                 'x_prevs': [x.detach() for x in ret['x_prevs']],
@@ -694,20 +1162,38 @@ def main():
                 'detail_feats': [None if x is None else x.detach() for x in ret.get('detail_feats', [])],
                 'contour_scales': [x.detach() for x in ret.get('contour_scales', [])],
                 'total_steps': [s.detach() for s in ret.get('total_steps', [])],
+                'latent_x0': None if ret.get('latent_x0', None) is None else ret['latent_x0'].detach(),
+                'latent_x0s': [x.detach() for x in ret.get('latent_x0s', [])],
+                'latent_sampled_feat': None if ret.get('sampled_feat', None) is None else ret['sampled_feat'].detach(),
+                'latent_sampled_feats': [x.detach() for x in ret.get('latent_sampled_feats', [])],
+                'latent_noise_scale': float(ret.get('latent_noise_scale', rollout_noise_scale or getattr(gcn, '_flow_train_noise_scale', 1.0))),
+                'latent_noise_scales': list(ret.get('latent_noise_scales', [])),
             })
             old_logs_list.append(old_log)
+            old_latent_logs_list.append(latent_old_log.detach() if has_latent_log else None)
+            step_log_count_list.append(int(old_log.size(1)))
             rewards_list.append(rew['reward'])
             final_scores_list.append(rew['final_score'])
             delta_scores_list.append(rew['delta_score'])
+            burr_penalty_list.append(rew['burr_penalty'])
+            burr_raw_list.append(rew['burr_raw_px'])
             disp_list.append(ret['disp'].detach())
 
         if len(rollouts) == 0:
             print(f'[GRPO-V2] step {step}: zero valid rollouts, skipping.')
             continue
+        if aligned_policy_only and not any(n > 0 for n in step_log_count_list):
+            raise RuntimeError(
+                'aligned policy mode collected no step logprobs; check action_std/window_size/window_range.'
+            )
 
+        if step <= 3:
+            print(f'[TIME] step={step} all_rollouts_done: {_time_module.time()-_t_step_start:.2f}s', flush=True)
         rewards = torch.stack(rewards_list, dim=0).to(base_device)         # (k, B)
         final_scores = torch.stack(final_scores_list, dim=0).to(base_device)
         delta_scores = torch.stack(delta_scores_list, dim=0).to(base_device)
+        burr_penalties = torch.stack(burr_penalty_list, dim=0).to(base_device)
+        burr_raw_px = torch.stack(burr_raw_list, dim=0).to(base_device)
         disp_stack = torch.stack(disp_list, dim=0).to(base_device)
 
         # ---- Deterministic baseline for quality-gated distillation
@@ -715,9 +1201,9 @@ def main():
         # current model's "floor" score. The distillation gate then ensures we
         # only distill stochastic trajectories that genuinely beat this floor.
         det_scores = None
-        if distill_weight > 0 and distill_compare_det:
+        if distill_compare_det and (distill_weight > 0 or latent_policy or aligned_policy_only):
             try:
-                det_ret = _sample_rollout(output, 0.0)
+                det_ret = _sample_deterministic_policy(output)
                 rew_det = _compute_rewards(output, det_ret)
                 det_scores = rew_det['final_score'].to(base_device).detach()  # (B,)
             except Exception as e:
@@ -725,15 +1211,23 @@ def main():
                 det_scores = None
 
 
-        # EMA tracked for monitoring only; no longer used as a bias term, since
-        # subtracting (batch_reward - ema_reward) injects a non-zero advantage
-        # mean and pushes the policy in arbitrary directions when the batch
-        # reward fluctuates.
-        group_baseline = rewards.mean(dim=0, keepdim=True)
+        if distill_compare_det and det_scores is not None:
+            quality_scores = final_scores - det_scores.unsqueeze(0)
+        else:
+            quality_scores = delta_scores
         ema_now = ema_reward.update(float(rewards.mean()))
-        advantages = rewards - group_baseline
+        # When a deterministic baseline is available, compare each rollout
+        # directly against the current deployed policy. This gives PPO a
+        # meaningful signal even when every stochastic rollout in the group is
+        # "bad" in absolute terms but some are less bad than others.
+        use_det_advantage = bool(distill_compare_det and det_scores is not None and (action_std > 0.0 or latent_policy))
+        if use_det_advantage:
+            advantages = quality_scores
+        else:
+            group_baseline = rewards.mean(dim=0, keepdim=True)
+            advantages = rewards - group_baseline
         # Dampened normalization: floor std so we don't amplify within-group noise
-        adv_std = rewards.std(dim=0, unbiased=False, keepdim=True).clamp_min(0.1)
+        adv_std = advantages.std(dim=0, unbiased=False, keepdim=True).clamp_min(0.1)
         advantages = (advantages / adv_std).clamp(-adv_clip_max, adv_clip_max).detach()
 
         # ---- Group-quality gate: zero advantage for batch indices where the
@@ -741,9 +1235,10 @@ def main():
         # prevents the policy from being pushed toward the "least bad" sample
         # in groups where every rollout is worse than the supervised baseline.
         gate_margin = float(cfg.train.get('grpo_v2_gate_margin', 0.0))
-        delta_best = delta_scores.max(dim=0, keepdim=True).values  # (1, B)
-        gate_mask = (delta_best > gate_margin).float()  # (1, B)
-        advantages = advantages * gate_mask
+        quality_best = quality_scores.max(dim=0, keepdim=True).values  # (1, B)
+        gate_mask = (quality_best > gate_margin).float()  # (1, B)
+        if update_only_if_beats_det or not use_det_advantage:
+            advantages = advantages * gate_mask
         gate_active_frac = float(gate_mask.mean().item())
 
         # ---- prepare sampling context once
@@ -757,8 +1252,22 @@ def main():
         policy_loss_history = []
         kl_loss_history = []
         grad_norm_history = []
+        latent_policy_loss_history = []
+        latent_kl_history = []
+        latent_ratio_history = []
+        latent_grad_norm_history = []
+        ranker_loss_val = 0.0
+        ranker_grad_norm = 0.0
+        ranker_top1_acc = 0.0
         early_stop_epoch = ppo_inner_epochs
-        for epoch in range(ppo_inner_epochs):
+        # At action_std=0, log_prob=0 everywhere so ratio=1 and PPO gradient is
+        # identically zero.  Skip the entire PPO loop to avoid K×T wasted forward
+        # passes (e.g. 16×60=960 ops per step).  The distillation block below is
+        # the sole gradient source and is unaffected by this skip.
+        _run_ppo = (action_std > 0.0)
+        if aligned_policy_only and not _run_ppo:
+            raise RuntimeError('aligned policy mode requires active PPO/GRPO step-action update.')
+        for epoch in range(ppo_inner_epochs if _run_ppo else 0):
             total_steps_in_epoch = sum(len(t['x_ts']) for t in rollouts)
             if total_steps_in_epoch == 0:
                 break
@@ -801,6 +1310,9 @@ def main():
                         detail_feat=step_detail_feat,
                         contour_scale=step_contour_scale,
                         x_self_cond=x_self_cond,
+                        step_mode=step_mode,
+                        noise_level=noise_level,
+                        sde_type=sde_type,
                     )
                     old_log_s = old_logs[:, s_idx]
                     ratio = torch.exp(lp_cur - old_log_s)
@@ -815,7 +1327,7 @@ def main():
                         ep_clipfrac.append(((ratio - 1.0).abs() > ppo_clip).float().mean().item())
                         ep_ratio.append(ratio.detach())
 
-                    # KL to frozen ref (gaussian mean alignment)
+                    # KL to frozen ref transition mean under the active step model.
                     if kl_beta > 0:
                         with torch.no_grad():
                             _, _, mean_ref, _, _ = ref_flow.step_with_logprob(
@@ -833,13 +1345,19 @@ def main():
                                 detail_feat=step_detail_feat,
                                 contour_scale=step_contour_scale,
                                 x_self_cond=x_self_cond,
+                                step_mode=step_mode,
+                                noise_level=noise_level,
+                                sde_type=sde_type,
                             )
                         var = std_cur.pow(2).clamp_min(1e-12)
                         kl_term = (((mean_cur - mean_ref) ** 2) / (2.0 * var)).mean()
                         loss_term = loss_term + kl_beta * kl_term / float(total_steps_in_epoch)
                         kl_loss_sum += float(kl_term.detach().item())
                         kl_terms += 1
-                    loss_term.backward()
+                    # At action_std=0 log_prob=0 (no grad), so policy_term
+                    # is a constant – skip backward to avoid RuntimeError.
+                    if loss_term.requires_grad:
+                        loss_term.backward()
 
             gnorm = torch.nn.utils.clip_grad_norm_(
                 [p for p in net_for_load.parameters() if p.requires_grad],
@@ -861,70 +1379,255 @@ def main():
                 early_stop_epoch = epoch + 1
                 break
 
-        # ---- decay action std
-        action_std = max(action_std_min, action_std * action_std_decay)
-
-        # ---- Best-of-k trajectory distillation
-        # PPO's policy-gradient signal is very small for this already-strong
-        # model. When exploration finds a rollout that truly improves over the
-        # deterministic init, directly distill its final displacement into the
-        # flow-matching denoiser so the deterministic mean can inherit it.
-        distill_loss_val = 0.0
-        distill_active_frac = 0.0
-        distill_grad_norm = 0.0
-        if distill_weight > 0 and disp_stack.numel() > 0:
-            best_idx = torch.argmax(final_scores, dim=0)  # (B,)
-            arange_b = torch.arange(disp_stack.size(1), device=base_device)
-            target_disp = disp_stack[best_idx, arange_b].detach()
-            # Gating: only distill trajectories that genuinely beat the current
-            # deterministic model (when det baseline is available), otherwise fall
-            # back to the original YOLO-init delta gate.
-            if distill_compare_det and det_scores is not None:
-                active = (final_scores[best_idx, arange_b] > det_scores + distill_det_margin).detach()
-            else:
-                active = (delta_scores[best_idx, arange_b] > distill_min_delta).detach()
-            distill_active_frac = float(active.float().mean().item()) if active.numel() else 0.0
-            if active.any():
-                contour_scale = gcn.compute_contour_scale(i_init).detach()
-                x1 = gcn.normalize_target_disp(target_disp, contour_scale).detach()
-                n_active = int(active.sum().item())
-                t = gcn.sample_train_t(i_init.size(0), device=base_device, dtype=x1.dtype)
-                x0 = gcn.sample_train_x0(x1).detach()
-                x_t = (1.0 - t) * x0 + t * x1
-                contour_scale_flat = contour_scale.view(-1).to(device=base_device, dtype=x1.dtype)
-                with torch.no_grad():
-                    distill_ctx = gcn.prepare_sampling_context(cnn_feature.detach(), i_init, py_ind)
-                v_pred, l_reg = gcn.predict_velocity(
-                    cnn_feature.detach(),
-                    i_init,
-                    c_init,
-                    distill_ctx['sampled_feat'],
-                    distill_ctx['detail_feat'],
-                    py_ind,
-                    x_t,
-                    t.view(-1),
-                    contour_scale=contour_scale_flat,
-                    x_self_cond=None,
-                )
-                v_target = (x1 - x0).detach()
-                distill_loss = F.mse_loss(v_pred[active], v_target[active], reduction='mean')
-                if isinstance(l_reg, torch.Tensor):
-                    distill_loss = distill_loss + l_reg.mean() * 0.0
-                # Clip to prevent catastrophic updates from outlier batches
-                if distill_loss_clip > 0.0:
-                    distill_loss = distill_loss.clamp(max=distill_loss_clip)
+        if latent_policy and any(x is not None for x in old_latent_logs_list):
+            for epoch in range(ppo_inner_epochs):
                 optimizer.zero_grad(set_to_none=True)
-                (distill_weight * distill_loss).backward()
-                dgnorm = torch.nn.utils.clip_grad_norm_(
+                latent_terms = []
+                ep_latent_kl = []
+                ep_latent_ratio = []
+                for ri, traj in enumerate(rollouts):
+                    old_latent_log = old_latent_logs_list[ri]
+                    latent_x0 = traj.get('latent_x0', None)
+                    latent_sampled_feat = traj.get('latent_sampled_feat', None)
+                    latent_x0s = traj.get('latent_x0s', [])
+                    latent_sampled_feats = traj.get('latent_sampled_feats', [])
+                    has_joint_latents = bool(latent_x0s and latent_sampled_feats)
+                    if old_latent_log is None:
+                        continue
+                    if (not has_joint_latents) and (latent_x0 is None or latent_sampled_feat is None):
+                        continue
+                    adv = advantages[ri]
+                    latent_noise_scales = traj.get('latent_noise_scales', [])
+                    if has_joint_latents:
+                        lp_parts = []
+                        for j, (x0_j, sf_j) in enumerate(zip(latent_x0s, latent_sampled_feats)):
+                            ns_j = latent_noise_scales[j] if j < len(latent_noise_scales) else traj.get('latent_noise_scale', rollout_noise_scale or getattr(gcn, '_flow_train_noise_scale', 1.0))
+                            lp_parts.append(gcn.initial_latent_logprob(sf_j, x0_j, float(ns_j)))
+                        lp_cur = torch.stack(lp_parts, dim=0).sum(dim=0)
+                    else:
+                        lp_cur = gcn.initial_latent_logprob(
+                            latent_sampled_feat,
+                            latent_x0,
+                            float(traj.get('latent_noise_scale', rollout_noise_scale or getattr(gcn, '_flow_train_noise_scale', 1.0))),
+                        )
+                    old_latent_log = old_latent_log.to(device=lp_cur.device, dtype=lp_cur.dtype)
+                    ratio = torch.exp(lp_cur - old_latent_log)
+                    if latent_elite_only:
+                        elite_w = (quality_scores[ri].detach() - latent_elite_min_gain).clamp_min(0.0)
+                        if not bool((elite_w > 0).any().item()):
+                            continue
+                        elite_w = elite_w / elite_w.mean().clamp_min(1e-6)
+                        if latent_elite_weight_clip > 0:
+                            elite_w = elite_w.clamp_max(latent_elite_weight_clip)
+                        latent_terms.append(-(elite_w * lp_cur).mean())
+                    else:
+                        unclipped = -adv * ratio
+                        clipped = -adv * torch.clamp(ratio, 1.0 - ppo_clip, 1.0 + ppo_clip)
+                        latent_terms.append(torch.maximum(unclipped, clipped).mean())
+                    with torch.no_grad():
+                        ep_latent_kl.append(0.5 * torch.mean((lp_cur - old_latent_log) ** 2).item())
+                        ep_latent_ratio.append(ratio.detach())
+                if not latent_terms:
+                    break
+                latent_loss = latent_ppo_weight * (sum(latent_terms) / float(len(latent_terms)))
+                if latent_loss.requires_grad:
+                    latent_loss.backward()
+                    lgnorm = torch.nn.utils.clip_grad_norm_(
+                        [p for p in net_for_load.parameters() if p.requires_grad],
+                        max_norm=grad_clip_norm,
+                    )
+                    optimizer.step()
+                    latent_grad_norm_history.append(float(lgnorm.item() if hasattr(lgnorm, 'item') else float(lgnorm)))
+                latent_policy_loss_history.append(float(latent_loss.detach().item()))
+                latent_kl = float(np.mean(ep_latent_kl)) if ep_latent_kl else 0.0
+                latent_kl_history.append(latent_kl)
+                if ep_latent_ratio:
+                    latent_ratio_history.append(torch.cat(ep_latent_ratio))
+                if latent_kl > ppo_kl_target:
+                    break
+
+        if latent_ranker and latent_ranker_weight > 0.0:
+            ranker_scores = []
+            for traj in rollouts:
+                latent_x0s = traj.get('latent_x0s', [])
+                latent_sampled_feats = traj.get('latent_sampled_feats', [])
+                if latent_x0s and latent_sampled_feats:
+                    score_parts = [
+                        gcn.latent_ranker_score(sf_j, x0_j)
+                        for x0_j, sf_j in zip(latent_x0s, latent_sampled_feats)
+                    ]
+                    ranker_scores.append(torch.stack(score_parts, dim=0).sum(dim=0))
+                else:
+                    latent_x0 = traj.get('latent_x0', None)
+                    latent_sampled_feat = traj.get('latent_sampled_feat', None)
+                    if latent_x0 is None or latent_sampled_feat is None:
+                        continue
+                    ranker_scores.append(gcn.latent_ranker_score(latent_sampled_feat, latent_x0))
+            if len(ranker_scores) == len(rollouts):
+                score_stack = torch.stack(ranker_scores, dim=0)  # (K, B)
+                target = quality_scores.detach()
+                target_top = target.argmax(dim=0)
+                if latent_ranker_top1:
+                    ranker_loss = F.cross_entropy(score_stack.transpose(0, 1), target_top)
+                else:
+                    temp = max(float(latent_ranker_temp), 1e-6)
+                    target_prob = torch.softmax(target / temp, dim=0)
+                    pred_logprob = torch.log_softmax(score_stack, dim=0)
+                    ranker_loss = -(target_prob * pred_logprob).sum(dim=0).mean()
+                optimizer.zero_grad(set_to_none=True)
+                (latent_ranker_weight * ranker_loss).backward()
+                rgnorm = torch.nn.utils.clip_grad_norm_(
                     [p for p in net_for_load.parameters() if p.requires_grad],
                     max_norm=grad_clip_norm,
                 )
                 optimizer.step()
-                distill_loss_val = float(distill_loss.detach().item())
-                distill_grad_norm = float(dgnorm.item() if hasattr(dgnorm, 'item') else float(dgnorm))
+                ranker_loss_val = float(ranker_loss.detach().item())
+                ranker_grad_norm = float(rgnorm.item() if hasattr(rgnorm, 'item') else float(rgnorm))
+                with torch.no_grad():
+                    ranker_top1_acc = float(
+                        (score_stack.argmax(dim=0) == target_top).float().mean().item()
+                    )
+
+        # ---- decay action std
+        action_std = max(action_std_min, action_std * action_std_decay)
+
+        # ---- Trajectory distillation (best-of-K or advantage-weighted multi-rollout)
+        # PPO's policy-gradient signal is very small for this already-strong model.
+        # When exploration finds rollouts that improve over the init, distill their
+        # final displacements into the flow-matching denoiser.
+        #
+        # adv_distill=0: Best-of-K – distill only the top rollout per batch element.
+        # adv_distill=1: Advantage-weighted – distill ALL positive-advantage rollouts,
+        #   each weighted by its normalised advantage.  Provides ~K/2 independent
+        #   gradient targets per step, giving a substantially stronger learning signal.
+        distill_loss_val = 0.0
+        distill_active_frac = 0.0
+        distill_grad_norm = 0.0
+        if distill_weight > 0 and disp_stack.numel() > 0:
+            if adv_distill:
+                # ---- Advantage-weighted multi-rollout distillation
+                # Process each contour b independently, batching K_pos rollouts
+                # for that contour in a single forward pass.
+                B_eff = disp_stack.size(1)
+                contour_scale = gcn.compute_contour_scale(i_init).detach()  # (B, 1, 1)
+                with torch.no_grad():
+                    distill_ctx = gcn.prepare_sampling_context(cnn_feature.detach(), i_init, py_ind)
+                loss_terms = []
+                n_active_b = 0
+                for b in range(B_eff):
+                    if distill_compare_det and det_scores is not None:
+                        gain_b = final_scores[:, b] - det_scores[b] - distill_det_margin
+                    else:
+                        gain_b = delta_scores[:, b] - distill_min_delta
+                    quality_mask_b = (gain_b > 0)
+                    if not bool(quality_mask_b.any().item()):
+                        continue
+                    pos_k = quality_mask_b.nonzero(as_tuple=True)[0]
+                    if len(pos_k) == 0:
+                        continue
+                    K_pos = len(pos_k)
+                    n_active_b += K_pos
+                    pos_gain_raw_b = gain_b[pos_k].detach()
+                    gain_scale_b = pos_gain_raw_b.mean()
+                    pos_gain_b = (pos_gain_raw_b / pos_gain_raw_b.sum().clamp_min(1e-6))  # (K_pos,)
+                    # K_pos rollout targets for contour b
+                    pos_disps_b = disp_stack[pos_k, b].detach()  # (K_pos, N, 2)
+                    cs_b = contour_scale[b:b+1].expand(K_pos, -1, -1)  # (K_pos, 1, 1)
+                    x1_b = gcn.normalize_target_disp(pos_disps_b, cs_b).detach()
+                    x0_b = gcn.sample_train_x0(x1_b).detach()
+                    t_b = _sample_distill_t(K_pos, device=base_device, dtype=x1_b.dtype)
+                    x_t_b = (1.0 - t_b) * x0_b + t_b * x1_b  # (K_pos, N, 2)
+                    # Tile per-contour context K_pos times (same init polygon, K_pos noisy interpolants)
+                    i_init_b = i_init[b:b+1].expand(K_pos, -1, -1)
+                    c_init_b = (c_init[b:b+1].expand(K_pos, -1, -1)
+                                if c_init is not None else None)
+                    py_ind_b = py_ind[b:b+1].expand(K_pos)
+                    sf_b = distill_ctx['sampled_feat'][b:b+1].expand(K_pos, -1, -1)
+                    df_b = (distill_ctx['detail_feat'][b:b+1].expand(K_pos, -1, -1)
+                            if distill_ctx['detail_feat'] is not None else None)
+                    cs_flat_b = contour_scale.view(-1)[b:b+1].expand(K_pos).to(dtype=x1_b.dtype)
+                    v_pred_b, _ = gcn.predict_velocity(
+                        cnn_feature.detach(), i_init_b, c_init_b,
+                        sf_b, df_b, py_ind_b,
+                        x_t_b, t_b.view(-1),
+                        contour_scale=cs_flat_b, x_self_cond=None,
+                    )
+                    v_target_b = (x1_b - x0_b).detach()
+                    # Per-rollout MSE, weighted by the rollout's true quality gain
+                    # over the comparison baseline (det or init).
+                    mse_per_b = ((v_pred_b - v_target_b) ** 2).mean(dim=-1).mean(dim=-1)  # (K_pos,)
+                    loss_terms.append((pos_gain_b * mse_per_b).sum() * gain_scale_b)
+                distill_active_frac = float(n_active_b) / max(len(rollouts) * B_eff, 1)
+                if loss_terms:
+                    distill_loss = sum(loss_terms) / len(loss_terms)
+                    if distill_loss_clip > 0.0:
+                        clip_scale = distill_loss_clip / distill_loss.detach().clamp_min(distill_loss_clip)
+                        distill_loss = distill_loss * clip_scale
+                    optimizer.zero_grad(set_to_none=True)
+                    (distill_weight * distill_loss).backward()
+                    dgnorm = torch.nn.utils.clip_grad_norm_(
+                        [p for p in net_for_load.parameters() if p.requires_grad],
+                        max_norm=grad_clip_norm,
+                    )
+                    optimizer.step()
+                    distill_loss_val = float(distill_loss.detach().item())
+                    distill_grad_norm = float(dgnorm.item() if hasattr(dgnorm, 'item') else float(dgnorm))
+            else:
+                # ---- Best-of-K trajectory distillation (original path)
+                best_idx = torch.argmax(final_scores, dim=0)  # (B,)
+                arange_b = torch.arange(disp_stack.size(1), device=base_device)
+                target_disp = disp_stack[best_idx, arange_b].detach()
+                # Gating: only distill trajectories that genuinely beat the current
+                # deterministic model (when det baseline is available), otherwise fall
+                # back to the original YOLO-init delta gate.
+                if distill_compare_det and det_scores is not None:
+                    active = (final_scores[best_idx, arange_b] > det_scores + distill_det_margin).detach()
+                else:
+                    active = (delta_scores[best_idx, arange_b] > distill_min_delta).detach()
+                distill_active_frac = float(active.float().mean().item()) if active.numel() else 0.0
+                if active.any():
+                    contour_scale = gcn.compute_contour_scale(i_init).detach()
+                    x1 = gcn.normalize_target_disp(target_disp, contour_scale).detach()
+                    n_active = int(active.sum().item())
+                    t = _sample_distill_t(i_init.size(0), device=base_device, dtype=x1.dtype)
+                    x0 = gcn.sample_train_x0(x1).detach()
+                    x_t = (1.0 - t) * x0 + t * x1
+                    contour_scale_flat = contour_scale.view(-1).to(device=base_device, dtype=x1.dtype)
+                    with torch.no_grad():
+                        distill_ctx = gcn.prepare_sampling_context(cnn_feature.detach(), i_init, py_ind)
+                    v_pred, l_reg = gcn.predict_velocity(
+                        cnn_feature.detach(),
+                        i_init,
+                        c_init,
+                        distill_ctx['sampled_feat'],
+                        distill_ctx['detail_feat'],
+                        py_ind,
+                        x_t,
+                        t.view(-1),
+                        contour_scale=contour_scale_flat,
+                        x_self_cond=None,
+                    )
+                    v_target = (x1 - x0).detach()
+                    distill_loss = F.mse_loss(v_pred[active], v_target[active], reduction='mean')
+                    if isinstance(l_reg, torch.Tensor):
+                        distill_loss = distill_loss + l_reg.mean() * 0.0
+                    # Clip to prevent catastrophic updates from outlier batches
+                    if distill_loss_clip > 0.0:
+                        clip_scale = distill_loss_clip / distill_loss.detach().clamp_min(distill_loss_clip)
+                        distill_loss = distill_loss * clip_scale
+                    optimizer.zero_grad(set_to_none=True)
+                    (distill_weight * distill_loss).backward()
+                    dgnorm = torch.nn.utils.clip_grad_norm_(
+                        [p for p in net_for_load.parameters() if p.requires_grad],
+                        max_norm=grad_clip_norm,
+                    )
+                    optimizer.step()
+                    distill_loss_val = float(distill_loss.detach().item())
+                    distill_grad_norm = float(dgnorm.item() if hasattr(dgnorm, 'item') else float(dgnorm))
 
         # ---- compute logging
         ratio_all = torch.cat(ratio_history) if ratio_history else torch.zeros(1, device=base_device)
+        latent_ratio_all = torch.cat(latent_ratio_history) if latent_ratio_history else torch.ones(1, device=base_device)
         log_item = {
             'timestamp': datetime.datetime.now().isoformat(),
             'step': int(step),
@@ -937,6 +1640,10 @@ def main():
             'final_score_mean': float(final_scores.mean().item()),
             'final_score_best': float(final_scores.max(dim=0)[0].mean().item()),
             'delta_score_mean': float(delta_scores.mean().item()),
+            'burr_penalty_mean': float(burr_penalties.mean().item()),
+            'burr_penalty_best': float(burr_penalties.min(dim=0)[0].mean().item()),
+            'burr_raw_px_mean': float(burr_raw_px.mean().item()),
+            'reward_burr_weight': float(reward_burr_weight),
             'ema_reward': float(ema_now),
             'adv_mean': float(advantages.mean().item()),
             'adv_std': float(advantages.std(unbiased=False).item()),
@@ -951,9 +1658,21 @@ def main():
             'policy_loss': float(np.mean(policy_loss_history)) if policy_loss_history else 0.0,
             'kl_loss': float(np.mean(kl_loss_history)) if kl_loss_history else 0.0,
             'grad_norm': float(np.mean(grad_norm_history)) if grad_norm_history else 0.0,
+            'latent_policy': int(latent_policy),
+            'latent_policy_loss': float(np.mean(latent_policy_loss_history)) if latent_policy_loss_history else 0.0,
+            'latent_kl_last': latent_kl_history[-1] if latent_kl_history else 0.0,
+            'latent_ratio_min': float(latent_ratio_all.min().item()) if latent_ratio_all.numel() > 0 else 1.0,
+            'latent_ratio_max': float(latent_ratio_all.max().item()) if latent_ratio_all.numel() > 0 else 1.0,
+            'latent_ratio_mean': float(latent_ratio_all.mean().item()) if latent_ratio_all.numel() > 0 else 1.0,
+            'latent_grad_norm': float(np.mean(latent_grad_norm_history)) if latent_grad_norm_history else 0.0,
+            'latent_ranker': int(latent_ranker),
+            'ranker_loss': ranker_loss_val,
+            'ranker_grad_norm': ranker_grad_norm,
+            'ranker_top1_acc': ranker_top1_acc,
             'inner_epochs': int(early_stop_epoch),
             'action_std': float(action_std),
             'k_rollouts': len(rollouts),
+            'step_log_count_mean': float(np.mean(step_log_count_list)) if step_log_count_list else 0.0,
             'gate_active_frac': gate_active_frac,
             'distill_loss': distill_loss_val,
             'distill_active_frac': distill_active_frac,
@@ -993,13 +1712,14 @@ def main():
         if step % 20 == 0 or step == 1:
             extra = ''
             if 'eval_iou' in log_item:
-                extra = f" eval_iou={log_item['eval_iou']:.4f} mboundf={log_item.get('eval_mboundf',0):.4f}"
+                extra = f" eval_iou={log_item['eval_iou']:.4f} Δ={log_item.get('eval_delta_vs_baseline',0):+.4f}"
             print(
                 f"[V2 step {step:5d}] reward={log_item['reward_mean']:.4f} "
                 f"final={log_item['final_score_mean']:.4f} "
-                f"kl_first={log_item['approx_kl_first']:.4f} "
-                f"clipfrac={log_item['clipfrac_first']:.3f} "
-                f"ratio[{log_item['ratio_min']:.3f},{log_item['ratio_max']:.3f}] "
+                f"burr={log_item['burr_penalty_mean']:.3f} "
+                f"dl={log_item['distill_loss']:.5f} dg={log_item['distill_grad_norm']:.4f} "
+                f"af={log_item['distill_active_frac']:.2f} "
+                f"kl={log_item['approx_kl_first']:.4f} "
                 f"gnorm={log_item['grad_norm']:.3f} "
                 f"std={action_std:.3f}{extra}"
             )
@@ -1007,12 +1727,24 @@ def main():
         # ---- viz: dump small trajectory tape for fixed eval batch
         if eval_batch is not None and viz_every > 0 and (step % viz_every == 0 or step == 1):
             try:
-                _dump_trajectory_viz(inner, eval_batch, viz_dir, step,
-                                     rollout_steps=rollout_steps, k_viz=min(k, 4),
-                                     action_std=action_std,
-                                     reward_w_region=reward_w_region,
-                                     reward_w_dice=reward_w_dice,
-                                     reward_w_iou=reward_w_iou)
+                _dump_train_group_viz(batch, output, disp_stack, rewards, final_scores,
+                                      det_scores, quality_scores, gate_mask, viz_dir, step)
+                if dump_trajectory_viz:
+                    _dump_trajectory_viz(inner, eval_batch, viz_dir, step,
+                                         rollout_steps=rollout_steps, k_viz=min(k, 8),
+                                         action_std=action_std,
+                                         step_mode=step_mode,
+                                         noise_level=noise_level,
+                                         sde_type=sde_type,
+                                         reward_w_region=reward_w_region,
+                                         reward_w_dice=reward_w_dice,
+                                         reward_w_iou=reward_w_iou,
+                                         reward_w_dist=reward_w_dist,
+                                         reward_dist_max_px=reward_dist_max_px,
+                                         reward_dist_quantile=reward_dist_quantile,
+                                         reward_dist_quantile_weight=reward_dist_quantile_weight,
+                                         reward_abs_w=reward_abs_w,
+                                         reward_delta_w=reward_delta_w)
             except Exception as e:
                 print(f'[GRPO-V2] viz failed: {e}')
 
@@ -1041,14 +1773,185 @@ def main():
 
 
 @torch.no_grad()
+def _dump_train_group_viz(batch, output, disp_stack, rewards, final_scores,
+                          det_scores, quality_scores, gate_mask, viz_dir: Path, step: int,
+                          max_rollouts: int = 8):
+    """Visualize the actual training group collected in the current step."""
+    import cv2
+
+    viz_dir.mkdir(parents=True, exist_ok=True)
+    i_init = output.get('i_it_py')
+    oct_init = output.get('octagon_i_it_py')
+    mid_frac = output.get('train_midstate_frac')
+    i_gt = output.get('i_gt_py')
+    py_ind = output.get('py_ind')
+    if not isinstance(i_init, torch.Tensor) or not isinstance(disp_stack, torch.Tensor):
+        return
+    if not isinstance(i_gt, torch.Tensor) or i_gt.numel() == 0:
+        return
+
+    i_gt = _align_gt(i_init, i_gt)
+    if isinstance(py_ind, torch.Tensor) and py_ind.numel() == i_init.shape[0]:
+        img_mask = (py_ind.detach().long().view(-1) == 0)
+    else:
+        img_mask = torch.ones((i_init.shape[0],), device=i_init.device, dtype=torch.bool)
+    if not bool(img_mask.any().item()):
+        return
+
+    inp = batch['inp'][0].detach().float().cpu().numpy()
+    if inp.shape[0] in (1, 3):
+        inp = inp.transpose(1, 2, 0)
+    inp = inp - inp.min()
+    if inp.max() > 0:
+        inp = inp / inp.max()
+    img = (inp * 255.0).astype(np.uint8)
+    if img.ndim == 2:
+        img = cv2.cvtColor(img, cv2.COLOR_GRAY2BGR)
+    elif img.shape[-1] == 1:
+        img = cv2.cvtColor(img, cv2.COLOR_GRAY2BGR)
+    elif img.shape[-1] == 3:
+        img = cv2.cvtColor(img, cv2.COLOR_RGB2BGR)
+    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+    base_img = cv2.cvtColor(gray, cv2.COLOR_GRAY2BGR)
+    base_img = cv2.addWeighted(base_img, 0.45, np.zeros_like(base_img), 0.55, 0)
+    H, W = base_img.shape[:2]
+
+    scale = float(snake_config.down_ratio)
+    mask_np = img_mask.detach().cpu().numpy().astype(bool)
+    init_np = i_init.detach().cpu().numpy()[mask_np] * scale
+    oct_np = None
+    init_oct_dist_px = None
+    if isinstance(oct_init, torch.Tensor) and oct_init.shape == i_init.shape:
+        oct_np = oct_init.detach().cpu().numpy()[mask_np] * scale
+        init_oct_dist_px = float(np.mean(np.linalg.norm(init_np - oct_np, axis=-1))) if init_np.size else None
+    gt_np = i_gt.detach().cpu().numpy()[mask_np] * scale
+    disp_np = disp_stack.detach().cpu().numpy()[:, mask_np] * scale
+    final_np = init_np[None, ...] + disp_np
+
+    rewards_np = rewards.detach().cpu().numpy()[:, mask_np]
+    final_scores_np = final_scores.detach().cpu().numpy()[:, mask_np]
+    quality_np = quality_scores.detach().cpu().numpy()[:, mask_np]
+    gate_np = gate_mask.detach().cpu().numpy().reshape(-1)
+    gate_sel = gate_np[mask_np] if gate_np.size == mask_np.size else gate_np
+    det_np = None
+    if isinstance(det_scores, torch.Tensor):
+        det_np = det_scores.detach().cpu().numpy()[mask_np]
+
+    k_total = final_np.shape[0]
+    k_show = min(int(max_rollouts), k_total)
+    rollout_order = list(range(k_show))
+    if k_total > k_show:
+        mean_quality = quality_np.mean(axis=1)
+        best = int(np.argmax(mean_quality))
+        worst = int(np.argmin(mean_quality))
+        rollout_order = []
+        for idx in list(range(k_show - 2)) + [best, worst]:
+            if idx not in rollout_order:
+                rollout_order.append(idx)
+        rollout_order = rollout_order[:k_show]
+
+    best_idx = int(np.argmax(quality_np.mean(axis=1)))
+    worst_idx = int(np.argmin(quality_np.mean(axis=1)))
+
+    def draw_polys(canvas, polys, color, thickness):
+        for m in range(polys.shape[0]):
+            pts = np.round(polys[m]).astype(np.int32)
+            if pts.shape[0] < 2:
+                continue
+            pts[:, 0] = np.clip(pts[:, 0], 0, W - 1)
+            pts[:, 1] = np.clip(pts[:, 1], 0, H - 1)
+            loop = np.concatenate([pts, pts[:1]], axis=0)
+            cv2.polylines(canvas, [loop], isClosed=True, color=color, thickness=thickness)
+
+    panels = []
+    for ri in rollout_order:
+        canvas = base_img.copy()
+        draw_polys(canvas, gt_np, (255, 0, 0), 3)
+        if oct_np is not None:
+            draw_polys(canvas, oct_np, (0, 180, 255), 1)
+        draw_polys(canvas, init_np, (255, 255, 0), 2)
+        draw_polys(canvas, final_np[ri], (255, 255, 255), 3)
+        if ri == best_idx:
+            border = (80, 220, 80)
+            tag = 'best'
+        elif ri == worst_idx:
+            border = (40, 40, 255)
+            tag = 'worst'
+        else:
+            border = (90, 90, 90)
+            tag = 'mid'
+        cv2.rectangle(canvas, (0, 0), (W - 1, H - 1), border, 4)
+        label = (
+            f"real k={ri} {tag} "
+            f"R={float(rewards_np[ri].mean()):.3f} "
+            f"Q={float(quality_np[ri].mean()):+.3f} "
+            f"F={float(final_scores_np[ri].mean()):.3f}"
+        )
+        cv2.rectangle(canvas, (2, 2), (min(W - 2, 430), 29), (0, 0, 0), -1)
+        cv2.putText(canvas, label, (6, 20), cv2.FONT_HERSHEY_SIMPLEX, 0.52,
+                    (0, 255, 0), 1, cv2.LINE_AA)
+        panels.append(canvas)
+
+    if not panels:
+        return
+    tape = np.concatenate(panels, axis=1)
+    legend = np.zeros((30, tape.shape[1], 3), dtype=np.uint8)
+    gate_frac = float(np.mean(gate_sel)) if gate_sel.size else 0.0
+    det_text = f"det={float(np.mean(det_np)):.3f}" if det_np is not None and det_np.size else "det=NA"
+    cv2.putText(
+        legend,
+        f"REAL TRAIN GROUP step={step} | cyan:init orange:oct white:final blue:GT | {det_text} gate_frac={gate_frac:.2f}",
+        (5, 20), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (255, 255, 255), 1, cv2.LINE_AA,
+    )
+    tape = np.concatenate([legend, tape], axis=0)
+    cv2.imwrite(str(viz_dir / f'train_group_step{step:06d}.png'), tape)
+
+    meta = {
+        'step': int(step),
+        'type': 'actual_training_group',
+        'image_index': 0,
+        'num_contours_drawn': int(mask_np.sum()),
+        'init_source': 'train_midstate' if init_oct_dist_px is not None else 'raw_i_it_py',
+        'mean_init_to_octagon_px': init_oct_dist_px,
+        'train_midstate_frac_mean': None if not isinstance(mid_frac, torch.Tensor) else float(mid_frac.detach().mean().item()),
+        'train_midstate_frac_min': None if not isinstance(mid_frac, torch.Tensor) else float(mid_frac.detach().min().item()),
+        'train_midstate_frac_max': None if not isinstance(mid_frac, torch.Tensor) else float(mid_frac.detach().max().item()),
+        'k_total': int(k_total),
+        'k_shown': [int(x) for x in rollout_order],
+        'best_rollout_by_quality_mean': int(best_idx),
+        'worst_rollout_by_quality_mean': int(worst_idx),
+        'gate_active_frac_drawn_image': gate_frac,
+        'det_score_mean_drawn_image': None if det_np is None or not det_np.size else float(np.mean(det_np)),
+        'rollouts': [
+            {
+                'k': int(ri),
+                'reward_mean': float(rewards_np[ri].mean()),
+                'final_score_mean': float(final_scores_np[ri].mean()),
+                'quality_vs_det_mean': float(quality_np[ri].mean()),
+            }
+            for ri in range(k_total)
+        ],
+    }
+    with open(viz_dir / f'train_group_step{step:06d}.json', 'w', encoding='utf-8') as f:
+        json.dump(meta, f, ensure_ascii=False, indent=2)
+
+
+@torch.no_grad()
 def _dump_trajectory_viz(inner, eval_batch, viz_dir: Path, step: int,
                          rollout_steps: int, k_viz: int, action_std: float,
-                         reward_w_region: float, reward_w_dice: float, reward_w_iou: float):
-    """Render a 'trajectory tape': for the eval batch, run k rollouts with the
-    current policy, draw the contour ODE-step evolution on the image with a
-    colour gradient (yellow→red along ODE steps), GT in blue, initial in cyan.
+                         step_mode: str, noise_level: float, sde_type: str,
+                         reward_w_region: float, reward_w_dice: float, reward_w_iou: float,
+                         reward_w_dist: float = 0.0,
+                         reward_dist_max_px: float = 8.0,
+                         reward_dist_quantile: float = 95.0,
+                         reward_dist_quantile_weight: float = 0.5,
+                         reward_abs_w: float = 1.0,
+                         reward_delta_w: float = 0.0):
+    """Render a compact group comparison: one panel per rollout.
 
-    Also dumps a deterministic prediction PNG and a small reward bar chart.
+    The diagnostic target is reward ranking, so the panel intentionally shows
+    only init / final / GT. Dense intermediate ODE trajectories are too noisy
+    once rollouts are close to each other.
     """
     import cv2
     try:
@@ -1094,6 +1997,9 @@ def _dump_trajectory_viz(inner, eval_batch, viz_dir: Path, step: int,
     elif inp_img.shape[-1] == 3:
         inp_img = cv2.cvtColor(inp_img, cv2.COLOR_RGB2BGR)
     H, W = inp_img.shape[:2]
+    gray = cv2.cvtColor(inp_img, cv2.COLOR_BGR2GRAY)
+    inp_img = cv2.cvtColor(gray, cv2.COLOR_GRAY2BGR)
+    inp_img = cv2.addWeighted(inp_img, 0.45, np.zeros_like(inp_img), 0.55, 0)
 
     # We need full-trajectory contour evolution. The flow `sample_with_logprob`
     # already records `latents` covering the policy window. To get *all* ODE
@@ -1106,6 +2012,10 @@ def _dump_trajectory_viz(inner, eval_batch, viz_dir: Path, step: int,
         init_score = compute_region_score(
             i_init, i_gt, H=H, W=W,
             w_boundary=reward_w_region, w_dice=reward_w_dice, w_iou=reward_w_iou,
+            w_dist=reward_w_dist,
+            dist_max_px=reward_dist_max_px,
+            dist_quantile=reward_dist_quantile,
+            dist_quantile_weight=reward_dist_quantile_weight,
             coord_scale=float(snake_config.down_ratio),
         ).detach().cpu().numpy()
     else:
@@ -1130,6 +2040,9 @@ def _dump_trajectory_viz(inner, eval_batch, viz_dir: Path, step: int,
                 detail_feat=ctx['detail_feat'],
                 contour_scale=ctx['contour_scale'],
                 x_self_cond=x_self_cond,
+                step_mode=step_mode,
+                noise_level=noise_level,
+                sde_type=sde_type,
             )
             # convert intermediate x to contour by denormalize_pred_disp
             disp_int = gcn.denormalize_pred_disp(x_prev, ctx['contour_scale'])
@@ -1143,9 +2056,14 @@ def _dump_trajectory_viz(inner, eval_batch, viz_dir: Path, step: int,
             final_score = compute_region_reward(
                 i_init, disp_final, i_gt, H=H, W=W,
                 w1=reward_w_region, w_dice=reward_w_dice, w_iou=reward_w_iou,
+                w_dist=reward_w_dist,
+                dist_max_px=reward_dist_max_px,
+                dist_quantile=reward_dist_quantile,
+                dist_quantile_weight=reward_dist_quantile_weight,
                 coord_scale=float(snake_config.down_ratio),
             ).detach().cpu().numpy()
-            rewards.append(float(np.mean(final_score)))
+            train_reward = reward_abs_w * final_score + reward_delta_w * (final_score - init_score)
+            rewards.append(float(np.mean(train_reward)))
         else:
             rewards.append(float('nan'))
         contour_evolutions.append(contour_seq)
@@ -1155,37 +2073,34 @@ def _dump_trajectory_viz(inner, eval_batch, viz_dir: Path, step: int,
     panels = []
     init_np = i_init.detach().cpu().numpy() * float(snake_config.down_ratio)
     gt_np = i_gt.detach().cpu().numpy() * float(snake_config.down_ratio) if i_gt is not None else None
+    valid_rewards = [r for r in rewards if not np.isnan(r)]
+    best_idx = int(np.nanargmax(np.asarray(rewards))) if valid_rewards else -1
+    worst_idx = int(np.nanargmin(np.asarray(rewards))) if valid_rewards else -1
     for ki in range(k_viz):
         img = inp_img.copy()
-        seq = contour_evolutions[ki]
-        T = len(seq)
-        # ODE trajectory: colour gradient from yellow (early) to red (late)
-        for tidx, poly in enumerate(seq):
-            frac = tidx / max(T - 1, 1)
-            color = (0, int(255 * (1 - frac)), 255)
-            for m in range(poly.shape[0]):
-                pts = poly[m].astype(np.int32)
-                loop = np.concatenate([pts, pts[:1]], axis=0)
-                cv2.polylines(img, [loop], isClosed=True, color=color, thickness=1)
         # initial (cyan)
         for m in range(init_np.shape[0]):
             pts = init_np[m].astype(np.int32)
             loop = np.concatenate([pts, pts[:1]], axis=0)
-            cv2.polylines(img, [loop], isClosed=True, color=(255, 255, 0), thickness=1)
+            cv2.polylines(img, [loop], isClosed=True, color=(255, 255, 0), thickness=2)
         # GT (blue) - only if available
         if gt_np is not None:
             for m in range(gt_np.shape[0]):
                 pts = gt_np[m].astype(np.int32)
                 loop = np.concatenate([pts, pts[:1]], axis=0)
-                cv2.polylines(img, [loop], isClosed=True, color=(255, 0, 0), thickness=2)
+                cv2.polylines(img, [loop], isClosed=True, color=(255, 0, 0), thickness=3)
         # final (white)
         fin = final_polys[ki]
         for m in range(fin.shape[0]):
             pts = fin[m].astype(np.int32)
             loop = np.concatenate([pts, pts[:1]], axis=0)
-            cv2.polylines(img, [loop], isClosed=True, color=(255, 255, 255), thickness=2)
-        cv2.putText(img, f"k={ki} r={rewards[ki]:.3f} std={action_std:.2f}",
-                    (5, 18), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 255, 0), 1, cv2.LINE_AA)
+            cv2.polylines(img, [loop], isClosed=True, color=(255, 255, 255), thickness=3)
+        border_color = (80, 220, 80) if ki == best_idx else ((40, 40, 255) if ki == worst_idx else (80, 80, 80))
+        cv2.rectangle(img, (0, 0), (W - 1, H - 1), border_color, 4)
+        tag = 'best' if ki == best_idx else ('worst' if ki == worst_idx else 'mid')
+        label = f"k={ki} {tag} reward={rewards[ki]:.3f}"
+        cv2.rectangle(img, (2, 2), (330, 26), (0, 0, 0), -1)
+        cv2.putText(img, label, (5, 18), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 255, 0), 1, cv2.LINE_AA)
         panels.append(img)
 
     if len(panels) == 0:
@@ -1202,7 +2117,7 @@ def _dump_trajectory_viz(inner, eval_batch, viz_dir: Path, step: int,
     # legend bar at top
     legend_h = 24
     legend = np.zeros((legend_h, tape.shape[1], 3), dtype=np.uint8)
-    cv2.putText(legend, "yellow->red: ODE step early->late | cyan: init | white: final | blue: GT",
+    cv2.putText(legend, "cyan: init | white: rollout final | blue: GT | green border: best reward | red border: worst reward",
                 (5, 17), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (255, 255, 255), 1, cv2.LINE_AA)
     tape = np.concatenate([legend, tape], axis=0)
     out_path = viz_dir / f'traj_step{step:06d}.png'
@@ -1212,8 +2127,9 @@ def _dump_trajectory_viz(inner, eval_batch, viz_dir: Path, step: int,
     if plt is not None and init_score is not None and not all(np.isnan(rewards)):
         fig, ax = plt.subplots(1, 1, figsize=(4, 2.5))
         ax.bar(range(len(rewards)), rewards, color='tab:orange')
-        ax.axhline(float(np.mean(init_score)), color='tab:gray', linestyle='--', label=f'init={float(np.mean(init_score)):.3f}')
-        ax.set_title(f'step {step}: per-rollout reward')
+        init_train_reward = reward_abs_w * init_score
+        ax.axhline(float(np.mean(init_train_reward)), color='tab:gray', linestyle='--', label=f'init_abs={float(np.mean(init_train_reward)):.3f}')
+        ax.set_title(f'step {step}: per-rollout training reward')
         ax.set_xlabel('rollout index'); ax.set_ylabel('reward')
         ax.legend(loc='lower right', fontsize=8)
         fig.tight_layout()

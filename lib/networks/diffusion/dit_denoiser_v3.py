@@ -41,6 +41,16 @@ class DiTDenoiserV3(nn.Module):
         time_dim: int = 256,
         num_points: int = 128,
         num_queries: int = 256,
+        use_ffn_moe: bool = False,
+        ffn_moe_num_experts: int = 4,
+        ffn_moe_top_k: int = 2,
+        ffn_moe_hidden_dim: int = 256,
+        ffn_moe_balance_weight: float = 1e-3,
+        ffn_moe_router_noise_std: float = 0.01,
+        ffn_moe_expert_init_std: float = 1e-4,
+        ffn_moe_routed_scale: float = 1.0,
+        ffn_moe_use_point_embed: bool = True,
+        ffn_moe_use_cyclic_router: bool = True,
         **kwargs,  # Accept but ignore extra kwargs for compatibility
     ):
         super().__init__()
@@ -82,6 +92,16 @@ class DiTDenoiserV3(nn.Module):
                 num_heads=num_heads,
                 num_points=num_points,
                 dropout=0.0,
+                use_ffn_moe=use_ffn_moe,
+                ffn_moe_num_experts=ffn_moe_num_experts,
+                ffn_moe_top_k=ffn_moe_top_k,
+                ffn_moe_hidden_dim=ffn_moe_hidden_dim,
+                ffn_moe_balance_weight=ffn_moe_balance_weight,
+                ffn_moe_router_noise_std=ffn_moe_router_noise_std,
+                ffn_moe_expert_init_std=ffn_moe_expert_init_std,
+                ffn_moe_routed_scale=ffn_moe_routed_scale,
+                ffn_moe_use_point_embed=ffn_moe_use_point_embed,
+                ffn_moe_use_cyclic_router=ffn_moe_use_cyclic_router,
             )
             for _ in range(num_layers)
         ])

@@ -194,11 +194,23 @@ class FlowMatchingEvolution(nn.Module):
             _moe_point_embed = bool(getattr(global_cfg, 'v4_6_moe_use_point_embed', True))
             _moe_cyclic_router = bool(getattr(global_cfg, 'v4_6_moe_use_cyclic_router', True))
             _moe_shared_expert = bool(getattr(global_cfg, 'v4_6_moe_use_shared_expert', False))
+            _moe_route_shared = bool(getattr(global_cfg, 'v4_6_moe_route_shared_expert', False))
+            _moe_route_shared_bias = float(getattr(global_cfg, 'v4_6_moe_route_shared_init_bias', 0.0))
             _moe_routed_scale = float(getattr(global_cfg, 'v4_6_moe_routed_expert_scale', 1.0))
             _moe_expert_type = str(getattr(global_cfg, 'v4_6_moe_expert_type', 'linear')).strip().lower()
             _moe_expert_hidden = int(getattr(global_cfg, 'v4_6_moe_expert_hidden_dim', 256))
             _latent_loop = bool(getattr(global_cfg, 'v4_7_use_latent_loop', False))
             _latent_loop_steps = int(getattr(global_cfg, 'v4_7_latent_loop_steps', 4))
+            _dit_ffn_moe = bool(getattr(global_cfg, 'v4_10_use_dit_ffn_moe', False))
+            _dit_ffn_moe_experts = int(getattr(global_cfg, 'v4_10_dit_ffn_moe_num_experts', 4))
+            _dit_ffn_moe_top_k = int(getattr(global_cfg, 'v4_10_dit_ffn_moe_top_k', 2))
+            _dit_ffn_moe_hidden = int(getattr(global_cfg, 'v4_10_dit_ffn_moe_hidden_dim', 256))
+            _dit_ffn_moe_balance = float(getattr(global_cfg, 'v4_10_dit_ffn_moe_balance_weight', 1e-3))
+            _dit_ffn_moe_router_noise = float(getattr(global_cfg, 'v4_10_dit_ffn_moe_router_noise_std', 0.01))
+            _dit_ffn_moe_init_std = float(getattr(global_cfg, 'v4_10_dit_ffn_moe_expert_init_std', 1e-4))
+            _dit_ffn_moe_scale = float(getattr(global_cfg, 'v4_10_dit_ffn_moe_routed_scale', 1.0))
+            _dit_ffn_moe_point = bool(getattr(global_cfg, 'v4_10_dit_ffn_moe_use_point_embed', True))
+            _dit_ffn_moe_cyclic = bool(getattr(global_cfg, 'v4_10_dit_ffn_moe_use_cyclic_router', True))
             print(f"[FlowMatchingEvolution] Using DiT Flow Network V4.1 "
                   f"(V3.4 detail backbone, detail_ctx={_detail_ctx}, "
                   f"detail_mode={_detail_mode}, per_point_delta={_use_pp_delta}, "
@@ -207,9 +219,12 @@ class FlowMatchingEvolution(nn.Module):
                   f"final_head={_final_head_type}, "
                   f"moe_experts={_moe_num_experts}, moe_top_k={_moe_top_k}, "
                   f"moe_shared={_moe_shared_expert}, "
+                  f"moe_route_shared={_moe_route_shared}, "
                   f"moe_expert_type={_moe_expert_type}, "
                   f"moe_expert_hidden={_moe_expert_hidden}, "
                   f"latent_loop={_latent_loop}, latent_loop_steps={_latent_loop_steps}, "
+                  f"dit_ffn_moe={_dit_ffn_moe}, dit_ffn_moe_experts={_dit_ffn_moe_experts}, "
+                  f"dit_ffn_moe_top_k={_dit_ffn_moe_top_k}, "
                   f"ODE steps={ode_steps})")
             self.denoiser = DiTFlowMatchingV4_1(
                 state_dim=dit_state_dim,
@@ -234,11 +249,23 @@ class FlowMatchingEvolution(nn.Module):
                 moe_use_point_embed=_moe_point_embed,
                 moe_use_cyclic_router=_moe_cyclic_router,
                 moe_use_shared_expert=_moe_shared_expert,
+                moe_route_shared_expert=_moe_route_shared,
+                moe_route_shared_init_bias=_moe_route_shared_bias,
                 moe_routed_expert_scale=_moe_routed_scale,
                 moe_expert_type=_moe_expert_type,
                 moe_expert_hidden_dim=_moe_expert_hidden,
                 use_latent_loop=_latent_loop,
                 latent_loop_steps=_latent_loop_steps,
+                use_ffn_moe=_dit_ffn_moe,
+                ffn_moe_num_experts=_dit_ffn_moe_experts,
+                ffn_moe_top_k=_dit_ffn_moe_top_k,
+                ffn_moe_hidden_dim=_dit_ffn_moe_hidden,
+                ffn_moe_balance_weight=_dit_ffn_moe_balance,
+                ffn_moe_router_noise_std=_dit_ffn_moe_router_noise,
+                ffn_moe_expert_init_std=_dit_ffn_moe_init_std,
+                ffn_moe_routed_scale=_dit_ffn_moe_scale,
+                ffn_moe_use_point_embed=_dit_ffn_moe_point,
+                ffn_moe_use_cyclic_router=_dit_ffn_moe_cyclic,
             )
         elif getattr(global_cfg, 'use_dit_v4', False):
             from .dit_denoiser_v4 import DiTFlowMatchingV4
@@ -332,6 +359,77 @@ class FlowMatchingEvolution(nn.Module):
                 num_points=num_points,
             )
 
+        def _env_bool(name: str, default: bool) -> bool:
+            raw = os.environ.get(name, '').strip()
+            if not raw:
+                return bool(default)
+            return raw.lower() in ('1', 'true', 'yes', 'y', 'on')
+
+        self._use_latent_policy = _env_bool(
+            'FLOW_USE_LATENT_POLICY',
+            bool(getattr(global_cfg, 'flow_use_latent_policy', False)),
+        )
+        self._use_latent_ranker = _env_bool(
+            'FLOW_USE_LATENT_RANKER',
+            bool(getattr(global_cfg, 'flow_use_latent_ranker', False)),
+        )
+        if self._use_latent_ranker:
+            self._use_latent_policy = True
+        self._latent_policy_scale = float(os.environ.get(
+            'FLOW_LATENT_POLICY_SCALE',
+            getattr(global_cfg, 'flow_latent_policy_scale', 0.10),
+        ))
+        self._latent_logprob_scale = float(os.environ.get(
+            'FLOW_LATENT_LOGPROB_SCALE',
+            getattr(global_cfg, 'flow_latent_logprob_scale', 1.0),
+        ))
+        self._latent_policy_eval_mode = str(
+            os.environ.get(
+                'FLOW_LATENT_POLICY_EVAL_MODE',
+                getattr(global_cfg, 'flow_latent_policy_eval_mode', 'sample'),
+            )
+        ).strip().lower()
+        self._latent_selector_k = int(os.environ.get(
+            'FLOW_LATENT_SELECTOR_K',
+            getattr(global_cfg, 'flow_latent_selector_k', 8),
+        ))
+        self.latent_policy = None
+        if self._use_latent_policy:
+            hidden = int(getattr(global_cfg, 'flow_latent_policy_hidden_dim', feature_dim))
+            self.latent_policy = nn.Sequential(
+                nn.Conv1d(feature_dim, hidden, kernel_size=1),
+                nn.SiLU(inplace=True),
+                nn.Conv1d(hidden, 2, kernel_size=1),
+            )
+            nn.init.zeros_(self.latent_policy[-1].weight)
+            nn.init.zeros_(self.latent_policy[-1].bias)
+            print(
+                f"[FlowMatchingEvolution] Latent x0 policy enabled "
+                f"(hidden={hidden}, scale={self._latent_policy_scale}, "
+                f"logprob_scale={self._latent_logprob_scale})"
+            )
+        self.latent_ranker = None
+        self.latent_ranker_head = None
+        if self._use_latent_ranker:
+            rank_hidden = int(os.environ.get(
+                'FLOW_LATENT_RANKER_HIDDEN_DIM',
+                getattr(global_cfg, 'flow_latent_ranker_hidden_dim', feature_dim),
+            ))
+            self.latent_ranker = nn.Sequential(
+                nn.Conv1d(feature_dim + 2, rank_hidden, kernel_size=1),
+                nn.SiLU(inplace=True),
+                nn.Conv1d(rank_hidden, rank_hidden, kernel_size=1),
+                nn.SiLU(inplace=True),
+            )
+            self.latent_ranker_head = nn.Linear(rank_hidden, 1)
+            nn.init.zeros_(self.latent_ranker_head.weight)
+            nn.init.zeros_(self.latent_ranker_head.bias)
+            print(
+                f"[FlowMatchingEvolution] Latent x0 ranker enabled "
+                f"(hidden={rank_hidden}, selector_k={self._latent_selector_k}, "
+                f"eval_mode={self._latent_policy_eval_mode})"
+            )
+
         # V6s: optimal cyclic alignment — find cyclic shift that minimises total displacement MSE
         # (greedy nearest-first-point can be far from optimal for tortuous contours)
         self._optimal_cyclic_align = bool(getattr(global_cfg, 'v3_7_optimal_cyclic_align', False))
@@ -378,6 +476,13 @@ class FlowMatchingEvolution(nn.Module):
         # V3.7.3: inference averaging
         self._infer_avg_samples = int(getattr(global_cfg, 'infer_avg_samples', 0))
         self._infer_noise_scale = float(getattr(global_cfg, 'infer_noise_scale', -1.0))
+        self._step_logprob_mode = str(
+            getattr(global_cfg, 'flow_step_logprob_mode', 'gaussian')
+        ).strip().lower()
+        self._step_noise_level = float(getattr(global_cfg, 'flow_step_noise_level', 0.8))
+        self._step_sde_type = str(
+            getattr(global_cfg, 'flow_step_sde_type', 'sde')
+        ).strip().lower()
         # Per-step noise annealing: list of noise scales for each iterative refinement step
         # e.g. [0.7, 0.5, 0.3] for coarse-to-fine. Empty = use infer_noise_scale for all steps.
         _itn = getattr(global_cfg, 'iterative_noise_scales', [])
@@ -690,6 +795,80 @@ class FlowMatchingEvolution(nn.Module):
         }
 
     @staticmethod
+    def _gaussian_sample_logprob(sample: torch.Tensor, mean: torch.Tensor, std) -> torch.Tensor:
+        if torch.is_tensor(std):
+            std_t = std.to(device=mean.device, dtype=mean.dtype)
+        else:
+            std_t = mean.new_full((mean.size(0), 1, 1), max(float(std), 1e-6))
+        std_t = std_t.clamp_min(1e-6)
+        var = std_t.pow(2)
+        log_prob = -((sample.detach() - mean) ** 2) / (2.0 * var)
+        log_prob = log_prob - torch.log(std_t) - 0.5 * math.log(2.0 * math.pi)
+        return log_prob.mean(dim=tuple(range(1, log_prob.ndim)))
+
+    def latent_policy_mean(self, sampled_feat: torch.Tensor) -> torch.Tensor:
+        if (not self._use_latent_policy) or self.latent_policy is None:
+            return sampled_feat.new_zeros((sampled_feat.size(0), sampled_feat.size(2), 2))
+        mean = self.latent_policy(sampled_feat).transpose(1, 2).contiguous()
+        return mean * self._latent_policy_scale
+
+    def initial_latent_logprob(
+        self,
+        sampled_feat: torch.Tensor,
+        latent_x0: torch.Tensor,
+        noise_scale: float,
+    ) -> torch.Tensor:
+        mean = self.latent_policy_mean(sampled_feat).to(device=latent_x0.device, dtype=latent_x0.dtype)
+        return self._gaussian_sample_logprob(latent_x0, mean, float(noise_scale)) * self._latent_logprob_scale
+
+    def sample_initial_latent_with_logprob(
+        self,
+        sampled_feat: torch.Tensor,
+        like: torch.Tensor,
+        noise_scale: float,
+        generator: Optional[torch.Generator] = None,
+    ):
+        mean = self.latent_policy_mean(sampled_feat).to(device=like.device, dtype=like.dtype)
+        std = max(float(noise_scale), 1e-6)
+        noise = torch.randn(like.shape, device=like.device, dtype=like.dtype, generator=generator)
+        latent_x0 = mean + std * noise
+        log_prob = self._gaussian_sample_logprob(latent_x0, mean, std) * self._latent_logprob_scale
+        std_t = mean.new_full((mean.size(0), 1, 1), std)
+        return latent_x0, log_prob, mean, std_t
+
+    def latent_ranker_score(self, sampled_feat: torch.Tensor, latent_x0: torch.Tensor) -> torch.Tensor:
+        if (not self._use_latent_ranker) or self.latent_ranker is None or self.latent_ranker_head is None:
+            return sampled_feat.new_zeros((sampled_feat.size(0),))
+        x_feat = latent_x0.transpose(1, 2).to(device=sampled_feat.device, dtype=sampled_feat.dtype)
+        rank_in = torch.cat([sampled_feat, x_feat], dim=1)
+        pooled = self.latent_ranker(rank_in).mean(dim=-1)
+        return self.latent_ranker_head(pooled).squeeze(-1)
+
+    def sample_ranked_initial_latent(
+        self,
+        sampled_feat: torch.Tensor,
+        like: torch.Tensor,
+        noise_scale: float,
+        k: Optional[int] = None,
+    ) -> torch.Tensor:
+        k = max(int(self._latent_selector_k if k is None else k), 1)
+        if k == 1 or (not self._use_latent_ranker):
+            x0, _, _, _ = self.sample_initial_latent_with_logprob(sampled_feat, like, noise_scale)
+            return x0
+
+        candidates = []
+        scores = []
+        for _ in range(k):
+            x0, _, _, _ = self.sample_initial_latent_with_logprob(sampled_feat, like, noise_scale)
+            candidates.append(x0)
+            scores.append(self.latent_ranker_score(sampled_feat, x0))
+        x_stack = torch.stack(candidates, dim=0)  # (K, B, P, 2)
+        score_stack = torch.stack(scores, dim=0)  # (K, B)
+        best_idx = torch.argmax(score_stack, dim=0)
+        gather_idx = best_idx.view(1, -1, 1, 1).expand(1, -1, x_stack.size(2), x_stack.size(3))
+        return x_stack.gather(0, gather_idx).squeeze(0)
+
+    @staticmethod
     def _gaussian_step_with_logprob(
         step_mean: torch.Tensor,
         action_std: float,
@@ -723,6 +902,92 @@ class FlowMatchingEvolution(nn.Module):
         log_prob = log_prob.mean(dim=tuple(range(1, log_prob.ndim)))
         return prev_sample, log_prob, step_mean, std
 
+    @staticmethod
+    def _flow_grpo_step_with_logprob(
+        sample: torch.Tensor,
+        model_output: torch.Tensor,
+        t_value,
+        total_steps: int,
+        noise_level: float,
+        sde_type: str = 'sde',
+        prev_sample: Optional[torch.Tensor] = None,
+        generator: Optional[torch.Generator] = None,
+    ):
+        total_steps = max(int(total_steps), 1)
+        dt = 1.0 / float(total_steps)
+        t_float = float(t_value.item()) if torch.is_tensor(t_value) else float(t_value)
+        transition_mean = sample + model_output * dt
+        zero_std = sample.new_zeros(sample.size(0), 1, 1)
+
+        if noise_level <= 0:
+            if prev_sample is None:
+                prev_sample = transition_mean
+            else:
+                prev_sample = prev_sample.to(device=sample.device, dtype=sample.dtype)
+            return prev_sample, sample.new_zeros(sample.size(0)), transition_mean, zero_std
+
+        sigma = sample.new_full((sample.size(0), 1, 1), max(1.0 - t_float, 0.0))
+        sigma_next = sample.new_full(
+            (sample.size(0), 1, 1),
+            max(1.0 - min(t_float + dt, 1.0), 0.0),
+        )
+        dt_sigma = sigma_next - sigma
+        neg_dt_sigma = (-dt_sigma).clamp_min(1e-12)
+        sde_type = str(sde_type).strip().lower()
+
+        if sde_type == 'sde':
+            safe_sigma = sigma.clamp_min(1e-6)
+            sigma_ref = torch.where(
+                sigma >= (1.0 - 1e-6),
+                sigma_next.clamp(max=1.0 - 1e-6),
+                sigma,
+            ).clamp(min=1e-6, max=1.0 - 1e-6)
+            std_dev_t = torch.sqrt(safe_sigma / (1.0 - sigma_ref).clamp_min(1e-6)) * float(noise_level)
+            transition_mean = (
+                sample * (1.0 + std_dev_t.pow(2) / (2.0 * safe_sigma) * dt_sigma)
+                + model_output * (1.0 + std_dev_t.pow(2) * (1.0 - sigma) / (2.0 * safe_sigma)) * dt_sigma
+            )
+            transition_std = std_dev_t * torch.sqrt(neg_dt_sigma)
+            if prev_sample is None:
+                noise = torch.randn(
+                    transition_mean.shape,
+                    device=transition_mean.device,
+                    dtype=transition_mean.dtype,
+                    generator=generator,
+                )
+                prev_sample = transition_mean + transition_std * noise
+            else:
+                prev_sample = prev_sample.to(device=transition_mean.device, dtype=transition_mean.dtype)
+
+            var = transition_std.pow(2).clamp_min(1e-12)
+            log_prob = -((prev_sample.detach() - transition_mean) ** 2) / (2.0 * var)
+            log_prob = log_prob - torch.log(transition_std.clamp_min(1e-12)) - 0.5 * math.log(2.0 * math.pi)
+            log_prob = log_prob.mean(dim=tuple(range(1, log_prob.ndim)))
+            return prev_sample, log_prob, transition_mean, transition_std
+
+        if sde_type == 'cps':
+            transition_std = sigma_next.clamp_min(0.0) * math.sin(float(noise_level) * math.pi / 2.0)
+            pred_original_sample = sample - sigma * model_output
+            noise_estimate = sample + model_output * (1.0 - sigma)
+            transition_mean = pred_original_sample * (1.0 - sigma_next) + noise_estimate * torch.sqrt(
+                (sigma_next.pow(2) - transition_std.pow(2)).clamp_min(0.0)
+            )
+            if prev_sample is None:
+                noise = torch.randn(
+                    transition_mean.shape,
+                    device=transition_mean.device,
+                    dtype=transition_mean.dtype,
+                    generator=generator,
+                )
+                prev_sample = transition_mean + transition_std * noise
+            else:
+                prev_sample = prev_sample.to(device=transition_mean.device, dtype=transition_mean.dtype)
+            log_prob = -((prev_sample.detach() - transition_mean) ** 2)
+            log_prob = log_prob.mean(dim=tuple(range(1, log_prob.ndim)))
+            return prev_sample, log_prob, transition_mean, transition_std
+
+        raise ValueError(f'Unsupported flow-grpo sde_type: {sde_type}')
+
     def step_with_logprob(
         self,
         cnn_feature: torch.Tensor,
@@ -740,6 +1005,9 @@ class FlowMatchingEvolution(nn.Module):
         detail_feat: Optional[torch.Tensor] = None,
         contour_scale: Optional[torch.Tensor] = None,
         x_self_cond: Optional[torch.Tensor] = None,
+        step_mode: Optional[str] = None,
+        noise_level: Optional[float] = None,
+        sde_type: Optional[str] = None,
     ):
         if sampled_feat is None or contour_scale is None or (self._use_detail_context and detail_feat is None):
             ctx = self.prepare_sampling_context(cnn_feature, i_it_py, py_ind)
@@ -786,20 +1054,50 @@ class FlowMatchingEvolution(nn.Module):
                 contour_scale=contour_scale_flat,
                 x_self_cond=next_self_cond,
             )
-            step_mean = x_t + (v_pred + v_pred2) * 0.5 * dt
+            step_velocity = (v_pred + v_pred2) * 0.5
+            step_mean = x_t + step_velocity * dt
         else:
-            step_mean = x_t + v_pred * dt
+            step_velocity = v_pred
+            step_mean = x_t + step_velocity * dt
 
         if self._ode_smooth_k > 0:
             step_mean = self.fourier_smooth(step_mean, self._ode_smooth_k)
 
-        prev_sample, log_prob, step_mean, std = self._gaussian_step_with_logprob(
-            step_mean,
-            action_std=action_std,
-            dt=dt,
-            prev_sample=prev_sample,
-            generator=generator,
+        step_mode = (
+            self._step_logprob_mode
+            if step_mode is None
+            else str(step_mode).strip().lower()
         )
+        if step_mode == 'gaussian':
+            prev_sample, log_prob, step_mean, std = self._gaussian_step_with_logprob(
+                step_mean,
+                action_std=action_std,
+                dt=dt,
+                prev_sample=prev_sample,
+                generator=generator,
+            )
+        elif step_mode in ('flow_grpo', 'flowgrpo'):
+            if action_std <= 0:
+                prev_sample, log_prob, step_mean, std = self._gaussian_step_with_logprob(
+                    step_mean,
+                    action_std=0.0,
+                    dt=dt,
+                    prev_sample=prev_sample,
+                    generator=generator,
+                )
+            else:
+                prev_sample, log_prob, step_mean, std = self._flow_grpo_step_with_logprob(
+                    sample=x_t,
+                    model_output=step_velocity,
+                    t_value=t_float,
+                    total_steps=total_steps,
+                    noise_level=self._step_noise_level if noise_level is None else float(noise_level),
+                    sde_type=self._step_sde_type if sde_type is None else str(sde_type),
+                    prev_sample=prev_sample,
+                    generator=generator,
+                )
+        else:
+            raise ValueError(f'Unsupported step_with_logprob mode: {step_mode}')
         return prev_sample, log_prob, step_mean, std, next_self_cond
 
     @torch.no_grad()
@@ -815,6 +1113,9 @@ class FlowMatchingEvolution(nn.Module):
         noise_scale: Optional[float] = None,
         action_std: float = 0.0,
         generator: Optional[torch.Generator] = None,
+        step_mode: Optional[str] = None,
+        noise_level: Optional[float] = None,
+        sde_type: Optional[str] = None,
     ) -> Dict[str, Any]:
         if steps is None:
             steps = self.ode_steps
@@ -823,8 +1124,20 @@ class FlowMatchingEvolution(nn.Module):
             noise_scale = self._flow_train_noise_scale
 
         device = i_it_py.device
-        x = torch.randn_like(i_it_py) * float(noise_scale)
         ctx = self.prepare_sampling_context(cnn_feature, i_it_py, py_ind)
+        latent_log_prob = None
+        latent_mean = None
+        latent_std = None
+        if self._use_latent_policy:
+            x, latent_log_prob, latent_mean, latent_std = self.sample_initial_latent_with_logprob(
+                ctx['sampled_feat'],
+                i_it_py,
+                float(noise_scale),
+                generator=generator,
+            )
+        else:
+            x = torch.randn_like(i_it_py) * float(noise_scale)
+        latent_x0 = x.detach()
 
         if window_size and window_size > 0:
             start_min = int(window_range[0]) if isinstance(window_range, (tuple, list)) and len(window_range) > 0 else 0
@@ -872,6 +1185,9 @@ class FlowMatchingEvolution(nn.Module):
                 detail_feat=ctx['detail_feat'],
                 contour_scale=ctx['contour_scale'],
                 x_self_cond=x_self_cond,
+                step_mode=step_mode,
+                noise_level=noise_level,
+                sde_type=sde_type,
             )
 
             if in_policy_window:
@@ -902,6 +1218,11 @@ class FlowMatchingEvolution(nn.Module):
             'contour_scale': ctx['contour_scale'],
             'disp': disp,
             'py': py,
+            'latent_x0': latent_x0,
+            'latent_log_prob': None if latent_log_prob is None else latent_log_prob.detach(),
+            'latent_mean': None if latent_mean is None else latent_mean.detach(),
+            'latent_std': None if latent_std is None else latent_std.detach(),
+            'latent_noise_scale': float(noise_scale),
         }
 
     def _sample_disp_from_sampled_feat(
@@ -923,8 +1244,25 @@ class FlowMatchingEvolution(nn.Module):
 
         device = i_it_py.device
         N = i_it_py.size(0)
-        x_t = torch.randn_like(i_it_py) * noise_scale
         contour_scale = self.compute_contour_scale(i_it_py)
+        if self._use_latent_policy:
+            if self._latent_policy_eval_mode in ('ranker', 'selector', 'select'):
+                x_t = self.sample_ranked_initial_latent(
+                    sampled_feat,
+                    i_it_py,
+                    float(noise_scale),
+                    k=self._latent_selector_k,
+                )
+            elif self._latent_policy_eval_mode in ('mean', 'det', 'deterministic'):
+                x_t = self.latent_policy_mean(sampled_feat).to(device=i_it_py.device, dtype=i_it_py.dtype)
+            else:
+                x_t, _, _, _ = self.sample_initial_latent_with_logprob(
+                    sampled_feat,
+                    i_it_py,
+                    float(noise_scale),
+                )
+        else:
+            x_t = torch.randn_like(i_it_py) * noise_scale
         contour_scale_flat = contour_scale.view(-1)
         dt = 1.0 / steps
 
@@ -1087,6 +1425,18 @@ class FlowMatchingEvolution(nn.Module):
 
         return total_disp
 
+    @staticmethod
+    def _progress_targets_to_residual_fractions(targets):
+        """Convert absolute progress targets into fractions of the current residual."""
+        fractions = []
+        prev = 0.0
+        for target in targets:
+            target = min(max(float(target), prev), 1.0)
+            remaining = max(1.0 - prev, 1e-6)
+            fractions.append((target - prev) / remaining)
+            prev = target
+        return fractions
+
     def forward(self, output: Dict[str, Any], cnn_feature: torch.Tensor, batch: Dict[str, Any]) -> Dict[str, Any]:
         ret = {}
         device = cnn_feature.device
@@ -1167,22 +1517,32 @@ class FlowMatchingEvolution(nn.Module):
                 use_mixed_iter_interp = bool(getattr(global_cfg, 'v4_4_use_mixed_iter_interp', False))
                 if use_rich_state_sampling:
                     cont_p = max(float(getattr(global_cfg, 'v4_9_continuous_state_prob', 0.60)), 0.0)
+                    disc_p = max(float(getattr(global_cfg, 'v4_9_discrete_state_prob', 0.0)), 0.0)
                     small_p = max(float(getattr(global_cfg, 'v4_9_small_state_prob', 0.25)), 0.0)
                     far_p = max(float(getattr(global_cfg, 'v4_9_hard_far_state_prob', 0.10)), 0.0)
                     zero_p = max(float(getattr(global_cfg, 'v4_9_near_zero_state_prob', 0.05)), 0.0)
-                    total_p = cont_p + small_p + far_p + zero_p
+                    exact_zero_p = max(float(getattr(global_cfg, 'v4_9_exact_zero_state_prob', 0.0)), 0.0)
+                    total_p = cont_p + disc_p + small_p + far_p + zero_p + exact_zero_p
                     if total_p > 0:
-                        cont_p, small_p, far_p, zero_p = (
+                        cont_p, disc_p, small_p, far_p, zero_p, exact_zero_p = (
                             cont_p / total_p,
+                            disc_p / total_p,
                             small_p / total_p,
                             far_p / total_p,
                             zero_p / total_p,
+                            exact_zero_p / total_p,
                         )
                         draw = torch.rand(B, device=device)
                         cont_mask = draw < cont_p
-                        small_mask = (draw >= cont_p) & (draw < cont_p + small_p)
-                        far_mask = (draw >= cont_p + small_p) & (draw < cont_p + small_p + far_p)
-                        zero_mask = draw >= (cont_p + small_p + far_p)
+                        disc_mask = (draw >= cont_p) & (draw < cont_p + disc_p)
+                        small_mask = (draw >= cont_p + disc_p) & (draw < cont_p + disc_p + small_p)
+                        far_mask = (
+                            (draw >= cont_p + disc_p + small_p)
+                            & (draw < cont_p + disc_p + small_p + far_p)
+                        )
+                        zero_start = cont_p + disc_p + small_p + far_p
+                        zero_mask = (draw >= zero_start) & (draw < zero_start + zero_p)
+                        exact_zero_mask = draw >= (zero_start + zero_p)
 
                         frac = torch.zeros(B, 1, 1, device=device, dtype=full_disp.dtype)
 
@@ -1203,6 +1563,31 @@ class FlowMatchingEvolution(nn.Module):
                             0.05,
                             0.85,
                         )
+                        if disc_mask.any():
+                            fractions = getattr(global_cfg, 'v4_9_discrete_fractions', None)
+                            if fractions is None:
+                                fractions = getattr(global_cfg, 'iterative_fractions', None)
+                            if fractions:
+                                frac_choices = torch.tensor(
+                                    [float(f) for f in fractions],
+                                    device=device,
+                                    dtype=full_disp.dtype,
+                                ).clamp_(0.0, 0.999)
+                                choice_idx = torch.randint(
+                                    0,
+                                    int(frac_choices.numel()),
+                                    (int(disc_mask.sum().item()),),
+                                    device=device,
+                                )
+                                frac[disc_mask] = frac_choices[choice_idx].view(-1, 1, 1)
+                            else:
+                                situations = torch.randint(
+                                    0,
+                                    iter_steps,
+                                    (int(disc_mask.sum().item()),),
+                                    device=device,
+                                )
+                                frac[disc_mask] = situations.to(dtype=full_disp.dtype).view(-1, 1, 1) / float(max(iter_steps, 1))
                         if small_mask.any():
                             min_frac = min(max(self._small_disp_min_frac, 0.0), 0.999)
                             max_frac = min(max(self._small_disp_max_frac, min_frac), 0.999)
@@ -1224,6 +1609,8 @@ class FlowMatchingEvolution(nn.Module):
                             0.95,
                             0.995,
                         )
+                        if exact_zero_mask.any():
+                            frac[exact_zero_mask] = 1.0
                         used_mixed_iter_interp = True
                     else:
                         situations = torch.randint(0, iter_steps, (B,), device=device)
@@ -1430,7 +1817,17 @@ class FlowMatchingEvolution(nn.Module):
                     ret.update({'disp': disp, 'py': i_it_py})
                 elif self.use_iterative_refinement:
                     iter_steps = int(getattr(global_cfg, 'iterative_num_steps', 3))
-                    fractions = list(getattr(global_cfg, 'iterative_fractions', []))
+                    use_rich_infer_schedule = bool(
+                        getattr(global_cfg, 'v4_9_use_rich_infer_schedule', False)
+                    )
+                    if use_rich_infer_schedule:
+                        targets = list(getattr(global_cfg, 'v4_9_infer_target_fractions', []))
+                        if not targets:
+                            targets = [0.3333, 0.5, 0.80, 0.97, 1.0]
+                        fractions = self._progress_targets_to_residual_fractions(targets)
+                        iter_steps = len(fractions)
+                    else:
+                        fractions = list(getattr(global_cfg, 'iterative_fractions', []))
                     if not fractions:
                         fractions = [1.0 / (iter_steps - i) for i in range(iter_steps)]
                     iter_ode_steps = int(

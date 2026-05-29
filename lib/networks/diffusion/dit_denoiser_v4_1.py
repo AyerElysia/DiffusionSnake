@@ -30,6 +30,8 @@ class DiTFlowMatchingV4_1(DiTFlowMatchingV3_4):
         moe_use_point_embed: bool = True,
         moe_use_cyclic_router: bool = True,
         moe_use_shared_expert: bool = False,
+        moe_route_shared_expert: bool = False,
+        moe_route_shared_init_bias: float = 0.0,
         moe_routed_expert_scale: float = 1.0,
         moe_expert_type: str = 'linear',
         moe_expert_hidden_dim: int = 256,
@@ -59,6 +61,8 @@ class DiTFlowMatchingV4_1(DiTFlowMatchingV3_4):
                 use_point_embed=moe_use_point_embed,
                 use_cyclic_router=moe_use_cyclic_router,
                 use_shared_expert=moe_use_shared_expert,
+                route_shared_expert=moe_route_shared_expert,
+                route_shared_init_bias=moe_route_shared_init_bias,
                 routed_expert_scale=moe_routed_expert_scale,
                 expert_type=moe_expert_type,
                 expert_hidden_dim=moe_expert_hidden_dim,
@@ -160,6 +164,9 @@ class DiTFlowMatchingV4_1(DiTFlowMatchingV3_4):
         reg_loss = pred.new_zeros(())
         if hasattr(self.final_layer, 'reg_loss'):
             reg_loss = reg_loss + self.final_layer.reg_loss().to(pred.device, pred.dtype)
+        for dit_layer in self.dit_layers:
+            if hasattr(dit_layer, 'reg_loss'):
+                reg_loss = reg_loss + dit_layer.reg_loss().to(pred.device, pred.dtype)
         if self.use_per_point_delta:
             pred = pred + self.per_point_delta_head(x, t_emb)
             reg_loss = reg_loss + self.per_point_delta_head.reg_loss().to(pred.device, pred.dtype)

@@ -174,6 +174,21 @@ cfg.v4_9_hard_far_max_frac = 0.20
 cfg.v4_9_near_zero_min_frac = 0.95
 cfg.v4_9_near_zero_max_frac = 0.995
 
+# V4.10: routed experts inside each DiT FFN branch.
+cfg.v4_10_use_dit_ffn_moe = False
+cfg.v4_10_dit_ffn_moe_num_experts = 4
+cfg.v4_10_dit_ffn_moe_top_k = 2
+cfg.v4_10_dit_ffn_moe_hidden_dim = 256
+cfg.v4_10_dit_ffn_moe_balance_weight = 1e-3
+cfg.v4_10_dit_ffn_moe_router_noise_std = 0.01
+cfg.v4_10_dit_ffn_moe_expert_init_std = 1e-4
+cfg.v4_10_dit_ffn_moe_routed_scale = 1.0
+cfg.v4_10_dit_ffn_moe_use_point_embed = True
+cfg.v4_10_dit_ffn_moe_use_cyclic_router = True
+
+# V4.6d: route shared expert together with routed experts instead of always-on residual addition.
+cfg.v4_6_moe_route_shared_expert = False
+
 # V3.5: Fourier low-pass post-processing
 cfg.fourier_smooth_k = 0  # 0=disabled, >0=keep lowest K freq components per side
 

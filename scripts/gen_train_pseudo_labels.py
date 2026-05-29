@@ -129,7 +129,17 @@ def load_model(ckpt_path):
 # ─── per-sample pseudo-label generation ──────────────────────────────────────
 
 @torch.no_grad()
-def gen_sample_pseudo_label(model, device, batch, k=8, ode_steps=10):
+def gen_sample_pseudo_label(
+    model,
+    device,
+    batch,
+    k=8,
+    ode_steps=10,
+    action_std=0.0,
+    noise_scale=None,
+    det_ode_steps=0,
+    use_true_det=True,
+):
     """
     Run k rollouts (fresh x_0 each time), pick the best by GT reward.
 
@@ -182,7 +192,8 @@ def gen_sample_pseudo_label(model, device, batch, k=8, ode_steps=10):
 
     use_iterative = getattr(gcn, 'use_iterative_refinement', False)
 
-    def run_one_rollout(std=0.0):
+    def run_one_rollout(std=0.0, steps_override=None, noise_scale_override=noise_scale):
+        local_steps = int(steps_override) if steps_override is not None else iter_ode_steps
         if use_iterative:
             current = i_init.clone()
             total_disp = torch.zeros_like(i_init)
@@ -190,7 +201,8 @@ def gen_sample_pseudo_label(model, device, batch, k=8, ode_steps=10):
                 c_cur = snake_gcn_utils.img_poly_to_can_poly(current)
                 ret = gcn.sample_with_logprob(
                     cnn_feature, current, c_cur, py_ind,
-                    steps=iter_ode_steps, action_std=std,
+                    steps=local_steps, action_std=std,
+                    noise_scale=noise_scale_override,
                 )
                 applied = ret['disp'] * float(frac)
                 current = (current + applied).detach()
@@ -199,21 +211,34 @@ def gen_sample_pseudo_label(model, device, batch, k=8, ode_steps=10):
         else:
             ret = gcn.sample_with_logprob(
                 cnn_feature, i_init, c_init, py_ind,
-                steps=iter_ode_steps, action_std=std,
+                steps=local_steps, action_std=std,
+                noise_scale=noise_scale_override,
             )
             return ret['disp']
 
     # --- deterministic baseline ---
-    det_disp = run_one_rollout(0.0)
+    if use_true_det and use_iterative:
+        det_steps = int(det_ode_steps) if int(det_ode_steps) > 0 else int(getattr(cfg, 'iterative_ode_steps', ode_steps))
+        det_disp = gcn.sample_disp_iterative(
+            cnn_feature, i_init, c_init, py_ind,
+            num_iter_steps=iter_steps,
+            fractions=fractions,
+            ode_steps=det_steps,
+        )
+    elif use_true_det:
+        det_steps = int(det_ode_steps) if int(det_ode_steps) > 0 else int(ode_steps)
+        det_disp = gcn.sample_disp(cnn_feature, i_init, c_init, py_ind, steps=det_steps)
+    else:
+        det_disp = run_one_rollout(0.0, steps_override=det_ode_steps if int(det_ode_steps) > 0 else None, noise_scale_override=None)
     det_pred_px = ((i_init + det_disp).cpu().numpy() * dr).astype(np.float32)
     det_iou = poly_iou_sample(det_pred_px, gt_np, h_img, w_img)
 
-    # --- k stochastic rollouts (std=0, fresh x_0 each time via gcn.sample_with_logprob) ---
+    # --- k search rollouts ---
     best_iou = -1.0
     best_disp = det_disp.clone()  # fallback to det if nothing beats it
 
     for _ in range(k):
-        disp = run_one_rollout(0.0)
+        disp = run_one_rollout(action_std)
         pred_px = ((i_init + disp).cpu().numpy() * dr).astype(np.float32)
         iou = poly_iou_sample(pred_px, gt_np, h_img, w_img)
         if iou > best_iou:
@@ -232,6 +257,12 @@ def gen_sample_pseudo_label(model, device, batch, k=8, ode_steps=10):
 
 def main():
     k = int(os.environ.get('K', '8'))
+    ode_steps = int(os.environ.get('ODE_STEPS', '10'))
+    action_std = float(os.environ.get('STD', '0.0'))
+    noise_scale_env = os.environ.get('NOISE_SCALE', '').strip()
+    noise_scale = float(noise_scale_env) if noise_scale_env else None
+    det_ode_steps = int(os.environ.get('DET_ODE_STEPS', '0'))
+    use_true_det = os.environ.get('USE_TRUE_DET', '1').strip().lower() not in ('0', 'false', 'no')
     ckpt_rel = os.environ.get('CKPT',
         'data/outputs/btcv_diffusion_dit_v3_4_fm_full_noleak_yolom_gpu35_reusemax/checkpoints/latest.pt')
     out_rel = os.environ.get('OUT', 'data/pseudo_labels/btcv_train_k8.json')
@@ -253,7 +284,11 @@ def main():
         print(f'[*] Resuming from {resume_path}: {len(done_idxs)} samples already done')
 
     ckpt_path = os.path.join(_THIS_DIR, ckpt_rel)
-    print(f'[*] k={k}  split={split}  ckpt={ckpt_path}')
+    print(
+        f'[*] k={k}  split={split}  ode_steps={ode_steps}  std={action_std}  '
+        f'noise_scale={noise_scale}  det_ode_steps={det_ode_steps}  true_det={use_true_det}  '
+        f'ckpt={ckpt_path}'
+    )
 
     model, device = load_model(ckpt_path)
 
@@ -279,7 +314,15 @@ def main():
             continue
         batch = collator([dataset[idx]])
         try:
-            r = gen_sample_pseudo_label(model, device, batch, k=k)
+            r = gen_sample_pseudo_label(
+                model, device, batch,
+                k=k,
+                ode_steps=ode_steps,
+                action_std=action_std,
+                noise_scale=noise_scale,
+                det_ode_steps=det_ode_steps,
+                use_true_det=use_true_det,
+            )
             r['idx'] = idx
             samples.append(r)
             det_ious.append(r['det_iou'])
@@ -295,16 +338,34 @@ def main():
 
             # Save checkpoint every 50 samples
             if (idx + 1) % 50 == 0:
-                _save(out_path, k, ckpt_path, limit, samples, det_ious, best_ious)
+                _save(
+                    out_path, k, ckpt_path, limit, samples, det_ious, best_ious,
+                    extra_meta={
+                        'ode_steps': ode_steps,
+                        'action_std': action_std,
+                        'noise_scale': noise_scale,
+                        'det_ode_steps': det_ode_steps,
+                        'use_true_det': use_true_det,
+                    },
+                )
         except Exception as e:
             print(f'[{idx+1:4d}/{limit}] FAILED idx={idx}: {e}')
             samples.append({'idx': idx, 'error': str(e)})
 
-    _save(out_path, k, ckpt_path, limit, samples, det_ious, best_ious)
+    _save(
+        out_path, k, ckpt_path, limit, samples, det_ious, best_ious,
+        extra_meta={
+            'ode_steps': ode_steps,
+            'action_std': action_std,
+            'noise_scale': noise_scale,
+            'det_ode_steps': det_ode_steps,
+            'use_true_det': use_true_det,
+        },
+    )
     print(f'\n[*] DONE. Saved to {out_path}')
 
 
-def _save(out_path, k, ckpt_path, limit, samples, det_ious, best_ious):
+def _save(out_path, k, ckpt_path, limit, samples, det_ious, best_ious, extra_meta=None):
     a = np.array(det_ious) if det_ious else np.array([0.0])
     b = np.array(best_ious) if best_ious else np.array([0.0])
     summary = {
@@ -319,6 +380,8 @@ def _save(out_path, k, ckpt_path, limit, samples, det_ious, best_ious):
         'mean_gain': float(np.mean(b - a)),
         'generated_at': datetime.datetime.now().isoformat(),
     }
+    if extra_meta:
+        summary.update(extra_meta)
     print(f'  [save] median_det={summary["median_det"]:.5f}  '
           f'median_best={summary["median_best"]:.5f}  '
           f'mean_gain={summary["mean_gain"]:+.5f}  '

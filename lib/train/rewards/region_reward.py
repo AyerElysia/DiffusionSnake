@@ -48,6 +48,39 @@ def _calc_dice(pred_mask: np.ndarray, gt_mask: np.ndarray) -> float:
     return float(2.0 * inter / denom) if denom > 0 else 0.0
 
 
+def _calc_boundary_distance_score(
+    pred_mask: np.ndarray,
+    gt_mask: np.ndarray,
+    max_dist: float = 8.0,
+    quantile: float = 95.0,
+    quantile_weight: float = 0.5,
+) -> float:
+    """双向边界距离分数；越贴近 GT 越接近 1。"""
+    pred_contour = _extract_contour(pred_mask, 1) > 0
+    gt_contour = _extract_contour(gt_mask, 1) > 0
+    if pred_contour.sum() == 0 or gt_contour.sum() == 0:
+        return 0.0
+
+    max_dist = max(float(max_dist), 1e-6)
+    quantile = min(max(float(quantile), 0.0), 100.0)
+    quantile_weight = max(float(quantile_weight), 0.0)
+
+    gt_dt = cv2.distanceTransform((~gt_contour).astype(np.uint8), cv2.DIST_L2, 3)
+    pred_dt = cv2.distanceTransform((~pred_contour).astype(np.uint8), cv2.DIST_L2, 3)
+    d_pred_to_gt = gt_dt[pred_contour]
+    d_gt_to_pred = pred_dt[gt_contour]
+    if d_pred_to_gt.size == 0 or d_gt_to_pred.size == 0:
+        return 0.0
+
+    mean_dist = 0.5 * (float(d_pred_to_gt.mean()) + float(d_gt_to_pred.mean()))
+    q_dist = 0.5 * (
+        float(np.percentile(d_pred_to_gt, quantile)) +
+        float(np.percentile(d_gt_to_pred, quantile))
+    )
+    dist = (mean_dist + quantile_weight * q_dist) / (1.0 + quantile_weight)
+    return float(1.0 - np.clip(dist / max_dist, 0.0, 1.0))
+
+
 def compute_region_score(poly_py: torch.Tensor,
                          gt_py: torch.Tensor,
                          H: int,
@@ -55,6 +88,10 @@ def compute_region_score(poly_py: torch.Tensor,
                          w_boundary: float = 1.0,
                          w_dice: float = 0.0,
                          w_iou: float = 0.0,
+                         w_dist: float = 0.0,
+                         dist_max_px: float = 8.0,
+                         dist_quantile: float = 95.0,
+                         dist_quantile_weight: float = 0.5,
                          coord_scale: float = 1.0) -> torch.Tensor:
     """Compute absolute contour quality from boundary F-score, Dice, and optional IoU."""
     device = poly_py.device
@@ -65,11 +102,21 @@ def compute_region_score(poly_py: torch.Tensor,
     for i in range(pred_np.shape[0]):
         m_pred = _poly_to_mask_np(pred_np[i], H, W)
         m_gt = _poly_to_mask_np(gt_np[i], H, W)
-        score = float(w_boundary) * _calc_mboundf(m_pred, m_gt)
+        score = 0.0
+        if w_boundary != 0:
+            score += float(w_boundary) * _calc_mboundf(m_pred, m_gt)
         if w_dice != 0:
             score += float(w_dice) * _calc_dice(m_pred, m_gt)
         if w_iou != 0:
             score += float(w_iou) * _calc_iou(m_pred, m_gt)
+        if w_dist != 0:
+            score += float(w_dist) * _calc_boundary_distance_score(
+                m_pred,
+                m_gt,
+                max_dist=dist_max_px,
+                quantile=dist_quantile,
+                quantile_weight=dist_quantile_weight,
+            )
         scores.append(score)
 
     return torch.tensor(scores, device=device, dtype=torch.float32)
@@ -83,6 +130,10 @@ def compute_region_reward(i_it_py: torch.Tensor,
                           w1: float = 1.0,
                           w_dice: float = 0.0,
                           w_iou: float = 0.0,
+                          w_dist: float = 0.0,
+                          dist_max_px: float = 8.0,
+                          dist_quantile: float = 95.0,
+                          dist_quantile_weight: float = 0.5,
                           coord_scale: float = 1.0) -> torch.Tensor:
     """Compute contour reward from boundary quality, Dice, and optional mask IoU."""
     return compute_region_score(
@@ -93,5 +144,9 @@ def compute_region_reward(i_it_py: torch.Tensor,
         w_boundary=w1,
         w_dice=w_dice,
         w_iou=w_iou,
+        w_dist=w_dist,
+        dist_max_px=dist_max_px,
+        dist_quantile=dist_quantile,
+        dist_quantile_weight=dist_quantile_weight,
         coord_scale=coord_scale,
     )

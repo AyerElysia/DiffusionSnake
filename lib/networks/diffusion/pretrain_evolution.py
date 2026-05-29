@@ -16,6 +16,7 @@ from .dit_denoiser_v3 import DiTDenoiserV3
 from .dit_denoiser_v3_1 import DiTDenoiserV3_1
 from .dit_denoiser_v3_3 import DiTDenoiserV3_3  # NEW
 from .dit_denoiser_v3_5 import DiTDenoiserV3_5  # V3.5 Fourier-space
+from .dit_denoiser_v4_1 import DiTFlowMatchingV4_1
 import lib.utils.snake.snake_gcn_utils as snake_gcn_utils
 from lib.utils.snake import snake_config
 from lib.config import cfg as global_cfg
@@ -49,7 +50,9 @@ def _select_denoiser_type(global_cfg, use_dit_denoiser):
         str: One of 'dit_v3_5', 'dit_v3_3', 'dit_v3_2', 'dit_v3_1',
              'dit_v3', 'dit_v1', 'snake'
     """
-    if getattr(global_cfg, 'use_dit_v3_5', False):
+    if getattr(global_cfg, 'use_dit_v4_1', False):
+        return 'dit_v4_1'
+    elif getattr(global_cfg, 'use_dit_v3_5', False):
         return 'dit_v3_5'
     elif getattr(global_cfg, 'use_dit_v3_3', False):
         return 'dit_v3_3'
@@ -70,6 +73,31 @@ class DiffusionEvolution(nn.Module):
     预训练专用的扩散模型实现
     只包含预训练相关的方法和逻辑
     """
+    @staticmethod
+    def _detail_feature_multiplier(mode: str) -> int:
+        mode = str(mode).strip().lower()
+        if mode == 'normal':
+            return 3
+        if mode == 'normal_band':
+            return 5
+        if mode == 'normal_tangent':
+            return 6
+        raise ValueError(f"Unsupported detail_context_mode: {mode}")
+
+    @staticmethod
+    def _resolve_detail_context_mode(global_cfg) -> str:
+        if bool(getattr(global_cfg, 'v4_2_use_detail_context', False)):
+            return str(getattr(global_cfg, 'v4_2_detail_context_mode', 'normal_band')).strip().lower()
+        if bool(getattr(global_cfg, 'v4_1_use_detail_context', False)):
+            return str(getattr(global_cfg, 'v4_1_detail_context_mode', 'normal')).strip().lower()
+        if bool(getattr(global_cfg, 'v4_use_detail_context', False)):
+            return str(getattr(global_cfg, 'v4_detail_context_mode', 'normal')).strip().lower()
+        if bool(getattr(global_cfg, 'v3_4_use_detail_context', False)):
+            return str(getattr(global_cfg, 'v3_4_detail_context_mode', 'normal')).strip().lower()
+        if bool(getattr(global_cfg, 'v3_7_use_detail_context', False)):
+            return str(getattr(global_cfg, 'v3_7_detail_context_mode', 'normal')).strip().lower()
+        return 'normal'
+
     def __init__(
         self,
         state_dim: int = 128,
@@ -102,6 +130,14 @@ class DiffusionEvolution(nn.Module):
 
         # Determine denoiser type with clear precedence
         denoiser_type = _select_denoiser_type(global_cfg, use_dit_denoiser)
+        self._use_detail_context = bool(
+            getattr(global_cfg, 'v4_1_use_detail_context', False)
+            or getattr(global_cfg, 'v4_use_detail_context', False)
+            or getattr(global_cfg, 'v3_4_use_detail_context', False)
+            or getattr(global_cfg, 'v3_7_use_detail_context', False)
+        )
+        self._detail_context_mode = self._resolve_detail_context_mode(global_cfg)
+        self._ddpm_time_input_unit = bool(getattr(global_cfg, 'ddpm_time_input_unit', False))
 
         # V3.5: Fourier-space diffusion config
         self.use_fourier_diffusion = (denoiser_type == 'dit_v3_5')
@@ -110,7 +146,44 @@ class DiffusionEvolution(nn.Module):
             logger.info(f"[DiffusionEvolution] V3.5 Fourier-space diffusion enabled (K={self.fourier_k})")
 
         # Initialize denoiser based on type
-        if denoiser_type == 'dit_v3_5':
+        if denoiser_type == 'dit_v4_1':
+            detail_mult = self._detail_feature_multiplier(self._detail_context_mode) if self._use_detail_context else 1
+            logger.info(
+                f"[DiffusionEvolution] Using DiT Denoiser V4.1 as DDPM/DM "
+                f"(layers={dit_num_layers}, heads={dit_num_heads}, dim={dit_state_dim}, "
+                f"detail_ctx={self._use_detail_context}, detail_mode={self._detail_context_mode}, "
+                f"final_head={getattr(global_cfg, 'v4_1_final_head_type', 'standard')})"
+            )
+            self.denoiser = DiTFlowMatchingV4_1(
+                state_dim=dit_state_dim,
+                feature_dim=feature_dim,
+                num_layers=dit_num_layers,
+                num_heads=dit_num_heads,
+                num_points=num_points,
+                use_detail_context=self._use_detail_context,
+                detail_feature_dim=feature_dim * detail_mult,
+                use_per_point_delta=getattr(global_cfg, 'v4_1_use_per_point_delta', False),
+                per_point_delta_scale=getattr(global_cfg, 'v4_1_per_point_delta_scale', 0.10),
+                per_point_delta_reg_weight=getattr(global_cfg, 'v4_1_per_point_delta_reg_weight', 0.0),
+                per_point_delta_head_type=getattr(global_cfg, 'v4_1_per_point_delta_head_type', 'linear'),
+                per_point_delta_hidden_mult=getattr(global_cfg, 'v4_1_per_point_delta_hidden_mult', 2.0),
+                per_point_delta_use_cyclic_mixer=getattr(global_cfg, 'v4_1_per_point_delta_use_cyclic_mixer', True),
+                final_head_type=getattr(global_cfg, 'v4_1_final_head_type', 'standard'),
+                moe_num_experts=getattr(global_cfg, 'v4_6_moe_num_experts', 8),
+                moe_top_k=getattr(global_cfg, 'v4_6_moe_top_k', 2),
+                moe_balance_weight=getattr(global_cfg, 'v4_6_moe_balance_weight', 1e-3),
+                moe_expert_init_std=getattr(global_cfg, 'v4_6_moe_expert_init_std', 1e-4),
+                moe_router_noise_std=getattr(global_cfg, 'v4_6_moe_router_noise_std', 0.01),
+                moe_use_point_embed=getattr(global_cfg, 'v4_6_moe_use_point_embed', True),
+                moe_use_cyclic_router=getattr(global_cfg, 'v4_6_moe_use_cyclic_router', True),
+                moe_use_shared_expert=getattr(global_cfg, 'v4_6_moe_use_shared_expert', False),
+                moe_route_shared_expert=getattr(global_cfg, 'v4_6_moe_route_shared_expert', False),
+                moe_route_shared_init_bias=getattr(global_cfg, 'v4_6_moe_route_shared_init_bias', 0.0),
+                moe_routed_expert_scale=getattr(global_cfg, 'v4_6_moe_routed_expert_scale', 1.0),
+                moe_expert_type=getattr(global_cfg, 'v4_6_moe_expert_type', 'linear'),
+                moe_expert_hidden_dim=getattr(global_cfg, 'v4_6_moe_expert_hidden_dim', 256),
+            )
+        elif denoiser_type == 'dit_v3_5':
             logger.info(
                 f"[DiffusionEvolution] Using DiT Denoiser V3.5 (Fourier-Space) "
                 f"(layers={dit_num_layers}, heads={dit_num_heads}, dim={dit_state_dim}, K={self.fourier_k})"
@@ -400,6 +473,74 @@ class DiffusionEvolution(nn.Module):
         am1 = self._sqrt_one_minus_alphas_cumprod_dev.index_select(0, t).view(-1, 1, 1)
         return (x_t - am1 * eps) / a
 
+    @staticmethod
+    def compute_contour_scale(polys: torch.Tensor) -> torch.Tensor:
+        span_x = polys[..., 0].amax(dim=1) - polys[..., 0].amin(dim=1)
+        span_y = polys[..., 1].amax(dim=1) - polys[..., 1].amin(dim=1)
+        return torch.maximum(span_x, span_y).clamp_min(1.0).view(-1, 1, 1)
+
+    def sample_detail_features(
+        self,
+        cnn_feature: torch.Tensor,
+        img_poly: torch.Tensor,
+        py_ind: torch.Tensor,
+        h: int,
+        w: int,
+        sampled_feat: Optional[torch.Tensor] = None,
+    ) -> Optional[torch.Tensor]:
+        if not self._use_detail_context:
+            return None
+        if img_poly.numel() == 0:
+            channels = cnn_feature.size(1)
+            return cnn_feature.new_zeros((0, channels * self._detail_feature_multiplier(self._detail_context_mode), 0))
+
+        if sampled_feat is None:
+            sampled_feat = snake_gcn_utils.get_gcn_feature(cnn_feature, img_poly, py_ind, h, w)
+        contour_scale = self.compute_contour_scale(img_poly).to(img_poly.device, img_poly.dtype)
+
+        prev_pt = torch.roll(img_poly, 1, dims=1)
+        next_pt = torch.roll(img_poly, -1, dims=1)
+        tangent = next_pt - prev_pt
+        tangent = tangent / tangent.norm(dim=-1, keepdim=True).clamp_min(1e-6)
+        normal = torch.stack([-tangent[..., 1], tangent[..., 0]], dim=-1)
+
+        radius_1 = torch.clamp(contour_scale / 64.0, min=0.75, max=2.0)
+        radius_2 = torch.clamp(contour_scale / 32.0, min=1.5, max=4.0)
+
+        plus_1 = snake_gcn_utils.get_gcn_feature(cnn_feature, img_poly + normal * radius_1, py_ind, h, w)
+        minus_1 = snake_gcn_utils.get_gcn_feature(cnn_feature, img_poly - normal * radius_1, py_ind, h, w)
+        plus_2 = snake_gcn_utils.get_gcn_feature(cnn_feature, img_poly + normal * radius_2, py_ind, h, w)
+        minus_2 = snake_gcn_utils.get_gcn_feature(cnn_feature, img_poly - normal * radius_2, py_ind, h, w)
+
+        detail_terms = [
+            plus_1 - minus_1,
+            plus_2 - minus_2,
+            0.5 * (plus_1 + minus_1) - sampled_feat,
+        ]
+
+        if self._detail_context_mode == 'normal_band':
+            radius_3 = torch.clamp(contour_scale / 16.0, min=2.5, max=6.0)
+            plus_3 = snake_gcn_utils.get_gcn_feature(cnn_feature, img_poly + normal * radius_3, py_ind, h, w)
+            minus_3 = snake_gcn_utils.get_gcn_feature(cnn_feature, img_poly - normal * radius_3, py_ind, h, w)
+            detail_terms.extend([
+                plus_3 - minus_3,
+                0.5 * (plus_2 + minus_2) - sampled_feat,
+            ])
+        elif self._detail_context_mode == 'normal_tangent':
+            tangent_plus_1 = snake_gcn_utils.get_gcn_feature(cnn_feature, img_poly + tangent * radius_1, py_ind, h, w)
+            tangent_minus_1 = snake_gcn_utils.get_gcn_feature(cnn_feature, img_poly - tangent * radius_1, py_ind, h, w)
+            tangent_plus_2 = snake_gcn_utils.get_gcn_feature(cnn_feature, img_poly + tangent * radius_2, py_ind, h, w)
+            tangent_minus_2 = snake_gcn_utils.get_gcn_feature(cnn_feature, img_poly - tangent * radius_2, py_ind, h, w)
+            detail_terms.extend([
+                tangent_plus_1 - tangent_minus_1,
+                tangent_plus_2 - tangent_minus_2,
+                0.5 * (tangent_plus_1 + tangent_minus_1) - sampled_feat,
+            ])
+        elif self._detail_context_mode != 'normal':
+            raise ValueError(f"Unsupported detail_context_mode: {self._detail_context_mode}")
+
+        return torch.cat(detail_terms, dim=1)
+
     def predict_eps(
         self,
         cnn_feature: torch.Tensor,
@@ -420,6 +561,7 @@ class DiffusionEvolution(nn.Module):
         # 1. 采样局部 GCN 特征 (保留作为 Local Context)
         h, w = cnn_feature.size(2), cnn_feature.size(3)
         gcn_feat = snake_gcn_utils.get_gcn_feature(cnn_feature, i_it_py, py_ind, h, w)
+        detail_feat = self.sample_detail_features(cnn_feature, i_it_py, py_ind, h, w, sampled_feat=gcn_feat)
 
         # 2. 构建邻接矩阵 (仅 GCN Denoiser 需要)
         adj = snake_gcn_utils.get_adj_ind(snake_config.adj_num, i_it_py.size(1), i_it_py.device)
@@ -439,11 +581,12 @@ class DiffusionEvolution(nn.Module):
 
         # 3. 通过去噪器预测噪声 (使用 denoiser_type 而非 isinstance)
         if self.denoiser_type.startswith('dit'):
+            t_in = t.to(dtype=x_t.dtype) / float(max(self.T - 1, 1)) if self._ddpm_time_input_unit else t
             # Only pass point_mask for V3.10+ which supports it
             if point_mask is not None and getattr(self.denoiser, 'supports_point_mask', False):
-                eps_pred, L = self.denoiser(cnn_feature, gcn_feat, x_t, t, adj, polys=i_it_py, py_ind=py_ind, point_mask=point_mask)
+                eps_pred, L = self.denoiser(cnn_feature, gcn_feat, x_t, t_in, adj, polys=i_it_py, py_ind=py_ind, point_mask=point_mask)
             else:
-                eps_pred, L = self.denoiser(cnn_feature, gcn_feat, x_t, t, adj, polys=i_it_py, py_ind=py_ind)
+                eps_pred, L = self.denoiser(cnn_feature, gcn_feat, x_t, t_in, adj, polys=i_it_py, py_ind=py_ind, detail_feat=detail_feat)
         else:  # snake
             eps_pred, L = self.denoiser(gcn_feat, c_it_py, x_t, t, adj, polys=i_it_py)
 

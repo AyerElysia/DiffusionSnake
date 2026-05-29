@@ -365,7 +365,15 @@ def eval_sample(model, device, batch, ode_steps=10, save_visuals=False, sample_d
 
             if getattr(core.gcn, 'use_iterative_refinement', False):
                 iter_steps = int(getattr(cfg, 'iterative_num_steps', 3))
-                fractions = list(getattr(cfg, 'iterative_fractions', []))
+                use_rich_infer_schedule = bool(getattr(cfg, 'v4_9_use_rich_infer_schedule', False))
+                if use_rich_infer_schedule and hasattr(core.gcn, '_progress_targets_to_residual_fractions'):
+                    targets = list(getattr(cfg, 'v4_9_infer_target_fractions', []))
+                    if not targets:
+                        targets = [0.3333, 0.5, 0.80, 0.97, 1.0]
+                    fractions = core.gcn._progress_targets_to_residual_fractions(targets)
+                    iter_steps = len(fractions)
+                else:
+                    fractions = list(getattr(cfg, 'iterative_fractions', []))
                 if not fractions:
                     fractions = [1.0 / (iter_steps - i) for i in range(iter_steps)]
                 iter_ode_steps = int(
@@ -377,15 +385,26 @@ def eval_sample(model, device, batch, ode_steps=10, save_visuals=False, sample_d
                 )
                 if iter_ode_steps <= 0:
                     iter_ode_steps = ode_steps
-                disp = core.gcn.sample_disp_iterative(
-                    cnn_feature,
-                    i_it_py,
-                    c_it_py,
-                    py_ind,
-                    num_iter_steps=iter_steps,
-                    fractions=fractions,
-                    ode_steps=iter_ode_steps,
-                )
+                if hasattr(core.gcn, 'ode_steps'):
+                    disp = core.gcn.sample_disp_iterative(
+                        cnn_feature,
+                        i_it_py,
+                        c_it_py,
+                        py_ind,
+                        num_iter_steps=iter_steps,
+                        fractions=fractions,
+                        ode_steps=iter_ode_steps,
+                    )
+                else:
+                    disp = core.gcn.sample_disp_iterative(
+                        cnn_feature,
+                        i_it_py,
+                        c_it_py,
+                        py_ind,
+                        num_iter_steps=iter_steps,
+                        fractions=fractions,
+                        ddim_steps=iter_ode_steps,
+                    )
             else:
                 disp = core.gcn.sample_disp(cnn_feature, i_it_py, c_it_py, py_ind, steps=ode_steps)
             fk = int(getattr(cfg, 'fourier_smooth_k', 0))

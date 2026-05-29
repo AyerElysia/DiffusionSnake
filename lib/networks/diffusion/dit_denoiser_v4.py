@@ -158,6 +158,8 @@ class MoEFinalHead(nn.Module):
         use_point_embed: bool = True,
         use_cyclic_router: bool = True,
         use_shared_expert: bool = False,
+        route_shared_expert: bool = False,
+        route_shared_init_bias: float = 0.0,
         routed_expert_scale: float = 1.0,
         expert_type: str = 'linear',
         expert_hidden_dim: int = 256,
@@ -165,12 +167,15 @@ class MoEFinalHead(nn.Module):
         super().__init__()
         self.num_points = int(num_points)
         self.num_experts = int(num_experts)
-        self.top_k = int(max(1, min(top_k, self.num_experts)))
         self.balance_weight = float(balance_weight)
         self.router_noise_std = float(router_noise_std)
         self.use_point_embed = bool(use_point_embed)
         self.use_cyclic_router = bool(use_cyclic_router)
         self.use_shared_expert = bool(use_shared_expert)
+        self.route_shared_expert = bool(route_shared_expert) and self.use_shared_expert
+        self.route_shared_init_bias = float(route_shared_init_bias)
+        self.router_num_experts = self.num_experts + (1 if self.route_shared_expert else 0)
+        self.top_k = int(max(1, min(top_k, self.router_num_experts)))
         self.routed_expert_scale = float(routed_expert_scale)
         self.expert_type = str(expert_type).strip().lower()
         self.use_mlp_experts = self.expert_type in ('mlp', 'mlp_all', 'mlp_experts')
@@ -223,7 +228,7 @@ class MoEFinalHead(nn.Module):
             self.router_mixer = None
         self.router_norm = RMSNorm(dim)
         self.router_time = nn.Linear(dim, dim, bias=False)
-        self.router = nn.Linear(dim, self.num_experts, bias=True)
+        self.router = nn.Linear(dim, self.router_num_experts, bias=True)
         self._last_aux_loss = None
 
         nn.init.constant_(self.adaLN[-1].weight, 0)
@@ -250,6 +255,9 @@ class MoEFinalHead(nn.Module):
         nn.init.normal_(self.router_time.weight, std=1e-3)
         nn.init.normal_(self.router.weight, std=1e-3)
         nn.init.zeros_(self.router.bias)
+        if self.route_shared_expert and self.route_shared_init_bias != 0:
+            with torch.no_grad():
+                self.router.bias[-1].fill_(self.route_shared_init_bias)
 
     def _compute_balance_loss(self, probs: torch.Tensor, selected_idx: torch.Tensor) -> torch.Tensor:
         if self.balance_weight <= 0:
@@ -258,7 +266,7 @@ class MoEFinalHead(nn.Module):
         selected = torch.zeros_like(probs)
         selected.scatter_(-1, selected_idx, 1.0)
         load = selected.mean(dim=(0, 1)) / float(self.top_k)
-        target = probs.new_full((self.num_experts,), 1.0 / float(self.num_experts))
+        target = probs.new_full((self.router_num_experts,), 1.0 / float(self.router_num_experts))
         balance = (importance - target).pow(2).mean() + (load - target).pow(2).mean()
         return balance * self.balance_weight
 
@@ -277,7 +285,11 @@ class MoEFinalHead(nn.Module):
             expert_delta = torch.einsum('npd,eod->npeo', x, self.expert_delta_weight)
             expert_delta = expert_delta + self.expert_delta_bias.view(1, 1, self.num_experts, -1)
 
-        if self.use_shared_expert:
+        if self.route_shared_expert:
+            # Equal-level routing: all candidates are full displacement heads.
+            # Routed experts are initialized as base + delta; the shared expert is base.
+            expert_out = torch.cat([base.unsqueeze(2) + expert_delta, base.unsqueeze(2)], dim=2)
+        elif self.use_shared_expert:
             expert_out = expert_delta
         else:
             expert_out = base.unsqueeze(2) + expert_delta
@@ -299,7 +311,9 @@ class MoEFinalHead(nn.Module):
         gather_idx = top_idx.unsqueeze(-1).expand(-1, -1, -1, expert_out.shape[-1])
         chosen = torch.gather(expert_out, dim=2, index=gather_idx)
         routed_out = (chosen * top_gates.unsqueeze(-1)).sum(dim=2)
-        if self.use_shared_expert:
+        if self.route_shared_expert:
+            out = routed_out
+        elif self.use_shared_expert:
             out = base + self.routed_expert_scale * routed_out
         else:
             out = routed_out
