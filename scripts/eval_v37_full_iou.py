@@ -56,6 +56,64 @@ def set_eval_seed(seed):
     print(f'[*] Evaluation seed -> {seed}')
 
 
+def apply_ablation_mode():
+    mode = os.environ.get('EVAL_ABLATION_MODE', '').strip().lower()
+    if not mode:
+        mode = 'config'
+    cfg.eval_manual_gt_init = False
+
+    if mode in ('config', 'default'):
+        pass
+    elif mode in ('pred_det_pred_ext', 'full_det'):
+        cfg.eval_use_network_forward = True
+        cfg.use_gt_det = False
+        cfg.use_pred_extreme_init_for_inference = True
+    elif mode in ('gt_det_pred_ext', 'gt_box_pred_ext'):
+        cfg.eval_use_network_forward = True
+        cfg.use_gt_det = True
+        cfg.use_pred_extreme_init_for_inference = True
+    elif mode in ('pred_det_bbox_init', 'pred_box_no_ext'):
+        cfg.eval_use_network_forward = True
+        cfg.use_gt_det = False
+        cfg.use_pred_extreme_init_for_inference = False
+    elif mode in ('gt_det_bbox_init', 'gt_box_no_ext'):
+        cfg.eval_use_network_forward = True
+        cfg.use_gt_det = True
+        cfg.use_pred_extreme_init_for_inference = False
+    elif mode in ('gt_init', 'gt_extreme_init', 'gt_octagon'):
+        cfg.eval_use_network_forward = False
+        cfg.use_gt_det = True
+        cfg.use_pred_extreme_init_for_inference = False
+        cfg.eval_manual_gt_init = True
+    else:
+        raise ValueError(
+            f"Unsupported EVAL_ABLATION_MODE={mode}. "
+            "Use config, pred_det_pred_ext, gt_det_pred_ext, "
+            "pred_det_bbox_init, gt_det_bbox_init, or gt_init."
+        )
+
+    print(
+        '[*] Ablation mode: '
+        f'{mode} | eval_use_network_forward={bool(getattr(cfg, "eval_use_network_forward", False))} '
+        f'use_gt_det={bool(getattr(cfg, "use_gt_det", False))} '
+        f'use_pred_extreme_init_for_inference='
+        f'{bool(getattr(cfg, "use_pred_extreme_init_for_inference", False))}'
+    )
+    det_conf = os.environ.get('EVAL_DET_CONF_THRESH', '').strip()
+    if det_conf:
+        cfg.det_conf_thresh = float(det_conf)
+        print(f'[*] Override det_conf_thresh -> {cfg.det_conf_thresh}')
+    det_iou = os.environ.get('EVAL_DET_IOU_THRESH', '').strip()
+    if det_iou:
+        cfg.det_iou_thresh = float(det_iou)
+        print(f'[*] Override det_iou_thresh -> {cfg.det_iou_thresh}')
+    det_max = os.environ.get('EVAL_DET_MAX_DET', '').strip()
+    if det_max:
+        cfg.det_max_det = int(det_max)
+        print(f'[*] Override det_max_det -> {cfg.det_max_det}')
+    return mode
+
+
 def poly_to_mask(poly_pts, h, w):
     mask = np.zeros((h, w), dtype=np.uint8)
     pts = np.round(poly_pts).astype(np.int32)
@@ -271,24 +329,261 @@ def build_sam_gt_box_init_polys(batch, gt_all, device):
     return torch.cat(polys, dim=0).to(device=device, dtype=gt_all.dtype)
 
 
-def save_visual(sample_dir, img, gt_polys, init_polys, pred_polys, per_contour_iou):
+_LABEL_PALETTE_BGR = [
+    (60, 180, 255),
+    (80, 220, 80),
+    (255, 120, 80),
+    (220, 120, 255),
+    (90, 220, 220),
+    (255, 210, 90),
+    (120, 160, 255),
+    (170, 230, 120),
+    (255, 150, 200),
+    (210, 210, 70),
+    (140, 120, 255),
+    (90, 170, 180),
+]
+
+
+def label_color(label):
+    try:
+        label_int = int(label)
+    except Exception:
+        label_int = 0
+    return _LABEL_PALETTE_BGR[label_int % len(_LABEL_PALETTE_BGR)]
+
+
+def soften_color(color, alpha=0.45):
+    base = np.array(color, dtype=np.float32)
+    gray = np.array([190, 190, 190], dtype=np.float32)
+    return tuple(int(v) for v in (alpha * base + (1.0 - alpha) * gray))
+
+
+def draw_dashed_line(img, p1, p2, color, thickness=1, dash_len=8, gap_len=5):
+    p1 = np.asarray(p1, dtype=np.float32)
+    p2 = np.asarray(p2, dtype=np.float32)
+    vec = p2 - p1
+    dist = float(np.linalg.norm(vec))
+    if dist < 1e-3:
+        return
+    direction = vec / dist
+    pos = 0.0
+    while pos < dist:
+        start = p1 + direction * pos
+        end = p1 + direction * min(pos + dash_len, dist)
+        cv2.line(
+            img,
+            tuple(np.round(start).astype(np.int32)),
+            tuple(np.round(end).astype(np.int32)),
+            color,
+            thickness=thickness,
+            lineType=cv2.LINE_AA,
+        )
+        pos += dash_len + gap_len
+
+
+def draw_polyline_style(img, poly, color, closed=True, thickness=1, style='solid'):
+    pts = np.round(poly).astype(np.int32)
+    if len(pts) < 2:
+        return
+    if style == 'solid':
+        cv2.polylines(img, [pts], closed, color, thickness, lineType=cv2.LINE_AA)
+        return
+    n = len(pts)
+    edge_count = n if closed else n - 1
+    for i in range(edge_count):
+        p1 = pts[i]
+        p2 = pts[(i + 1) % n]
+        if style == 'dotted':
+            draw_dashed_line(img, p1, p2, color, thickness=thickness, dash_len=2, gap_len=6)
+        else:
+            draw_dashed_line(img, p1, p2, color, thickness=thickness, dash_len=9, gap_len=6)
+
+
+def crop_poly_view(img, polys, margin=28):
+    valid = [np.asarray(poly, dtype=np.float32) for poly in polys if poly is not None and len(poly) > 0]
+    if not valid:
+        return img
+    pts = np.concatenate(valid, axis=0)
+    h, w = img.shape[:2]
+    x1 = max(0, int(np.floor(pts[:, 0].min())) - margin)
+    y1 = max(0, int(np.floor(pts[:, 1].min())) - margin)
+    x2 = min(w, int(np.ceil(pts[:, 0].max())) + margin)
+    y2 = min(h, int(np.ceil(pts[:, 1].max())) + margin)
+    if x2 <= x1 or y2 <= y1:
+        return img
+    return img[y1:y2, x1:x2].copy()
+
+
+def save_visual(
+    sample_dir,
+    img,
+    gt_polys,
+    init_polys,
+    pred_polys,
+    per_contour_iou,
+    matched_pred=None,
+    gt_labels=None,
+    pred_labels=None,
+):
     os.makedirs(sample_dir, exist_ok=True)
+    vis_style = os.environ.get('VIS_STYLE', '').strip().lower()
+    if vis_style in ('old', 'old_iou', 'legacy', 'very_old', 'old_blue_gt', 'legacy_blue_gt'):
+        gt_color = (255, 0, 0) if vis_style in ('very_old', 'old_blue_gt', 'legacy_blue_gt') else (0, 255, 0)
+        init_color = (0, 255, 255)
+        pred_color = (0, 0, 255)
+        if matched_pred is None:
+            matched_pred = list(range(min(len(gt_polys), len(pred_polys))))
+        show_unmatched = os.environ.get('VIS_SHOW_UNMATCHED', '1') != '0'
+        if show_unmatched:
+            pred_indices = list(range(len(pred_polys)))
+            init_indices = list(range(len(init_polys)))
+        else:
+            pred_indices = sorted({int(i) for i in matched_pred if 0 <= int(i) < len(pred_polys)})
+            init_indices = [i for i in pred_indices if i < len(init_polys)]
+        vis = img.copy()
+        for poly in gt_polys:
+            pts = np.round(poly).astype(np.int32)
+            if len(pts) >= 2:
+                cv2.polylines(vis, [pts], True, gt_color, 2, lineType=cv2.LINE_AA)
+        for init_idx in init_indices:
+            poly = init_polys[init_idx]
+            pts = np.round(poly).astype(np.int32)
+            if len(pts) >= 2:
+                cv2.polylines(vis, [pts], True, init_color, 1, lineType=cv2.LINE_AA)
+        for pred_idx in pred_indices:
+            poly = pred_polys[pred_idx]
+            pts = np.round(poly).astype(np.int32)
+            if len(pts) >= 2:
+                cv2.polylines(vis, [pts], True, pred_color, 2, lineType=cv2.LINE_AA)
+
+        for gt_idx, iou in enumerate(per_contour_iou):
+            pred_idx = int(matched_pred[gt_idx]) if gt_idx < len(matched_pred) else gt_idx
+            if pred_idx < 0 or pred_idx >= len(pred_polys):
+                continue
+            poly = pred_polys[pred_idx]
+            if len(poly) == 0:
+                continue
+            cx = int(poly[:, 0].mean())
+            cy = int(poly[:, 1].mean())
+            cv2.putText(
+                vis,
+                f'{iou * 100:.1f}%',
+                (cx - 24, cy),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.38,
+                (255, 255, 255),
+                1,
+                lineType=cv2.LINE_AA,
+            )
+        cv2.imwrite(os.path.join(sample_dir, 'overlay.png'), vis)
+        return
+
     vis = img.copy()
-    for poly in gt_polys:
-        cv2.polylines(vis, [poly.astype(np.int32)], True, (0, 255, 0), 2)
-    for poly in init_polys:
-        cv2.polylines(vis, [poly.astype(np.int32)], True, (0, 255, 255), 1)
-    for poly in pred_polys:
-        cv2.polylines(vis, [poly.astype(np.int32)], True, (0, 0, 255), 2)
+    label_vis = img.copy()
+    gt_vis = img.copy()
+    pred_vis = img.copy()
+    init_vis = img.copy()
+    pred_all_debug = img.copy()
+    init_all_debug = img.copy()
+    show_init = os.environ.get('VIS_SHOW_INIT', '0') != '0'
+    show_text = os.environ.get('VIS_SHOW_TEXT', '0') != '0'
+    show_unmatched = os.environ.get('VIS_SHOW_UNMATCHED', '0') != '0'
+    color_mode = os.environ.get('VIS_COLOR_MODE', 'role').strip().lower()
+    use_role_color = color_mode not in ('label', 'label_color', 'old', 'oldstyle')
+    gt_role_color = (80, 255, 80)
+    pred_role_color = (60, 60, 255)
+    init_role_color = (255, 200, 80)
 
-    for idx, iou in enumerate(per_contour_iou):
-        if idx >= len(pred_polys):
+    if matched_pred is None:
+        matched_pred = list(range(min(len(gt_polys), len(pred_polys))))
+    if gt_labels is None or len(gt_labels) != len(gt_polys):
+        gt_labels = np.zeros((len(gt_polys),), dtype=np.int32)
+    if pred_labels is None or len(pred_labels) != len(pred_polys):
+        pred_labels = np.full((len(pred_polys),), -1, dtype=np.int32)
+
+    pred_to_gt = {}
+    for gt_idx, pred_idx in enumerate(matched_pred):
+        if 0 <= int(pred_idx) < len(pred_polys):
+            pred_to_gt[int(pred_idx)] = gt_idx
+
+    # Draw init separately by default. When requested in overlay, keep it faint.
+    for pred_idx, poly in enumerate(init_polys):
+        gt_idx = pred_to_gt.get(pred_idx)
+        label = gt_labels[gt_idx] if gt_idx is not None else pred_labels[pred_idx]
+        color = soften_color(label_color(label), alpha=0.35) if gt_idx is not None else (150, 150, 150)
+        draw_polyline_style(init_all_debug, poly, color, thickness=1, style='dotted')
+        if gt_idx is None and not show_unmatched:
             continue
-        cx = int(pred_polys[idx, :, 0].mean())
-        cy = int(pred_polys[idx, :, 1].mean())
-        cv2.putText(vis, f'{idx}:{iou * 100:.1f}%', (cx - 25, cy), cv2.FONT_HERSHEY_SIMPLEX, 0.35, (255, 255, 255), 1)
+        draw_polyline_style(init_vis, poly, color, thickness=1, style='dotted')
+        if show_init:
+            draw_polyline_style(vis, poly, init_role_color if use_role_color else color, thickness=1, style='dotted')
+            draw_polyline_style(label_vis, poly, color, thickness=1, style='dotted')
 
+    for gt_idx, poly in enumerate(gt_polys):
+        color = label_color(gt_labels[gt_idx])
+        draw_polyline_style(vis, poly, gt_role_color if use_role_color else color, thickness=2 if use_role_color else 1, style='solid')
+        draw_polyline_style(label_vis, poly, color, thickness=1, style='solid')
+        draw_polyline_style(gt_vis, poly, gt_role_color if use_role_color else color, thickness=2 if use_role_color else 1, style='solid')
+
+    for pred_idx, poly in enumerate(pred_polys):
+        gt_idx = pred_to_gt.get(pred_idx)
+        label = gt_labels[gt_idx] if gt_idx is not None else pred_labels[pred_idx]
+        color = label_color(label) if gt_idx is not None else (120, 120, 120)
+        draw_polyline_style(pred_all_debug, poly, color, thickness=1, style='dashed')
+        if gt_idx is None and not show_unmatched:
+            continue
+        draw_polyline_style(vis, poly, pred_role_color if use_role_color else color, thickness=1, style='dashed')
+        draw_polyline_style(label_vis, poly, color, thickness=1, style='dashed')
+        draw_polyline_style(pred_vis, poly, pred_role_color if use_role_color else color, thickness=1, style='dashed')
+
+    if show_text:
+        for gt_idx, iou in enumerate(per_contour_iou):
+            pred_idx = int(matched_pred[gt_idx]) if gt_idx < len(matched_pred) else -1
+            if pred_idx < 0 or pred_idx >= len(pred_polys):
+                continue
+            cx = int(pred_polys[pred_idx, :, 0].mean())
+            cy = int(pred_polys[pred_idx, :, 1].mean())
+            label = int(gt_labels[gt_idx]) if gt_idx < len(gt_labels) else 0
+            cv2.putText(
+                vis,
+                f'g{gt_idx}/l{label}:{iou * 100:.1f}%',
+                (cx - 35, cy),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.32,
+                (255, 255, 255),
+                1,
+                lineType=cv2.LINE_AA,
+            )
+
+    if use_role_color:
+        cv2.putText(vis, 'GT solid green', (8, 18), cv2.FONT_HERSHEY_SIMPLEX, 0.45, gt_role_color, 1, lineType=cv2.LINE_AA)
+        cv2.putText(vis, 'Pred dashed red', (8, 36), cv2.FONT_HERSHEY_SIMPLEX, 0.45, pred_role_color, 1, lineType=cv2.LINE_AA)
     cv2.imwrite(os.path.join(sample_dir, 'overlay.png'), vis)
+    cv2.imwrite(os.path.join(sample_dir, 'overlay_label_color.png'), label_vis)
+    cv2.imwrite(os.path.join(sample_dir, 'gt_only.png'), gt_vis)
+    cv2.imwrite(os.path.join(sample_dir, 'pred_only.png'), pred_vis)
+    cv2.imwrite(os.path.join(sample_dir, 'init_only.png'), init_vis)
+    if not show_unmatched:
+        cv2.imwrite(os.path.join(sample_dir, 'pred_all_debug.png'), pred_all_debug)
+        cv2.imwrite(os.path.join(sample_dir, 'init_all_debug.png'), init_all_debug)
+
+    if os.environ.get('VIS_SAVE_PAIRS', '1') != '0':
+        pair_dir = os.path.join(sample_dir, 'pairs')
+        os.makedirs(pair_dir, exist_ok=True)
+        for gt_idx, gt_poly in enumerate(gt_polys):
+            pred_idx = int(matched_pred[gt_idx]) if gt_idx < len(matched_pred) else -1
+            if pred_idx < 0 or pred_idx >= len(pred_polys):
+                continue
+            label = int(gt_labels[gt_idx]) if gt_idx < len(gt_labels) else 0
+            color = label_color(label)
+            pair_vis = img.copy()
+            draw_polyline_style(pair_vis, gt_poly, color, thickness=1, style='solid')
+            draw_polyline_style(pair_vis, pred_polys[pred_idx], color, thickness=1, style='dashed')
+            crop = crop_poly_view(pair_vis, [gt_poly, pred_polys[pred_idx]])
+            iou = float(per_contour_iou[gt_idx]) if gt_idx < len(per_contour_iou) else 0.0
+            out_name = f'gt_{gt_idx:03d}_label_{label:02d}_iou_{iou:.3f}.png'
+            cv2.imwrite(os.path.join(pair_dir, out_name), crop)
 
 
 def eval_sample(model, device, batch, ode_steps=10, save_visuals=False, sample_dir=None):
@@ -307,6 +602,8 @@ def eval_sample(model, device, batch, ode_steps=10, save_visuals=False, sample_d
     )
     use_sam_gt_box_init = contour_init_method in ('sam', 'efficient_sam') and sam_prompt_source == 'gt_box'
     use_full_forward = (
+        not bool(getattr(cfg, 'eval_manual_gt_init', False))
+    ) and (
         use_sam_yolo_init
         or detector_backend != 'yolo'
         or bool(getattr(cfg, 'eval_use_network_forward', False))
@@ -318,6 +615,8 @@ def eval_sample(model, device, batch, ode_steps=10, save_visuals=False, sample_d
             raise RuntimeError('No GT polygons in batch')
 
         batch_size, num_contours, num_points, _ = gt_all.shape
+        gt_labels = None
+        pred_labels = None
 
         if use_full_forward:
             net_out = core(batch['inp'], batch)
@@ -327,29 +626,61 @@ def eval_sample(model, device, batch, ode_steps=10, save_visuals=False, sample_d
             init_src = net_out.get('i_it_py', torch.zeros_like(net_out['py']))
             init_polys = init_src.detach().cpu().numpy() * dr
             if 'ct_01' in batch:
-                gt_polys = gt_all[batch['ct_01'].bool()].detach().cpu().numpy() * dr
+                keep = batch['ct_01'].bool()
+                gt_polys = gt_all[keep].detach().cpu().numpy() * dr
+                if 'ct_cls' in batch:
+                    gt_labels = batch['ct_cls'][keep].detach().cpu().numpy().astype(np.int32)
             else:
                 gt_polys = gt_all.view(-1, num_points, 2).detach().cpu().numpy() * dr
+                if 'ct_cls' in batch:
+                    gt_labels = batch['ct_cls'].view(-1).detach().cpu().numpy().astype(np.int32)
+            if 'detection' in net_out and torch.is_tensor(net_out['detection']):
+                det = net_out['detection'].detach()
+                if det.numel() > 0 and det.size(-1) >= 6:
+                    det_flat = det.reshape(-1, det.size(-1))
+                    det_flat = det_flat[det_flat[:, 4] > 1e-4]
+                    pred_labels = det_flat[:, 5].detach().cpu().numpy().astype(np.int32)
             match_by_iou = not bool(getattr(cfg, 'use_gt_det', False))
         else:
-            if not hasattr(core, 'yolo') or core.yolo is None:
-                raise RuntimeError(f'Manual eval path requires YOLO backend, got detector_backend={detector_backend}')
-            yolo_out = core.yolo(batch['inp'])
-            feat_list = yolo_out[1] if isinstance(yolo_out, (list, tuple)) and len(yolo_out) > 1 else None
-            feat_p2 = feat_list[0] if isinstance(feat_list, (list, tuple)) else yolo_out
-            if getattr(core, 'use_swin_snake_feature', False):
-                if not hasattr(core, 'swin_snake_feature') or core.swin_snake_feature is None:
-                    raise RuntimeError('Swin feature evaluation requested but swin_snake_feature is missing')
-                cnn_feature = core.swin_snake_feature(batch['inp'])
-            else:
-                cnn_feature = core.cnn_proj(feat_p2)
-            if (not getattr(core, 'use_swin_snake_feature', False)) and getattr(core, 'use_p3_features', False) and hasattr(core, 'cnn_proj_p3'):
-                if isinstance(feat_list, (list, tuple)) and len(feat_list) > 1:
+            if detector_backend == 'yolo':
+                if not hasattr(core, 'yolo') or core.yolo is None:
+                    raise RuntimeError('Manual YOLO eval path requested but yolo module is missing')
+                yolo_out = core.yolo(batch['inp'])
+                feat_list = yolo_out[1] if isinstance(yolo_out, (list, tuple)) and len(yolo_out) > 1 else None
+                feat_p2 = feat_list[0] if isinstance(feat_list, (list, tuple)) else yolo_out
+                if getattr(core, 'use_swin_snake_feature', False):
+                    if not hasattr(core, 'swin_snake_feature') or core.swin_snake_feature is None:
+                        raise RuntimeError('Swin feature evaluation requested but swin_snake_feature is missing')
+                    cnn_feature = core.swin_snake_feature(batch['inp'])
+                else:
+                    cnn_feature = core.cnn_proj(feat_p2)
+                if (
+                    (not getattr(core, 'use_swin_snake_feature', False))
+                    and getattr(core, 'use_p3_features', False)
+                    and hasattr(core, 'cnn_proj_p3')
+                    and isinstance(feat_list, (list, tuple))
+                    and len(feat_list) > 1
+                ):
                     feat_p3 = feat_list[1]
                     feat_p3_up = torch.nn.functional.interpolate(
                         feat_p3, size=feat_p2.shape[-2:], mode='bilinear', align_corners=False
                     )
                     cnn_feature = cnn_feature + core.cnn_proj_p3(feat_p3_up)
+            elif (
+                detector_backend.startswith('heatmap_')
+                or detector_backend.startswith('convnext')
+                or detector_backend.startswith('moonvit')
+            ):
+                if not hasattr(core, 'heatmap_detector') or core.heatmap_detector is None:
+                    raise RuntimeError(f'Manual eval path requires heatmap_detector, got detector_backend={detector_backend}')
+                cnn_feature, _ct_hm, _wh, mask_logits = core.heatmap_detector(batch['inp'])
+                if mask_logits is not None:
+                    mask_guidance_alpha = float(getattr(cfg, 'heatmap_mask_guidance_alpha', 0.0))
+                    if mask_guidance_alpha > 0.0:
+                        mask_guidance = torch.sigmoid(mask_logits).amax(dim=1, keepdim=True)
+                        cnn_feature = cnn_feature * (1.0 + mask_guidance_alpha * mask_guidance)
+            else:
+                raise RuntimeError(f'Manual GT-init eval does not support detector_backend={detector_backend}')
 
             if use_sam_gt_box_init:
                 i_it_py = build_sam_gt_box_init_polys(batch, gt_all, device)
@@ -415,6 +746,9 @@ def eval_sample(model, device, batch, ode_steps=10, save_visuals=False, sample_d
             pred_polys = (i_it_py + disp).cpu().numpy() * dr
             gt_polys = gt_all.view(-1, num_points, 2).cpu().numpy() * dr
             init_polys = i_it_py.cpu().numpy() * dr
+            if 'ct_cls' in batch:
+                gt_labels = batch['ct_cls'].view(-1).detach().cpu().numpy().astype(np.int32)
+                pred_labels = gt_labels.copy()
             match_by_iou = False
 
     if 'orig_img' in batch:
@@ -441,7 +775,17 @@ def eval_sample(model, device, batch, ode_steps=10, save_visuals=False, sample_d
     )
 
     if save_visuals and sample_dir is not None:
-        save_visual(sample_dir, img, gt_polys, init_polys, pred_polys, per_contour_iou)
+        save_visual(
+            sample_dir,
+            img,
+            gt_polys,
+            init_polys,
+            pred_polys,
+            per_contour_iou,
+            matched_pred=matched_pred,
+            gt_labels=gt_labels,
+            pred_labels=pred_labels,
+        )
 
     return {
         'mean_iou': float(np.mean(per_contour_iou)) if per_contour_iou else 0.0,
@@ -464,6 +808,7 @@ def eval_sample(model, device, batch, ode_steps=10, save_visuals=False, sample_d
 
 def main():
     apply_gpu_override()
+    ablation_mode = apply_ablation_mode()
 
     ckpt = os.environ.get('CKPT')
     eval_seed = int(os.environ.get('EVAL_SEED', '20260504'))
@@ -559,6 +904,10 @@ def main():
         'timestamp': ts,
         'cfg_file': os.path.relpath(os.environ.get('CFG_FILE', _DEFAULT_CFG), _THIS_DIR),
         'ckpt': os.path.relpath(ckpt_path, _THIS_DIR),
+        'ablation_mode': ablation_mode,
+        'eval_use_network_forward': bool(getattr(cfg, 'eval_use_network_forward', False)),
+        'use_gt_det': bool(getattr(cfg, 'use_gt_det', False)),
+        'use_pred_extreme_init_for_inference': bool(getattr(cfg, 'use_pred_extreme_init_for_inference', False)),
         'eval_seed': eval_seed,
         'ode_steps': ode_steps,
         'dataset': cfg.test.dataset,
