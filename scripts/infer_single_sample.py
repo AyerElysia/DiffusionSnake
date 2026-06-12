@@ -39,21 +39,18 @@ from lib.datasets.make_dataset import make_dataset
 from lib.datasets.transforms import make_transforms
 from lib.datasets.collate_batch import make_collator
 from lib.utils.snake import snake_config
+from lib.utils.snake.viz_colors import (
+    draw_dotted_bbox,
+    draw_instance_legend,
+    draw_polyline_style,
+    instance_color,
+)
 
 
 def to_numpy(x):
     if isinstance(x, torch.Tensor):
         x = x.detach().cpu().numpy()
     return np.asarray(x, dtype=np.float32)
-
-
-def draw_poly(img, poly, color, thickness=2):
-    if poly is None:
-        return
-    pts = np.asarray(poly, dtype=np.int32)
-    if pts.size == 0:
-        return
-    cv2.polylines(img, [pts], isClosed=True, color=color, thickness=thickness)
 
 
 def apply_valid_point_mask(poly_pts, point_mask_row=None):
@@ -277,20 +274,21 @@ def infer_one(model, device, sample, out_path):
         init_vis.append(clip_poly(init_poly, h_img, w_img))
         pred_vis.append(clip_poly(pred_poly, h_img, w_img))
 
-    for poly in gt_vis:
-        draw_poly(orig_img, poly, (255, 0, 0), thickness=2)
-    for poly in init_vis:
-        draw_poly(orig_img, poly, (0, 255, 255), thickness=1)
-    for poly in pred_vis:
-        draw_poly(orig_img, poly, (0, 0, 255), thickness=2)
+    for idx, poly in enumerate(gt_vis):
+        draw_polyline_style(orig_img, poly, instance_color(idx), thickness=2, style='solid')
+    for idx, poly in enumerate(init_vis):
+        draw_dotted_bbox(orig_img, poly, instance_color(idx), thickness=1)
+    for idx, poly in enumerate(pred_vis):
+        draw_polyline_style(orig_img, poly, instance_color(idx), thickness=2, style='dashed')
     if int(_custom_args.annotate_pred_count) > 0:
         valid_counts = None
         if point_mask is not None:
             valid_counts = to_numpy(point_mask).sum(axis=1).astype(np.int32).tolist()
         annotate_pred_point_counts(orig_img, pred_vis, valid_counts=valid_counts)
-    if gt4_np is not None:
-        for poly in gt4_np:
-            draw_poly(orig_img, poly, (255, 0, 255), thickness=1)
+    if gt4_np is not None and os.environ.get('VIS_SHOW_GT4', '0') != '0':
+        for idx, poly in enumerate(gt4_np):
+            draw_polyline_style(orig_img, clip_poly(poly, h_img, w_img), instance_color(idx), thickness=1, style='dotted')
+    draw_instance_legend(orig_img, range(len(gt_vis)))
 
     os.makedirs(os.path.dirname(out_path), exist_ok=True)
     cv2.imwrite(out_path, orig_img)

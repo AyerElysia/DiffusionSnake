@@ -130,7 +130,9 @@ class RoutedFFNMoE(nn.Module):
     def reg_loss(self) -> torch.Tensor:
         if self._last_aux_loss is None:
             return self.router.weight.new_zeros(())
-        return self._last_aux_loss
+        aux_loss = self._last_aux_loss
+        self._last_aux_loss = None
+        return aux_loss
 
 
 class DiTBlockV3(nn.Module):

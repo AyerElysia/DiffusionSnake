@@ -35,9 +35,10 @@ class DiffusionPretrainNetworkWrapper(nn.Module):
 
         # 先验损失
         self.L_crit = F.mse_loss
+        self.ex_crit = F.smooth_l1_loss
 
         # 损失权重
-        default_scales = {'det': 1.0, 'diff': 1.0, 'prior': 1.0}
+        default_scales = {'det': 1.0, 'mask': 0.0, 'ex': 0.0, 'diff': 1.0, 'prior': 1.0}
         self.loss_scales = getattr(cfg, 'loss_scales', default_scales)
         for k, v in default_scales.items():
             if k not in self.loss_scales:
@@ -80,6 +81,58 @@ class DiffusionPretrainNetworkWrapper(nn.Module):
         if not losses:
             return contours.sum() * 0.0
         return torch.stack(losses).mean()
+
+    @staticmethod
+    def _poly_to_mask(poly: torch.Tensor, height: int, width: int) -> torch.Tensor:
+        if poly.numel() == 0 or poly.size(0) < 3:
+            return torch.zeros((height, width), device=poly.device, dtype=torch.bool)
+
+        yy, xx = torch.meshgrid(
+            torch.arange(height, device=poly.device, dtype=poly.dtype) + 0.5,
+            torch.arange(width, device=poly.device, dtype=poly.dtype) + 0.5,
+            indexing='ij',
+        )
+        x0 = poly[:, 0].clamp(0, max(width - 1, 0))
+        y0 = poly[:, 1].clamp(0, max(height - 1, 0))
+        x1 = torch.roll(x0, shifts=-1, dims=0)
+        y1 = torch.roll(y0, shifts=-1, dims=0)
+
+        denom = y1 - y0
+        eps = torch.full_like(denom, 1e-6)
+        denom = torch.where(denom.abs() < 1e-6, eps, denom)
+        crosses = (y0[:, None, None] > yy) != (y1[:, None, None] > yy)
+        x_at_y = (x1 - x0)[:, None, None] * (yy - y0[:, None, None]) / denom[:, None, None] + x0[:, None, None]
+        inside = crosses & (xx < x_at_y)
+        return (inside.sum(dim=0) % 2) == 1
+
+    def _build_heatmap_mask_target(self, batch, mask_logits: torch.Tensor) -> torch.Tensor:
+        bsz, channels, height, width = mask_logits.shape
+        target = torch.zeros_like(mask_logits)
+        if 'i_gt_py' not in batch or 'ct_cls' not in batch or 'ct_01' not in batch:
+            return target
+
+        polys = batch['i_gt_py'].to(device=mask_logits.device, dtype=mask_logits.dtype)
+        ct_cls = batch['ct_cls'].to(device=mask_logits.device)
+        ct_01 = batch['ct_01'].to(device=mask_logits.device).bool()
+        point_mask = batch.get('point_mask', None)
+        if isinstance(point_mask, torch.Tensor):
+            point_mask = point_mask.to(device=mask_logits.device)
+        class_offset = int(getattr(cfg, 'heatmap_class_offset', 0))
+
+        with torch.no_grad():
+            for b in range(min(bsz, polys.size(0))):
+                valid_inds = ct_01[b].nonzero(as_tuple=False).flatten()
+                for ind in valid_inds:
+                    cls_id = int(ct_cls[b, ind].item()) - class_offset
+                    if cls_id < 0 or cls_id >= channels:
+                        continue
+                    poly = polys[b, ind]
+                    if isinstance(point_mask, torch.Tensor) and point_mask.dim() == 3:
+                        valid_pts = point_mask[b, ind] > 0.5
+                        poly = poly[valid_pts]
+                    mask = self._poly_to_mask(poly, height, width).to(dtype=target.dtype)
+                    target[b, cls_id] = torch.maximum(target[b, cls_id], mask)
+        return target
 
     def forward(self, batch):
         # 仅调用原网络，保证不会进入 GRPO 分支
@@ -138,9 +191,85 @@ class DiffusionPretrainNetworkWrapper(nn.Module):
         else:
             scalar_stats.update({'det_loss': torch.tensor(0.0, device=base_device)})
 
-        # 2) Diffusion 去噪损失
+        # 1.5) Class-aware polygon mask loss. This is used by V8.2 to give the
+        # heatmap detector dense shape supervision in addition to center/box loss.
+        mask_weight = float(self.loss_scales.get('mask', 0.0))
+        if mask_weight > 0.0 and ('mask_logits' in output):
+            mask_logits = output['mask_logits']
+            mask_target = self._build_heatmap_mask_target(batch, mask_logits)
+            pos_weight_value = float(getattr(cfg, 'heatmap_mask_pos_weight', 5.0))
+            pos_weight = torch.full(
+                (1, mask_logits.size(1), 1, 1),
+                pos_weight_value,
+                device=mask_logits.device,
+                dtype=mask_logits.dtype,
+            )
+            mask_bce = F.binary_cross_entropy_with_logits(mask_logits, mask_target, pos_weight=pos_weight)
+            mask_prob = torch.sigmoid(mask_logits)
+            reduce_dims = (0, 2, 3)
+            inter = (mask_prob * mask_target).sum(dim=reduce_dims)
+            denom = mask_prob.sum(dim=reduce_dims) + mask_target.sum(dim=reduce_dims)
+            active = mask_target.sum(dim=reduce_dims) > 0
+            if bool(active.any()):
+                mask_dice = (1.0 - (2.0 * inter[active] + 1.0) / (denom[active] + 1.0)).mean()
+            else:
+                mask_dice = mask_bce * 0.0
+            dice_weight = float(getattr(cfg, 'heatmap_mask_dice_weight', 1.0))
+            mask_loss = mask_bce + dice_weight * mask_dice
+            loss = loss + mask_weight * mask_loss
+            scalar_stats.update({
+                'mask_loss': mask_loss,
+                'mask_bce': mask_bce,
+                'mask_dice': mask_dice,
+                'mask_loss_scaled': mask_weight * mask_loss,
+            })
+        else:
+            scalar_stats.update({'mask_loss': torch.tensor(0.0, device=base_device)})
+
+        # 2) Extreme-point refinement loss. This aligns detector-side init with
+        # the octagon initialization used by diffusion training/inference.
+        ex_weight = float(self.loss_scales.get('ex', 0.0))
+        if (
+            ex_weight > 0.0
+            and (not self.freeze_snake)
+            and ('ex_pred' in output)
+            and ('i_gt_4py' in output)
+        ):
+            ex_target = output['i_gt_4py'].to(device=output['ex_pred'].device, dtype=output['ex_pred'].dtype)
+            ex_loss = self.ex_crit(output['ex_pred'], ex_target)
+            loss = loss + ex_weight * ex_loss
+            scalar_stats.update({'ex_loss': ex_loss, 'ex_loss_scaled': ex_weight * ex_loss})
+        else:
+            scalar_stats.update({'ex_loss': torch.tensor(0.0, device=base_device)})
+
+        eagle_weight = float(getattr(cfg, 'eagle_teacher_loss_weight', 0.0))
+        if (
+            eagle_weight > 0.0
+            and (not self.freeze_snake)
+            and ('ex_pred' in output)
+            and ('eagle_i_gt_4py' in batch)
+            and ('eagle_4py_mask' in batch)
+        ):
+            ct_01 = batch['ct_01'].to(device=output['ex_pred'].device).bool()
+            teacher = batch['eagle_i_gt_4py'].to(device=output['ex_pred'].device, dtype=output['ex_pred'].dtype)
+            teacher_mask = batch['eagle_4py_mask'].to(device=output['ex_pred'].device).bool()
+            teacher_flat = torch.cat([teacher[b][ct_01[b]] for b in range(ct_01.size(0))], dim=0)
+            mask_flat = torch.cat([teacher_mask[b][ct_01[b]] for b in range(ct_01.size(0))], dim=0)
+            if teacher_flat.numel() > 0 and bool(mask_flat.any()):
+                eagle_loss = self.ex_crit(output['ex_pred'][mask_flat], teacher_flat[mask_flat])
+                loss = loss + eagle_weight * eagle_loss
+            else:
+                eagle_loss = output['ex_pred'].sum() * 0.0
+            scalar_stats.update({
+                'eagle_ex_loss': eagle_loss,
+                'eagle_ex_loss_scaled': eagle_weight * eagle_loss,
+            })
+        else:
+            scalar_stats.update({'eagle_ex_loss': torch.tensor(0.0, device=base_device)})
+
+        # 3) Diffusion 去噪损失
         if (not self.freeze_snake) and ('diff_loss' in output):
-            diff_weight = float(getattr(cfg, 'diffusion_loss_weight', 1.0))
+            diff_weight = float(getattr(cfg, 'diffusion_loss_weight', 1.0)) * float(self.loss_scales.get('diff', 1.0))
             loss = loss + diff_weight * output['diff_loss']
             scalar_stats.update({'diff_loss': output['diff_loss'], 'diff_loss_scaled': diff_weight * output['diff_loss']})
             for k_, v_ in output.items():
@@ -148,6 +277,25 @@ class DiffusionPretrainNetworkWrapper(nn.Module):
                     scalar_stats[k_] = v_
         else:
             scalar_stats.update({'diff_loss': torch.tensor(0.0, device=base_device)})
+
+        for debug_key in (
+            'ex_box_jitter_count',
+            'pred_extreme_init_count',
+            'gt_extreme_init_count',
+            'pred_extreme_init_prob_effective',
+            'locate_feat_residual_absmax',
+            'locate_feat_adapter_last_absmax',
+            'locate_feat_replace_absmax',
+        ):
+            if debug_key in output:
+                value = output[debug_key]
+                if isinstance(value, torch.Tensor):
+                    scalar_stats[debug_key] = value.detach().cpu()
+                else:
+                    try:
+                        scalar_stats[debug_key] = torch.tensor(float(value))
+                    except Exception:
+                        pass
 
         # 4) Combined metric for monitoring: detection loss + diffusion loss (both unscaled)
         det_l = scalar_stats.get('det_loss', None)

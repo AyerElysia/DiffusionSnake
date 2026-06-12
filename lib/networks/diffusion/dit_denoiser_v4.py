@@ -325,7 +325,9 @@ class MoEFinalHead(nn.Module):
         if self._last_aux_loss is None:
             param = self.linear.weight
             return param.new_zeros(())
-        return self._last_aux_loss
+        aux_loss = self._last_aux_loss
+        self._last_aux_loss = None
+        return aux_loss
 
 
 class LatentLoopBlock(nn.Module):

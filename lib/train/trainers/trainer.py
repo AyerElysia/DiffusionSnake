@@ -18,7 +18,7 @@ class Trainer(object):
 
     def to_cuda(self, batch):
         for k, v in list(batch.items()):
-            if k in ('meta', 'orig_img', 'img_path'):
+            if k in ('meta', 'orig_img', 'img_path') or k == 'locate_feat' or str(k).startswith('locate_feat_'):
                 continue
             # list/tuple of tensors
             if isinstance(v, (list, tuple)):
@@ -205,7 +205,7 @@ class Trainer(object):
         for batch in tqdm.tqdm(data_loader):
             # move only tensors to CUDA, keep others on CPU
             for k, v in list(batch.items()):
-                if k == 'meta':
+                if k in ('meta', 'orig_img', 'img_path') or k == 'locate_feat' or str(k).startswith('locate_feat_'):
                     continue
                 if isinstance(v, (list, tuple)):
                     moved = []

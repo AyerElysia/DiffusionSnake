@@ -11,6 +11,8 @@ from lib.config import cfg
 from lib.utils.getedge import binary_mask_to_polygon
 import sys
 import glob
+import json
+from pathlib import Path
 
 class Dataset(data.Dataset):
     def __init__(self, ann_file, data_root, split):
@@ -18,6 +20,20 @@ class Dataset(data.Dataset):
 
         self.data_root = data_root
         self.split = split
+        self.eagle_teacher = self._load_eagle_teacher()
+        self.locate_feat_enabled = bool(
+            getattr(cfg, 'locate_feat_inject', False)
+            or getattr(cfg, 'locate_feat_replace', False)
+            or getattr(cfg, 'use_locate_token_dit', False)
+        )
+        cache_root = getattr(cfg, 'locate_feat_cache_dir', '') or getattr(cfg, 'locate_feat_cache_root', 'data/locate_feat_cache')
+        self.locate_feat_cache_root = str(cache_root or '')
+        keys = getattr(cfg, 'locate_feat_keys', ['feat'])
+        if isinstance(keys, str):
+            keys = [x.strip() for x in keys.split(',') if x.strip()]
+        self.locate_feat_keys = list(keys) if keys else ['feat']
+        split_name = str(split).lower()
+        self.locate_feat_split = 'test' if split_name in ('val', 'test') else 'train'
 
         self.coco = None
         self.anns = np.array([], dtype=np.int64)
@@ -108,6 +124,186 @@ class Dataset(data.Dataset):
                     cls_id = int(os.path.basename(mpath).split('.')[0].split('_')[-1])
                     for p_idx in range(len(polys)):
                         self.samples.append((idx, mpath, cls_id, p_idx))
+
+        if self.locate_feat_enabled:
+            print(
+                f"[LocateFeat] enabled root={self.locate_feat_cache_root} "
+                f"split={self.locate_feat_split} keys={self.locate_feat_keys}",
+                flush=True,
+            )
+
+    @staticmethod
+    def _path_keys(path):
+        path = str(path)
+        base = os.path.basename(path)
+        stem = os.path.splitext(base)[0]
+        return {path, os.path.abspath(path), base, stem}
+
+    def _load_eagle_teacher(self):
+        teacher_path = str(getattr(cfg, 'eagle_teacher_json', '') or '').strip()
+        if not teacher_path:
+            return {}
+        if not os.path.exists(teacher_path):
+            print(f"[EagleTeacher] teacher json not found: {teacher_path}")
+            return {}
+        with open(teacher_path, 'r', encoding='utf-8') as f:
+            obj = json.load(f)
+
+        if isinstance(obj, dict) and isinstance(obj.get('samples'), list):
+            records = obj['samples']
+        elif isinstance(obj, list):
+            records = obj
+        elif isinstance(obj, dict):
+            records = []
+            for k, v in obj.items():
+                if isinstance(v, dict):
+                    rec = dict(v)
+                    rec.setdefault('img_path', k)
+                    records.append(rec)
+                elif isinstance(v, list):
+                    records.append({'img_path': k, 'instances': v})
+        else:
+            records = []
+
+        teacher = {}
+        for rec in records:
+            if not isinstance(rec, dict):
+                continue
+            path = (
+                rec.get('img_path') or rec.get('image_path') or rec.get('path')
+                or rec.get('file_name') or rec.get('image') or rec.get('id')
+            )
+            if path is None:
+                continue
+            instances = rec.get('instances') or rec.get('objects') or rec.get('predictions') or rec.get('labels')
+            if instances is None:
+                instances = [rec]
+            for key in self._path_keys(path):
+                teacher[str(key)] = instances
+        print(f"[EagleTeacher] loaded {len(records)} records from {teacher_path}")
+        return teacher
+
+    def _get_eagle_instances(self, img_path):
+        if not self.eagle_teacher:
+            return []
+        for key in self._path_keys(img_path):
+            if str(key) in self.eagle_teacher:
+                return self.eagle_teacher[str(key)]
+        return []
+
+    def _locate_feat_path(self, img_path):
+        stem = Path(str(img_path)).stem
+        return os.path.join(self.locate_feat_cache_root, self.locate_feat_split, f'{stem}.npz')
+
+    def _load_locate_feature(self, img_path):
+        if not self.locate_feat_enabled:
+            return {}
+        feat_path = self._locate_feat_path(img_path)
+        if not os.path.exists(feat_path):
+            raise FileNotFoundError(
+                f"Locate feature cache missing for image={img_path}; expected npz={feat_path}"
+            )
+        try:
+            with np.load(feat_path) as npz:
+                def get_npz(key, default):
+                    return npz[key] if key in npz.files else default
+
+                missing_keys = [key for key in self.locate_feat_keys if key not in npz.files]
+                if missing_keys:
+                    raise KeyError(
+                        f"missing feature keys={missing_keys}; available={list(npz.files)}"
+                    )
+                arrays = [np.asarray(npz[key], dtype=np.float16) for key in self.locate_feat_keys]
+                shapes = {tuple(arr.shape[-2:]) for arr in arrays}
+                if len(shapes) != 1:
+                    raise ValueError(f"Locate feature spatial sizes differ: {[arr.shape for arr in arrays]}")
+                feat = arrays[0] if len(arrays) == 1 else np.concatenate(arrays, axis=0)
+                meta = {
+                    'locate_feat': feat,
+                    'locate_feat_grid_hw': np.asarray(get_npz('grid_hw', feat.shape[-2:]), dtype=np.int32),
+                    'locate_feat_orig_hw': np.asarray(get_npz('orig_hw', [0, 0]), dtype=np.int32),
+                    'locate_feat_resized_hw': np.asarray(get_npz('resized_hw', [0, 0]), dtype=np.int32),
+                    'locate_feat_padded_hw': np.asarray(get_npz('padded_hw', [0, 0]), dtype=np.int32),
+                    'locate_feat_pad': np.asarray(get_npz('pad', [0, 0, 0, 0]), dtype=np.int32),
+                    'locate_feat_scale': np.asarray(get_npz('scale', [1.0]), dtype=np.float32),
+                    'locate_feat_patch_size': np.asarray(get_npz('patch_size', [14]), dtype=np.int32),
+                    'locate_feat_path': feat_path,
+                }
+        except Exception as exc:
+            raise RuntimeError(f"Failed to read Locate feature cache {feat_path}: {exc}") from exc
+        return meta
+
+    @staticmethod
+    def _teacher_label(obj):
+        for key in ('label_id', 'cls_id', 'class_id', 'category_id', 'label'):
+            if key in obj:
+                try:
+                    return int(obj[key])
+                except Exception:
+                    return None
+        return None
+
+    @staticmethod
+    def _teacher_extreme_points(obj):
+        pts = (
+            obj.get('extreme_points') or obj.get('extremes') or obj.get('points_4')
+            or obj.get('extreme_4py') or obj.get('points')
+        )
+        if pts is None:
+            return None
+        pts = np.asarray(pts, dtype=np.float32).reshape(-1, 2)
+        if pts.shape[0] < 4:
+            return None
+        return pts[:4]
+
+    def _transform_eagle_points(self, points, flipped, width, trans_output, inp_out_hw):
+        output_h, output_w = inp_out_hw[2:]
+        poly = np.asarray(points, dtype=np.float32).reshape(-1, 2)
+        if flipped:
+            poly = poly.copy()
+            poly[:, 0] = width - np.array(poly[:, 0]) - 1
+        transformed = snake_voc_utils.transform_polys([poly], trans_output, output_h, output_w)
+        if not transformed:
+            return None
+        transformed = transformed[0].astype(np.float32)
+        transformed[:, 0] = np.clip(transformed[:, 0], 0, output_w - 1)
+        transformed[:, 1] = np.clip(transformed[:, 1], 0, output_h - 1)
+        return transformed[:4]
+
+    def _build_eagle_targets(self, img_path, cls_ids_ordered, flipped, width, trans_output, inp_out_hw):
+        instances = self._get_eagle_instances(img_path)
+        if not instances:
+            return None, None
+        conf_thresh = float(getattr(cfg, 'eagle_teacher_conf_thresh', 0.0))
+        queues = {}
+        for obj in instances:
+            if not isinstance(obj, dict):
+                continue
+            score = float(obj.get('confidence', obj.get('score', 1.0)))
+            if score < conf_thresh:
+                continue
+            label = self._teacher_label(obj)
+            pts = self._teacher_extreme_points(obj)
+            if label is None or pts is None:
+                continue
+            pts = self._transform_eagle_points(pts, flipped, width, trans_output, inp_out_hw)
+            if pts is None or pts.shape[0] < 4:
+                continue
+            queues.setdefault(label, []).append(pts)
+
+        targets = []
+        mask = []
+        for cls_id in cls_ids_ordered:
+            q = queues.get(int(cls_id), [])
+            if q:
+                targets.append(q.pop(0))
+                mask.append(1.0)
+            else:
+                targets.append(np.zeros((4, 2), dtype=np.float32))
+                mask.append(0.0)
+        if not targets:
+            return None, None
+        return targets, mask
 
 
     def process_info(self, img_id):
@@ -380,6 +576,7 @@ class Dataset(data.Dataset):
         c_it_pys = []
         i_gt_pys = []
         c_gt_pys = []
+        eagle_cls_ordered = []
         k=0
         
             
@@ -405,6 +602,7 @@ class Dataset(data.Dataset):
                         continue
 
 
+                    eagle_cls_ordered.append(cls_id)
                     self.prepare_detection(bbox, poly, ct_hm, cls_id, wh, ct_cls, ct_ind)
                     # Build YOLO targets: convert bbox (in output coords) to input coords, then to normalized xywh
                     inp_h, inp_w = inp_out_hw[0], inp_out_hw[1]
@@ -439,6 +637,21 @@ class Dataset(data.Dataset):
         ret.update(init)
         ret.update(evolution)
         ret.update({'img_path': img_path})
+        locate_feat = self._load_locate_feature(img_path)
+        if locate_feat:
+            ret.update(locate_feat)
+        if bool(getattr(cfg, 'use_eagle_teacher_init', False)):
+            eagle_4py, eagle_mask = self._build_eagle_targets(
+                img_path,
+                eagle_cls_ordered,
+                flipped,
+                width,
+                trans_output,
+                inp_out_hw,
+            )
+            if eagle_4py is not None and eagle_mask is not None:
+                ret['eagle_i_gt_4py'] = eagle_4py
+                ret['eagle_4py_mask'] = eagle_mask
 
         # Attach YOLO target tensors expected by v8DetectionLoss
         if len(yolo_xywh) > 0:
@@ -458,7 +671,17 @@ class Dataset(data.Dataset):
             visualize_utils.visualize_snake_evolution(orig_img, ret)
 
         ct_num = len(ct_ind)
-        meta = {'center': center, 'scale': scale, 'ct_num': ct_num}
+        inv_trans_input = cv2.invertAffineTransform(trans_input).astype(np.float32)
+        meta = {
+            'center': center,
+            'scale': scale,
+            'ct_num': ct_num,
+            'trans_input': trans_input.astype(np.float32),
+            'inv_trans_input': inv_trans_input,
+            'flipped': np.asarray([1 if flipped else 0], dtype=np.float32),
+            'orig_hw': np.asarray([height, width], dtype=np.float32),
+            'inp_out_hw': np.asarray(inp_out_hw, dtype=np.float32),
+        }
         ret.update({'meta': meta})
 
         return ret

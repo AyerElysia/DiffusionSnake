@@ -1,0 +1,125 @@
+# V4.6c no-DET 10k-epoch continuation on the 1232_final dataset.
+# Train/test data are expected under /home/medteam/Zhrch/Datasets/1232_final.
+
+model: 'sbd'
+network: 'ro_34'
+task: 'snake'
+model_dir: "data/outputs/1232_final_diffusion_dit_v4_6c_mlp_shared_moe_nodet_continue_gpu3"
+
+gpus: [0, 1, 2, 3]
+resume: true
+resume_weights_only: false
+resume_path: "data/outputs/1232_final_diffusion_dit_v4_6c_mlp_shared_moe_nodet_continue_gpu3/checkpoints/epoch_1500_bs12_step33000_no_scheduler.pt"
+
+train_or_test: train
+
+train:
+    dataset: 'BtcvTrain'
+    data_path: '/home/medteam/Zhrch/Datasets/1232_final/train'
+    per_contour: false
+    merge_with_val: false
+
+    optim: 'adamw'
+    lr: 8e-6
+    milestones: (80, 120)
+    gamma: 0.5
+    batch_size: 12
+    gradient_accumulation_steps: 1
+    gradient_clip: 1.0
+    weight_decay: 0.01
+    warmup_steps: 100
+    disable_scheduler: true
+
+    epoch: 10000
+    num_workers: 4
+    save_ep: 100
+
+test:
+    dataset: 'BtcvVal'
+    batch_size: 1
+    img_path: '/home/medteam/Zhrch/Datasets/1232_final/train'
+    epoch: -1
+
+use_nms_for_snake: true
+det_conf_thresh: 0.01
+det_iou_thresh: 0.45
+det_max_det: 100
+per_class_nms: true
+use_gt_det: true
+
+loss_scales: {det: 0.0, diff: 1.0, prior: 0.0, smooth: 0.0, curv: 0.0}
+
+use_diffusion_evolution: true
+use_flow_matching: true
+flow_ode_steps: 10
+flow_noise_scale: 1.0
+flow_train_noise_scale: 1.0
+flow_fix_t0: false
+
+diffusion_loss_weight: 1.0
+diffusion_loss_type: 'adaptive'
+diffusion_disp_norm: true
+diffusion_disp_stats: "data/stats/1232_final_disp_stats_octagon.json"
+
+use_dit_v3: true
+use_dit_v4_1: true
+dit_num_layers: 6
+dit_num_heads: 8
+dit_state_dim: 256
+
+use_iterative_refinement: true
+iterative_num_steps: 5
+iterative_fractions: [0.3333, 0.5, 0.80, 0.97, 1.0]
+iterative_ode_steps: 20
+
+infer_noise_scale: 1.0
+infer_avg_samples: 1
+
+use_grpo: false
+heads: {'ct_hm': 52, 'wh': 2}
+yolo_num_classes: 51
+freeze_yolo: true
+segm_or_bbox: 'segm'
+use_diffusion_trainer: true
+
+yolo_model_scale: 's'
+v4_1_use_p3_features: true
+v4_1_use_detail_context: true
+v4_1_detail_context_mode: 'normal'
+v4_1_use_per_point_delta: false
+v4_1_use_curvature_reweight: false
+v4_1_small_disp_prob: 0.25
+v4_1_small_disp_min_frac: 0.80
+v4_1_small_disp_max_frac: 0.95
+
+v4_1_final_head_type: 'moe'
+v4_6_moe_num_experts: 8
+v4_6_moe_top_k: 2
+v4_6_moe_balance_weight: 0.001
+v4_6_moe_expert_init_std: 0.0001
+v4_6_moe_router_noise_std: 0.01
+v4_6_moe_use_point_embed: true
+v4_6_moe_use_cyclic_router: true
+v4_6_moe_use_shared_expert: true
+v4_6_moe_routed_expert_scale: 1.0
+v4_6_moe_expert_type: 'mlp'
+v4_6_moe_expert_hidden_dim: 256
+
+v4_9_use_rich_state_sampling: true
+v4_9_use_rich_infer_schedule: true
+v4_9_infer_target_fractions: [0.3333, 0.5, 0.80, 0.97, 1.0]
+v4_9_continuous_state_prob: 0.15
+v4_9_discrete_state_prob: 0.40
+v4_9_discrete_fractions: [0.3333, 0.5, 1.0]
+v4_9_small_state_prob: 0.25
+v4_9_hard_far_state_prob: 0.05
+v4_9_near_zero_state_prob: 0.15
+v4_9_continuous_min_frac: 0.05
+v4_9_continuous_max_frac: 0.85
+v4_9_hard_far_min_frac: 0.0
+v4_9_hard_far_max_frac: 0.20
+v4_9_near_zero_min_frac: 0.97
+v4_9_near_zero_max_frac: 0.999
+
+dataloader_persistent_workers: true
+dataloader_prefetch_factor: 2

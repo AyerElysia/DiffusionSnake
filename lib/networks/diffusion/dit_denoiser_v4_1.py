@@ -4,6 +4,8 @@ V4.1 keeps the proven V3.4 detail backbone for checkpoint reuse and adds only a
 zero-init per-point residual head for small local contour corrections.
 """
 
+import torch
+
 from .dit_denoiser_v3_4 import DiTFlowMatchingV3_4
 from .dit_denoiser_v4 import LatentLoopBlock, MoEFinalHead, PerPointDeltaHead, StrongPerPointDeltaHead
 
@@ -108,6 +110,9 @@ class DiTFlowMatchingV4_1(DiTFlowMatchingV3_4):
         contour_scale=None,
         detail_feat=None,
         x_self_cond=None,
+        locate_point_ctx=None,
+        locate_global_ctx=None,
+        locate_only: bool = False,
     ):
         assert x_t.dim() == 3 and x_t.shape[-1] == 2, \
             f"Expected x_t shape (N, P, 2), got {x_t.shape}"
@@ -126,6 +131,10 @@ class DiTFlowMatchingV4_1(DiTFlowMatchingV3_4):
             t = t.to(param_dtype)
         if detail_feat is not None and detail_feat.dtype != param_dtype:
             detail_feat = detail_feat.to(param_dtype)
+        if locate_point_ctx is not None and locate_point_ctx.dtype != param_dtype:
+            locate_point_ctx = locate_point_ctx.to(param_dtype)
+        if locate_global_ctx is not None and locate_global_ctx.dtype != param_dtype:
+            locate_global_ctx = locate_global_ctx.to(param_dtype)
 
         n_contours, _, _ = x_t.shape
         t_emb = self.time_emb_net(t)
@@ -133,21 +142,37 @@ class DiTFlowMatchingV4_1(DiTFlowMatchingV3_4):
         if cnn_feature.dim() == 3:
             cnn_feature = cnn_feature.unsqueeze(0)
 
-        global_ctx = self.global_compressor(cnn_feature)
-        if py_ind is not None:
-            global_ctx = global_ctx[py_ind]
-        elif global_ctx.shape[0] != n_contours:
-            if global_ctx.shape[0] == 1:
-                global_ctx = global_ctx.expand(n_contours, -1, -1)
-            else:
-                raise ValueError(
-                    f"Batch dimension mismatch: global_ctx={global_ctx.shape[0]}, N={n_contours}"
-                )
+        use_locate = locate_point_ctx is not None or locate_global_ctx is not None
+        if locate_only and use_locate:
+            sampled_for_point = torch.zeros_like(sampled_feat)
+        else:
+            sampled_for_point = sampled_feat
 
-        local_ctx = self.local_proj(sampled_feat.transpose(1, 2))
-        x = self.point_embed(x_t, sampled_feat)
+        if locate_global_ctx is not None:
+            global_ctx = locate_global_ctx
+        else:
+            global_ctx = self.global_compressor(cnn_feature)
+            if py_ind is not None:
+                global_ctx = global_ctx[py_ind]
+            elif global_ctx.shape[0] != n_contours:
+                if global_ctx.shape[0] == 1:
+                    global_ctx = global_ctx.expand(n_contours, -1, -1)
+                else:
+                    raise ValueError(
+                        f"Batch dimension mismatch: global_ctx={global_ctx.shape[0]}, N={n_contours}"
+                    )
 
-        if self.use_detail_context and detail_feat is not None:
+        if locate_only and locate_point_ctx is not None:
+            local_ctx = locate_point_ctx
+        else:
+            local_ctx = self.local_proj(sampled_feat.transpose(1, 2))
+            if locate_point_ctx is not None:
+                local_ctx = local_ctx + locate_point_ctx
+        x = self.point_embed(x_t, sampled_for_point)
+        if locate_point_ctx is not None:
+            x = x + locate_point_ctx
+
+        if (not (locate_only and use_locate)) and self.use_detail_context and detail_feat is not None:
             detail_ctx = detail_feat.transpose(1, 2)
             local_ctx = local_ctx + self.detail_local_proj(detail_ctx)
             x = x + self.detail_point_proj(detail_ctx)

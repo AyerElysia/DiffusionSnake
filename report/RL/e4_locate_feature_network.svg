@@ -1,0 +1,177 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1800" height="1260" viewBox="0 0 1800 1260">
+  <defs>
+    <style>
+      .bg { fill: #f7f8fb; }
+      .title { font-family: Arial, "Noto Sans CJK SC", sans-serif; font-size: 38px; font-weight: 700; fill: #18202f; }
+      .subtitle { font-family: Arial, "Noto Sans CJK SC", sans-serif; font-size: 20px; fill: #526070; }
+      .section { font-family: Arial, "Noto Sans CJK SC", sans-serif; font-size: 25px; font-weight: 700; fill: #18202f; }
+      .boxTitle { font-family: Arial, "Noto Sans CJK SC", sans-serif; font-size: 21px; font-weight: 700; fill: #18202f; }
+      .boxText { font-family: Arial, "Noto Sans CJK SC", sans-serif; font-size: 17px; fill: #344052; }
+      .small { font-family: Arial, "Noto Sans CJK SC", sans-serif; font-size: 15px; fill: #4d5a6b; }
+      .note { font-family: Arial, "Noto Sans CJK SC", sans-serif; font-size: 17px; fill: #61430b; }
+      .code { font-family: "DejaVu Sans Mono", Consolas, monospace; font-size: 16px; fill: #253044; }
+      .panel { fill: #ffffff; stroke: #d8dee9; stroke-width: 2; rx: 18; }
+      .offline { fill: #eef7ff; stroke: #87b8e8; stroke-width: 2; rx: 14; }
+      .cache { fill: #f1fbf2; stroke: #80bd7b; stroke-width: 2; rx: 14; }
+      .main { fill: #fff7e8; stroke: #dfa648; stroke-width: 2; rx: 14; }
+      .adapter { fill: #f4efff; stroke: #9d83d9; stroke-width: 2; rx: 14; }
+      .head { fill: #fff0f0; stroke: #d67d7d; stroke-width: 2; rx: 14; }
+      .fusion { fill: #edf8f7; stroke: #59aaa3; stroke-width: 2.5; rx: 14; }
+      .warn { fill: #fff8db; stroke: #ddb744; stroke-width: 2; rx: 12; }
+      .arrow { stroke: #536172; stroke-width: 2.6; fill: none; marker-end: url(#arrow); }
+      .arrowDashed { stroke: #7a627c; stroke-width: 2.4; fill: none; stroke-dasharray: 8 6; marker-end: url(#arrow); }
+      .arrowGreen { stroke: #4d9360; stroke-width: 2.8; fill: none; marker-end: url(#arrowGreen); }
+      .arrowRed { stroke: #b76565; stroke-width: 2.6; fill: none; marker-end: url(#arrowRed); }
+      .arrowBlue { stroke: #4d81b7; stroke-width: 2.6; fill: none; marker-end: url(#arrowBlue); }
+    </style>
+    <marker id="arrow" markerWidth="12" markerHeight="12" refX="10" refY="6" orient="auto" markerUnits="strokeWidth">
+      <path d="M2,2 L10,6 L2,10 z" fill="#536172"/>
+    </marker>
+    <marker id="arrowGreen" markerWidth="12" markerHeight="12" refX="10" refY="6" orient="auto" markerUnits="strokeWidth">
+      <path d="M2,2 L10,6 L2,10 z" fill="#4d9360"/>
+    </marker>
+    <marker id="arrowRed" markerWidth="12" markerHeight="12" refX="10" refY="6" orient="auto" markerUnits="strokeWidth">
+      <path d="M2,2 L10,6 L2,10 z" fill="#b76565"/>
+    </marker>
+    <marker id="arrowBlue" markerWidth="12" markerHeight="12" refX="10" refY="6" orient="auto" markerUnits="strokeWidth">
+      <path d="M2,2 L10,6 L2,10 z" fill="#4d81b7"/>
+    </marker>
+  </defs>
+
+  <rect class="bg" x="0" y="0" width="1800" height="1260"/>
+
+  <text class="title" x="70" y="72">E4 Locate Feature Inject 网络结构</text>
+  <text class="subtitle" x="70" y="108">核心思想：不替换 V8.2 的 heatmap 检测器；把 LocateAnything / MoonViT 的中间视觉特征作为 residual 注入到 Snake 的 64-channel feature。</text>
+
+  <rect class="panel" x="50" y="145" width="780" height="980"/>
+  <text class="section" x="82" y="188">A. 离线生成 Locate 特征缓存</text>
+  <text class="small" x="82" y="218">脚本：scripts/e4_locate_extract_features.py</text>
+
+  <rect class="offline" x="95" y="255" width="300" height="92"/>
+  <text class="boxTitle" x="120" y="289">原始 CT slice 图像</text>
+  <text class="boxText" x="120" y="317">/Datasets/1232_final/train 或 test</text>
+
+  <path class="arrowBlue" d="M395 301 C430 301, 445 301, 480 301"/>
+
+  <rect class="offline" x="480" y="245" width="285" height="112"/>
+  <text class="boxTitle" x="505" y="281">Locate 预处理</text>
+  <text class="boxText" x="505" y="309">long_side=448</text>
+  <text class="boxText" x="505" y="334">pad 到 14 的倍数</text>
+
+  <path class="arrowBlue" d="M622 357 L622 420"/>
+
+  <rect class="offline" x="480" y="420" width="285" height="118"/>
+  <text class="boxTitle" x="505" y="454">Patchify</text>
+  <text class="boxText" x="505" y="482">patch_size=14</text>
+  <text class="boxText" x="505" y="507">例：448x448 -> 32x32 tokens</text>
+
+  <path class="arrowBlue" d="M480 478 C430 478, 420 478, 395 478"/>
+
+  <rect class="offline" x="95" y="420" width="300" height="126"/>
+  <text class="boxTitle" x="120" y="454">LocateAnything MoonViT</text>
+  <text class="boxText" x="120" y="482">checkpoint-3000 vision_model</text>
+  <text class="boxText" x="120" y="507">只跑视觉 encoder</text>
+  <text class="boxText" x="120" y="532">不使用文本输出框</text>
+
+  <path class="arrowBlue" d="M245 546 L245 610"/>
+
+  <rect class="offline" x="95" y="610" width="300" height="130"/>
+  <text class="boxTitle" x="120" y="644">抓取中间层 hidden</text>
+  <text class="boxText" x="120" y="672">layers = [9, 18]</text>
+  <text class="boxText" x="120" y="697">每层 1152 channels</text>
+  <text class="boxText" x="120" y="722">concat -> 2304 channels</text>
+
+  <path class="arrowBlue" d="M395 675 C445 675, 470 675, 520 675"/>
+
+  <rect class="cache" x="520" y="606" width="245" height="150"/>
+  <text class="boxTitle" x="545" y="640">保存 .npz 缓存</text>
+  <text class="code" x="545" y="671">feat: [2304,Hg,Wg]</text>
+  <text class="code" x="545" y="697">grid_hw / scale / pad</text>
+  <text class="code" x="545" y="723">orig_hw / patch_size</text>
+
+  <path class="arrowGreen" d="M642 756 L642 822"/>
+
+  <rect class="cache" x="95" y="822" width="670" height="150"/>
+  <text class="boxTitle" x="120" y="856">训练时 Dataset 读取缓存</text>
+  <text class="boxText" x="120" y="884">lib/datasets/voc/snake.py: _load_locate_feature(img_path)</text>
+  <text class="boxText" x="120" y="912">lib/datasets/collate_batch.py: stack 成 batch['locate_feat']</text>
+  <text class="code" x="120" y="943">batch['locate_feat'] = [B,2304,Hg,Wg] fp16</text>
+
+  <rect class="panel" x="870" y="145" width="880" height="980"/>
+  <text class="section" x="902" y="188">B. E4 训练时网络前向</text>
+  <text class="small" x="902" y="218">配置：configs/e4_locate_feat_inject_gpu2.yaml</text>
+
+  <rect class="main" x="930" y="255" width="315" height="112"/>
+  <text class="boxTitle" x="955" y="289">输入图像 inp</text>
+  <text class="boxText" x="955" y="317">Snake 训练增强后的图像</text>
+  <text class="code" x="955" y="343">x -> heatmap_detector(x)</text>
+
+  <path class="arrow" d="M1245 311 L1310 311"/>
+
+  <rect class="main" x="1310" y="235" width="355" height="152"/>
+  <text class="boxTitle" x="1335" y="269">HeatmapResNetDetector</text>
+  <text class="boxText" x="1335" y="297">ResNet34 + FPN-like p2 feature</text>
+  <text class="code" x="1335" y="324">cnn_feature: [B,64,H/4,W/4]</text>
+  <text class="code" x="1335" y="350">ct_hm, wh, mask_logits</text>
+
+  <path class="arrowRed" d="M1488 387 L1488 460"/>
+
+  <rect class="head" x="1310" y="460" width="355" height="142"/>
+  <text class="boxTitle" x="1335" y="494">检测头输出</text>
+  <text class="boxText" x="1335" y="522">ct_hm: center heatmap</text>
+  <text class="boxText" x="1335" y="548">wh: bbox size</text>
+  <text class="boxText" x="1335" y="574">mask_logits: mask guidance</text>
+
+  <path class="arrow" d="M1310 533 C1260 533, 1245 533, 1215 533"/>
+
+  <rect class="main" x="930" y="460" width="285" height="142"/>
+  <text class="boxTitle" x="955" y="494">Mask Guidance</text>
+  <text class="boxText" x="955" y="522">sigmoid(mask_logits).amax</text>
+  <text class="code" x="955" y="549">feature *= 1 + 0.35 * mask</text>
+  <text class="small" x="955" y="575">先做 mask 引导，再加 Locate residual</text>
+
+  <path class="arrowGreen" d="M642 972 C740 1045, 855 1025, 965 948"/>
+
+  <rect class="adapter" x="930" y="690" width="350" height="152"/>
+  <text class="boxTitle" x="955" y="724">LocateFeatAdapter</text>
+  <text class="boxText" x="955" y="752">1x1 Conv: 2304 -> 64</text>
+  <text class="boxText" x="955" y="778">GroupNorm + GELU</text>
+  <text class="boxText" x="955" y="804">3x3 Conv: 64 -> 64，零初始化</text>
+  <text class="small" x="955" y="829">零初始化：刚开始不破坏 V8.2 原模型</text>
+
+  <path class="arrowDashed" d="M1280 766 L1360 766"/>
+
+  <rect class="adapter" x="1360" y="690" width="305" height="152"/>
+  <text class="boxTitle" x="1385" y="724">几何对齐到 Snake 特征图</text>
+  <text class="boxText" x="1385" y="752">用 inv_trans_input 反变换</text>
+  <text class="boxText" x="1385" y="778">再用 scale / pad / patch 映射</text>
+  <text class="code" x="1385" y="805">F.grid_sample(...)</text>
+
+  <path class="arrowDashed" d="M1512 690 C1512 655, 1512 635, 1512 602"/>
+
+  <path class="arrow" d="M1072 602 L1072 905"/>
+  <path class="arrowDashed" d="M1512 842 C1512 915, 1410 940, 1280 940"/>
+
+  <rect class="fusion" x="930" y="905" width="350" height="132"/>
+  <text class="boxTitle" x="955" y="939">Residual Feature Fusion</text>
+  <text class="code" x="955" y="970">cnn_feature = cnn_feature + aligned</text>
+  <text class="boxText" x="955" y="998">输出仍是 [B,64,H/4,W/4]</text>
+  <text class="small" x="955" y="1022">后续模块看到的是融合后的特征</text>
+
+  <path class="arrow" d="M1280 971 L1360 971"/>
+
+  <rect class="main" x="1360" y="900" width="305" height="166"/>
+  <text class="boxTitle" x="1385" y="934">Snake 后续模块</text>
+  <text class="boxText" x="1385" y="962">decode detection candidates</text>
+  <text class="boxText" x="1385" y="988">extreme refine head</text>
+  <text class="boxText" x="1385" y="1014">pred extreme -> octagon init</text>
+  <text class="boxText" x="1385" y="1040">DiT Flow Matching Evolution</text>
+
+  <rect class="warn" x="900" y="1138" width="830" height="78"/>
+  <text class="note" x="925" y="1170">注意：当前实现中 ct_hm / wh / mask_logits 在注入 Locate residual 之前已经算完。</text>
+  <text class="note" x="925" y="1197">所以 E4 主要增强 extreme refine + diffusion 的特征条件；不是直接替换或重训 Locate 检测头。</text>
+
+  <rect class="warn" x="80" y="1030" width="710" height="78"/>
+  <text class="note" x="105" y="1062">E4 的 Locate 特征来自 MoonViT 中间层，不是 LocateAnything 的最终矩形框。</text>
+  <text class="note" x="105" y="1089">最终框那条路是 E2/V10.2 box-octagon 实验；E4 是“视觉特征辅助”实验。</text>
+</svg>

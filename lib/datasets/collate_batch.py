@@ -10,6 +10,23 @@ def snake_collator(batch):
     # Keep original images as a Python list to handle variable sizes safely (used only for visualization)
     ret.update({'orig_img': [b['orig_img'] for b in batch]})
     ret.update({'img_path': default_collate([b['img_path'] for b in batch])})
+    if any('locate_feat' in b for b in batch):
+        missing = [b.get('img_path', '<unknown>') for b in batch if 'locate_feat' not in b]
+        if missing:
+            raise KeyError(f"locate_feat is missing for batch samples: {missing}")
+        ret.update({
+            'locate_feat': torch.stack([
+                torch.as_tensor(b['locate_feat'], dtype=torch.float16) for b in batch
+            ], dim=0),
+            'locate_feat_grid_hw': default_collate([b['locate_feat_grid_hw'] for b in batch]),
+            'locate_feat_orig_hw': default_collate([b['locate_feat_orig_hw'] for b in batch]),
+            'locate_feat_resized_hw': default_collate([b['locate_feat_resized_hw'] for b in batch]),
+            'locate_feat_padded_hw': default_collate([b['locate_feat_padded_hw'] for b in batch]),
+            'locate_feat_pad': default_collate([b['locate_feat_pad'] for b in batch]),
+            'locate_feat_scale': default_collate([b['locate_feat_scale'] for b in batch]),
+            'locate_feat_patch_size': default_collate([b['locate_feat_patch_size'] for b in batch]),
+            'locate_feat_path': [b['locate_feat_path'] for b in batch],
+        })
 
     meta = default_collate([b['meta'] for b in batch])
 
@@ -38,6 +55,9 @@ def snake_collator(batch):
             'i_gt_py': b['i_gt_py'][:n],
             'c_gt_py': b['c_gt_py'][:n]
         })
+        if 'eagle_i_gt_4py' in b and 'eagle_4py_mask' in b:
+            truncated[-1]['eagle_i_gt_4py'] = b['eagle_i_gt_4py'][:n]
+            truncated[-1]['eagle_4py_mask'] = b['eagle_4py_mask'][:n]
 
     meta['ct_num'] = torch.tensor(ct_nums, dtype=torch.int64)
     ret.update({'meta': meta})
@@ -79,6 +99,20 @@ def snake_collator(batch):
         c_gt_4pys[ct_01] = torch.Tensor(sum([b['c_gt_4py'] for b in truncated], []))
     init = {'i_it_4py': i_it_4pys, 'c_it_4py': c_it_4pys, 'i_gt_4py': i_gt_4pys, 'c_gt_4py': c_gt_4pys}
     ret.update(init)
+
+    has_eagle = any('eagle_i_gt_4py' in b for b in truncated)
+    if has_eagle:
+        eagle_i_gt_4pys = torch.zeros([batch_size, ct_num, 4, 2], dtype=torch.float)
+        eagle_4py_mask = torch.zeros([batch_size, ct_num], dtype=torch.float)
+        for bi, b in enumerate(truncated):
+            if 'eagle_i_gt_4py' not in b:
+                continue
+            n = min(len(b['eagle_i_gt_4py']), int(meta['ct_num'][bi]))
+            if n <= 0:
+                continue
+            eagle_i_gt_4pys[bi, :n] = torch.as_tensor(b['eagle_i_gt_4py'][:n], dtype=torch.float)
+            eagle_4py_mask[bi, :n] = torch.as_tensor(b['eagle_4py_mask'][:n], dtype=torch.float)
+        ret.update({'eagle_i_gt_4py': eagle_i_gt_4pys, 'eagle_4py_mask': eagle_4py_mask})
 
     # V3.10: evolution with adaptive points + mask
     if snake_config.adaptive_points_enabled:

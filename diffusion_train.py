@@ -332,7 +332,7 @@ def main():
 
     def move_batch_to_cuda(batch):
         for k in list(batch.keys()):
-            if k == 'meta':
+            if k in ('meta', 'orig_img', 'img_path') or k == 'locate_feat' or str(k).startswith('locate_feat_'):
                 continue
             if isinstance(batch[k], torch.Tensor):
                 batch[k] = batch[k].cuda(non_blocking=True)
@@ -936,6 +936,14 @@ def main():
             raise RuntimeError('cfg.train.epoch must be > 0 for epoch-based training.')
 
         total_steps = int(num_epochs * steps_per_epoch)
+        max_steps_cfg = getattr(cfg.train, 'max_steps', 0)
+        try:
+            max_train_steps = int(max_steps_cfg)
+        except Exception:
+            max_train_steps = 0
+        if max_train_steps > 0:
+            total_steps = min(total_steps, int(resume_step) + max_train_steps)
+            logger.info(f"Limiting this run to max_steps={max_train_steps}; stop_step={total_steps}")
         global_step = int(resume_step)
         start_epoch = int(global_step // steps_per_epoch)
         start_step_in_epoch = int(global_step % steps_per_epoch)
@@ -950,7 +958,10 @@ def main():
             freeze_yolo_after_epoch = -1
 
         scheduler = None
-        if total_steps > 0:
+        disable_scheduler = bool(getattr(cfg.train, 'disable_scheduler', False))
+        if disable_scheduler:
+            logger.info("LR scheduler disabled; using optimizer checkpoint/current LR.")
+        if total_steps > 0 and not disable_scheduler:
             warmup_steps = int(getattr(cfg.train, 'warmup_steps', 0))
             if warmup_steps > 0:
                 # 1. 线性预热阶段：从基准 LR 的 1e-3 开始爬升
@@ -984,6 +995,11 @@ def main():
             if (not resume_weights_only) and isinstance(resume_checkpoint, dict) and 'scheduler' in resume_checkpoint:
                 try:
                     scheduler.load_state_dict(resume_checkpoint['scheduler'])
+                    restored_lrs = scheduler.get_last_lr()
+                    if len(restored_lrs) == len(optimizer.param_groups):
+                        for param_group, lr in zip(optimizer.param_groups, restored_lrs):
+                            param_group['lr'] = float(lr)
+                        logger.info(f"Restored scheduler LR: {restored_lrs[0]:.8g}")
                 except Exception:
                     pass
 
@@ -1043,6 +1059,7 @@ def main():
 
                 global_step += 1
                 dt = time.time() - t0
+                stop_after_step = max_train_steps > 0 and global_step >= total_steps
 
                 # periodic inference visualization every N steps
                 viz_interval = int(os.environ.get('ONE_SAMPLE_VIZ_INTERVAL', '0'))
@@ -1094,9 +1111,16 @@ def main():
                         pass
 
                 del output, loss, loss_stats, batch
+                if stop_after_step:
+                    break
 
             # epoch-based checkpoint saving
-            do_save_epoch = (save_ep > 0 and ((epoch + 1) % save_ep == 0)) or (epoch == (num_epochs - 1))
+            reached_max_steps = max_train_steps > 0 and global_step >= total_steps
+            do_save_epoch = (
+                reached_max_steps
+                or (save_ep > 0 and ((epoch + 1) % save_ep == 0))
+                or (epoch == (num_epochs - 1))
+            )
             if do_save_epoch:
                 safe_barrier(is_distributed)
                 if is_main_process:
@@ -1104,6 +1128,9 @@ def main():
                 safe_barrier(is_distributed)
 
             start_step_in_epoch = 0
+            if reached_max_steps:
+                logger.info(f"Reached configured max_steps; stopping at step {global_step}.")
+                break
 
     # Final inference visualization on affine-input coords
     if is_main_process:

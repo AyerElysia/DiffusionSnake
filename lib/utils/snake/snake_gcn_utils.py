@@ -72,6 +72,53 @@ def _get_evolve_init_from_extreme(ex):
     return snake_decode.get_box(_get_box_from_extreme(ex))
 
 
+def _box_to_octagon_init(box, p_num):
+    """Build a DeepSnake-style octagon from xyxy boxes and upsample it."""
+    if box.numel() == 0:
+        return box.new_zeros((0, int(p_num), 2))
+    if box.dim() == 2:
+        box_batched = box.unsqueeze(0)
+        squeeze_batch = True
+    elif box.dim() == 3:
+        box_batched = box
+        squeeze_batch = False
+    else:
+        raise ValueError(f'box must have shape [N,4] or [B,N,4], got {tuple(box.shape)}')
+
+    ex = snake_decode.get_quadrangle(box_batched)
+    octagon = snake_decode.get_octagon(ex)
+    poly = uniform_upsample(octagon, int(p_num))
+    return poly[0] if squeeze_batch else poly
+
+
+def build_box_octagon_from_poly(gt_poly, p_num=None):
+    """Use each GT contour bbox as the only initialization signal."""
+    if p_num is None:
+        p_num = snake_config.poly_num
+    if gt_poly.numel() == 0:
+        return gt_poly.new_zeros((0, int(p_num), 2))
+    box = torch.cat([gt_poly.min(dim=1)[0], gt_poly.max(dim=1)[0]], dim=1)
+    return _box_to_octagon_init(box, int(p_num))
+
+
+def replace_training_init_with_gt_box_octagon(train_dict):
+    """Make diffusion train from bbox-derived octagons instead of GT extremes."""
+    if 'i_gt_py' not in train_dict:
+        return train_dict
+    i_gt_py = train_dict['i_gt_py']
+    if not torch.is_tensor(i_gt_py) or i_gt_py.numel() == 0:
+        return train_dict
+
+    i_it_py = build_box_octagon_from_poly(i_gt_py, snake_config.poly_num)
+    i_it_4py = build_box_octagon_from_poly(i_gt_py, snake_config.init_poly_num)
+    train_dict = dict(train_dict)
+    train_dict['i_it_py'] = i_it_py
+    train_dict['c_it_py'] = img_poly_to_can_poly(i_it_py)
+    train_dict['i_it_4py'] = i_it_4py
+    train_dict['c_it_4py'] = img_poly_to_can_poly(i_it_4py)
+    return train_dict
+
+
 def prepare_testing_init(box, score): # 上采样40个点构建八边形     没必要深究
     if box.numel() == 0 or score.numel() == 0 or box.size(1) == 0:
         empty_poly = box.new_zeros((0, snake_config.init_poly_num, 2))

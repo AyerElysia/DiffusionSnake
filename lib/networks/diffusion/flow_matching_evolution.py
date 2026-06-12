@@ -9,7 +9,7 @@ from typing import Tuple, Optional, Dict, Any
 import json
 
 import lib.utils.snake.snake_gcn_utils as snake_gcn_utils
-from lib.utils.snake import snake_config
+from lib.utils.snake import snake_config, snake_decode
 from lib.config import cfg as global_cfg
 
 class FlowMatchingEvolution(nn.Module):
@@ -359,6 +359,47 @@ class FlowMatchingEvolution(nn.Module):
                 num_points=num_points,
             )
 
+        self._locate_token_enabled = bool(getattr(global_cfg, 'use_locate_token_dit', False))
+        self._locate_token_only = bool(getattr(global_cfg, 'v11_locate_only', True))
+        self._locate_token_dim = int(dit_state_dim)
+        self._locate_global_tokens = int(getattr(global_cfg, 'v11_locate_global_tokens', 64))
+        self._locate_roi_grid = int(getattr(global_cfg, 'v11_locate_roi_grid', 6))
+        self._locate_use_roi_tokens = bool(getattr(global_cfg, 'v11_locate_use_roi_tokens', True))
+        self._locate_use_normal_tangent = bool(getattr(global_cfg, 'v11_locate_use_normal_tangent', True))
+        self.locate_feat_proj = None
+        self.locate_point_mixer = None
+        self.locate_global_queries = None
+        self.locate_global_attn = None
+        self.locate_global_norm = None
+        if self._locate_token_enabled:
+            locate_in_dim = int(getattr(global_cfg, 'locate_feat_dim', 2304))
+            point_samples = 5 if self._locate_use_normal_tangent else 1
+            self.locate_feat_proj = nn.Sequential(
+                nn.Conv2d(locate_in_dim, self._locate_token_dim, kernel_size=1, bias=False),
+                nn.GroupNorm(8, self._locate_token_dim),
+                nn.GELU(),
+                nn.Conv2d(self._locate_token_dim, self._locate_token_dim, kernel_size=3, padding=1, bias=True),
+            )
+            self.locate_point_mixer = nn.Sequential(
+                nn.Linear(self._locate_token_dim * point_samples, self._locate_token_dim),
+                nn.SiLU(),
+                nn.Linear(self._locate_token_dim, self._locate_token_dim),
+            )
+            self.locate_global_queries = nn.Embedding(self._locate_global_tokens, self._locate_token_dim)
+            self.locate_global_attn = nn.MultiheadAttention(
+                embed_dim=self._locate_token_dim,
+                num_heads=max(1, int(dit_num_heads)),
+                batch_first=True,
+            )
+            self.locate_global_norm = nn.LayerNorm(self._locate_token_dim)
+            print(
+                f"[FlowMatchingEvolution] V11 LocateToken-DiT enabled "
+                f"(locate_only={self._locate_token_only}, dim={self._locate_token_dim}, "
+                f"global_tokens={self._locate_global_tokens}, roi_grid={self._locate_roi_grid}, "
+                f"normal_tangent={self._locate_use_normal_tangent})",
+                flush=True,
+            )
+
         def _env_bool(name: str, default: bool) -> bool:
             raw = os.environ.get(name, '').strip()
             if not raw:
@@ -516,6 +557,31 @@ class FlowMatchingEvolution(nn.Module):
         self._use_self_conditioning = bool(getattr(global_cfg, 'v3_7_use_self_conditioning', False))
         self._max_disp_frac = float(getattr(global_cfg, 'fm_max_disp_frac', 0.0))
 
+        # Optional supervised displacement gate. The gate predicts how much of
+        # the proposed residual should be applied for contours that are already
+        # close to the target or whose predicted residual points the wrong way.
+        self._use_disp_gate = bool(getattr(global_cfg, 'flow_use_disp_gate', False))
+        self._disp_gate_apply_inference = bool(getattr(global_cfg, 'flow_disp_gate_apply_inference', True))
+        self._disp_gate_apply_training_pred = bool(getattr(global_cfg, 'flow_disp_gate_apply_training_pred', False))
+        self._disp_gate_loss_weight = float(getattr(global_cfg, 'flow_disp_gate_loss_weight', 0.0))
+        self._disp_gate_detach_input = bool(getattr(global_cfg, 'flow_disp_gate_detach_input', True))
+        if self._use_disp_gate:
+            gate_hidden = int(getattr(global_cfg, 'flow_disp_gate_hidden_dim', 128))
+            gate_hidden = max(gate_hidden, 16)
+            self.disp_gate_head = nn.Sequential(
+                nn.Linear(feature_dim + 4, gate_hidden),
+                nn.SiLU(),
+                nn.Linear(gate_hidden, gate_hidden),
+                nn.SiLU(),
+                nn.Linear(gate_hidden, 1),
+            )
+            # Start close to the legacy behavior: gate ~= 1.
+            gate_bias = float(getattr(global_cfg, 'flow_disp_gate_init_bias', 4.0))
+            nn.init.zeros_(self.disp_gate_head[-1].weight)
+            nn.init.constant_(self.disp_gate_head[-1].bias, gate_bias)
+        else:
+            self.disp_gate_head = None
+
         # CMAM 先验参数保留 (以防外部调用)
         self.compute_L = True
 
@@ -593,6 +659,45 @@ class FlowMatchingEvolution(nn.Module):
         limit = self.compute_contour_scale(init_poly).to(disp.device, disp.dtype) * self._max_disp_frac
         norm = disp.norm(dim=-1, keepdim=True).clamp_min(1e-6)
         return disp * torch.clamp(limit / norm, max=1.0)
+
+    def _disp_gate_features(
+        self,
+        sampled_feat: torch.Tensor,
+        disp: torch.Tensor,
+        contour_scale: torch.Tensor,
+    ) -> torch.Tensor:
+        pooled = sampled_feat.mean(dim=-1)
+        scale = contour_scale.to(device=disp.device, dtype=disp.dtype).clamp_min(1.0)
+        disp_norm = disp / scale
+        mag = disp_norm.norm(dim=-1)
+        mean_mag = mag.mean(dim=1, keepdim=True)
+        max_mag = mag.amax(dim=1, keepdim=True)
+        rms_mag = mag.pow(2).mean(dim=1, keepdim=True).sqrt()
+        log_scale = torch.log(scale.view(-1, 1))
+        gate_in = torch.cat([pooled, mean_mag, max_mag, rms_mag, log_scale], dim=1)
+        if self._disp_gate_detach_input:
+            gate_in = gate_in.detach()
+        return gate_in
+
+    def predict_disp_gate(
+        self,
+        sampled_feat: torch.Tensor,
+        disp: torch.Tensor,
+        contour_scale: torch.Tensor,
+    ) -> torch.Tensor:
+        if (not self._use_disp_gate) or self.disp_gate_head is None or disp.numel() == 0:
+            return disp.new_ones((disp.size(0), 1, 1))
+        gate_in = self._disp_gate_features(sampled_feat, disp, contour_scale)
+        gate = torch.sigmoid(self.disp_gate_head(gate_in)).view(-1, 1, 1)
+        return gate.to(device=disp.device, dtype=disp.dtype)
+
+    @staticmethod
+    def compute_disp_gate_target(pred_disp: torch.Tensor, target_disp: torch.Tensor) -> torch.Tensor:
+        pred = pred_disp.detach()
+        target = target_disp.detach().to(device=pred.device, dtype=pred.dtype)
+        denom = pred.pow(2).sum(dim=(1, 2), keepdim=True).clamp_min(1e-6)
+        numer = (pred * target).sum(dim=(1, 2), keepdim=True)
+        return (numer / denom).clamp(0.0, 1.0)
 
     def sample_train_t(self, n: int, device: torch.device, dtype: torch.dtype) -> torch.Tensor:
         if self._flow_fix_t0:
@@ -720,6 +825,228 @@ class FlowMatchingEvolution(nn.Module):
         return torch.cat(detail_terms, dim=1)
 
     @staticmethod
+    def _batch_meta_tensor(batch: Dict[str, Any], key: str, device: torch.device, dtype: torch.dtype):
+        if batch is None or 'meta' not in batch or key not in batch['meta']:
+            return None
+        value = batch['meta'][key]
+        if torch.is_tensor(value):
+            return value.to(device=device, dtype=dtype, non_blocking=True)
+        return torch.as_tensor(value, device=device, dtype=dtype)
+
+    @staticmethod
+    def _batch_tensor(batch: Dict[str, Any], key: str, device: torch.device, dtype: torch.dtype):
+        if batch is None or key not in batch:
+            return None
+        value = batch[key]
+        if torch.is_tensor(value):
+            return value.to(device=device, dtype=dtype, non_blocking=True)
+        return torch.as_tensor(value, device=device, dtype=dtype)
+
+    def _points_to_locate_grid(
+        self,
+        points: torch.Tensor,
+        py_ind: torch.Tensor,
+        batch: Dict[str, Any],
+    ) -> torch.Tensor:
+        """Map output-coordinate contour points to Locate patch-grid coordinates."""
+        device, dtype = points.device, points.dtype
+        inv_trans = self._batch_meta_tensor(batch, 'inv_trans_input', device, dtype)
+        orig_hw = self._batch_meta_tensor(batch, 'orig_hw', device, dtype)
+        inp_out_hw = self._batch_meta_tensor(batch, 'inp_out_hw', device, dtype)
+        flipped = self._batch_meta_tensor(batch, 'flipped', device, dtype)
+        locate_scale = self._batch_tensor(batch, 'locate_feat_scale', device, dtype)
+        grid_hw = self._batch_tensor(batch, 'locate_feat_grid_hw', device, dtype)
+        patch_size = self._batch_tensor(batch, 'locate_feat_patch_size', device, dtype)
+        locate_pad = self._batch_tensor(batch, 'locate_feat_pad', device, dtype)
+        if inv_trans is None or orig_hw is None or locate_scale is None or grid_hw is None:
+            raise KeyError(
+                "V11 LocateToken-DiT requires meta.inv_trans_input/meta.orig_hw and "
+                "locate_feat_scale/locate_feat_grid_hw in the batch."
+            )
+
+        py_ind = py_ind.to(device=device, dtype=torch.long)
+        n_contours = int(points.size(0))
+        if n_contours == 0:
+            return points.new_zeros((0, 0, 1, 2))
+
+        if patch_size is None:
+            patch_size = torch.full((inv_trans.size(0), 1), 14.0, device=device, dtype=dtype)
+        if locate_pad is None:
+            locate_pad = torch.zeros((inv_trans.size(0), 4), device=device, dtype=dtype)
+        if flipped is None:
+            flipped = torch.zeros((inv_trans.size(0), 1), device=device, dtype=dtype)
+        if locate_scale.dim() == 1:
+            locate_scale = locate_scale[:, None]
+        if patch_size.dim() == 1:
+            patch_size = patch_size[:, None]
+        if flipped.dim() == 1:
+            flipped = flipped[:, None]
+
+        if inp_out_hw is not None and inp_out_hw.size(-1) >= 4:
+            sx = (inp_out_hw[:, 1] / inp_out_hw[:, 3].clamp_min(1.0))[py_ind].view(n_contours, 1)
+            sy = (inp_out_hw[:, 0] / inp_out_hw[:, 2].clamp_min(1.0))[py_ind].view(n_contours, 1)
+        else:
+            ratio = float(getattr(global_cfg, 'down_ratio', 4.0))
+            sx = points.new_full((n_contours, 1), ratio)
+            sy = points.new_full((n_contours, 1), ratio)
+
+        input_x = points[..., 0] * sx
+        input_y = points[..., 1] * sy
+        ones = torch.ones_like(input_x)
+        input_xy1 = torch.stack([input_x, input_y, ones], dim=1)
+
+        inv = inv_trans[py_ind]
+        src_xy = torch.bmm(inv, input_xy1).transpose(1, 2)
+        src_x = src_xy[..., 0]
+        src_y = src_xy[..., 1]
+        orig_w = orig_hw[py_ind, 1].view(n_contours, 1)
+        flip_mask = flipped[py_ind].view(n_contours, 1) > 0.5
+        src_x = torch.where(flip_mask, orig_w - src_x - 1.0, src_x)
+
+        scale = locate_scale[py_ind].view(n_contours, 1)
+        patch = patch_size[py_ind].view(n_contours, 1).clamp_min(1.0)
+        pad_left = locate_pad[py_ind, 0].view(n_contours, 1)
+        pad_top = locate_pad[py_ind, 1].view(n_contours, 1)
+        feat_x = (src_x * scale + pad_left) / patch - 0.5
+        feat_y = (src_y * scale + pad_top) / patch - 0.5
+
+        gh = grid_hw[py_ind, 0].view(n_contours, 1).clamp_min(1.0)
+        gw = grid_hw[py_ind, 1].view(n_contours, 1).clamp_min(1.0)
+        norm_x = torch.where(gw > 1.0, (feat_x / (gw - 1.0)) * 2.0 - 1.0, torch.zeros_like(feat_x))
+        norm_y = torch.where(gh > 1.0, (feat_y / (gh - 1.0)) * 2.0 - 1.0, torch.zeros_like(feat_y))
+        return torch.stack([norm_x, norm_y], dim=-1).unsqueeze(2)
+
+    def _sample_locate_points(
+        self,
+        locate_map: torch.Tensor,
+        points: torch.Tensor,
+        py_ind: torch.Tensor,
+        batch: Dict[str, Any],
+        contour_scale: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        if not self._locate_use_normal_tangent:
+            grid = self._points_to_locate_grid(points, py_ind, batch)
+            sampled = F.grid_sample(
+                locate_map[py_ind.to(device=locate_map.device, dtype=torch.long)],
+                grid,
+                mode='bilinear',
+                padding_mode='zeros',
+                align_corners=True,
+            ).squeeze(-1).transpose(1, 2)
+            return self.locate_point_mixer(sampled)
+
+        prev_pt = torch.roll(points, 1, dims=1)
+        next_pt = torch.roll(points, -1, dims=1)
+        tangent = next_pt - prev_pt
+        tangent = tangent / tangent.norm(dim=-1, keepdim=True).clamp_min(1e-6)
+        normal = torch.stack([-tangent[..., 1], tangent[..., 0]], dim=-1)
+        if contour_scale is None:
+            contour_scale = self.compute_contour_scale(points)
+        radius = torch.clamp(contour_scale.to(points.device, points.dtype) / 64.0, min=0.75, max=3.0)
+        sample_points = [
+            points,
+            points + normal * radius,
+            points - normal * radius,
+            points + tangent * radius,
+            points - tangent * radius,
+        ]
+        feat_n = locate_map[py_ind.to(device=locate_map.device, dtype=torch.long)]
+        sampled_terms = []
+        for pts in sample_points:
+            grid = self._points_to_locate_grid(pts, py_ind, batch)
+            sampled = F.grid_sample(
+                feat_n,
+                grid,
+                mode='bilinear',
+                padding_mode='zeros',
+                align_corners=True,
+            ).squeeze(-1).transpose(1, 2)
+            sampled_terms.append(sampled)
+        return self.locate_point_mixer(torch.cat(sampled_terms, dim=-1))
+
+    def _sample_locate_roi_tokens(
+        self,
+        locate_map: torch.Tensor,
+        points: torch.Tensor,
+        py_ind: torch.Tensor,
+        batch: Dict[str, Any],
+    ) -> torch.Tensor:
+        grid_size = max(int(self._locate_roi_grid), 1)
+        n_contours = int(points.size(0))
+        if n_contours == 0 or grid_size <= 0:
+            return locate_map.new_zeros((n_contours, 0, self._locate_token_dim))
+        x_min = points[..., 0].amin(dim=1)
+        x_max = points[..., 0].amax(dim=1)
+        y_min = points[..., 1].amin(dim=1)
+        y_max = points[..., 1].amax(dim=1)
+        xs_base = torch.linspace(0.0, 1.0, grid_size, device=points.device, dtype=points.dtype)
+        ys_base = torch.linspace(0.0, 1.0, grid_size, device=points.device, dtype=points.dtype)
+        yy, xx = torch.meshgrid(ys_base, xs_base, indexing='ij')
+        roi_x = x_min.view(n_contours, 1, 1) + xx.view(1, grid_size, grid_size) * (
+            x_max - x_min
+        ).clamp_min(1.0).view(n_contours, 1, 1)
+        roi_y = y_min.view(n_contours, 1, 1) + yy.view(1, grid_size, grid_size) * (
+            y_max - y_min
+        ).clamp_min(1.0).view(n_contours, 1, 1)
+        roi_points = torch.stack([roi_x, roi_y], dim=-1).view(n_contours, grid_size * grid_size, 2)
+        grid = self._points_to_locate_grid(roi_points, py_ind, batch).view(n_contours, grid_size, grid_size, 2)
+        sampled = F.grid_sample(
+            locate_map[py_ind.to(device=locate_map.device, dtype=torch.long)],
+            grid,
+            mode='bilinear',
+            padding_mode='zeros',
+            align_corners=True,
+        )
+        return sampled.flatten(2).transpose(1, 2)
+
+    def build_locate_token_context(
+        self,
+        batch: Dict[str, Any],
+        points: torch.Tensor,
+        py_ind: torch.Tensor,
+        contour_scale: Optional[torch.Tensor] = None,
+    ) -> Dict[str, torch.Tensor]:
+        if not self._locate_token_enabled:
+            return {}
+        if batch is None or 'locate_feat' not in batch:
+            raise KeyError(
+                "cfg.use_locate_token_dit=True but batch has no locate_feat. "
+                "Run Locate feature extraction or check locate_feat_cache_root."
+            )
+        raw = batch['locate_feat']
+        if not torch.is_tensor(raw):
+            raw = torch.as_tensor(raw)
+        param = next(self.locate_feat_proj.parameters())
+        raw = raw.to(device=points.device, dtype=param.dtype, non_blocking=True)
+        locate_map = self.locate_feat_proj(raw).to(dtype=points.dtype)
+
+        point_ctx = self._sample_locate_points(
+            locate_map,
+            points,
+            py_ind,
+            batch,
+            contour_scale=contour_scale,
+        )
+
+        bsz, channels, h, w = locate_map.shape
+        tokens = locate_map.flatten(2).transpose(1, 2)
+        queries = self.locate_global_queries.weight.to(device=points.device, dtype=points.dtype)
+        queries = queries.unsqueeze(0).expand(bsz, -1, -1)
+        global_ctx, _ = self.locate_global_attn(queries, tokens, tokens, need_weights=False)
+        global_ctx = self.locate_global_norm(global_ctx + queries)
+        global_ctx = global_ctx[py_ind.to(device=points.device, dtype=torch.long)]
+        if self._locate_use_roi_tokens:
+            roi_ctx = self._sample_locate_roi_tokens(locate_map, points, py_ind, batch)
+            global_ctx = torch.cat([global_ctx, roi_ctx], dim=1)
+        return {
+            'locate_point_ctx': point_ctx,
+            'locate_global_ctx': global_ctx,
+            'locate_only': self._locate_token_only,
+            'locate_map_absmax': locate_map.detach().abs().max(),
+            'locate_point_ctx_absmax': point_ctx.detach().abs().max(),
+        }
+
+    @staticmethod
     def fourier_smooth(disp: torch.Tensor, k: int) -> torch.Tensor:
         """Apply a Fourier low-pass filter to contour displacement."""
         if k <= 0:
@@ -743,6 +1070,7 @@ class FlowMatchingEvolution(nn.Module):
         t_continuous,
         contour_scale: Optional[torch.Tensor] = None,
         x_self_cond: Optional[torch.Tensor] = None,
+        locate_context: Optional[Dict[str, torch.Tensor]] = None,
     ):
         """
         包装接口：预测速度场 V_t
@@ -754,6 +1082,14 @@ class FlowMatchingEvolution(nn.Module):
         t_scaled = t_continuous * 1000.0
         
         # Flow denoiser 核心调用，务必传入 sampled_feat
+        denoiser_kwargs = {}
+        if locate_context:
+            denoiser_kwargs.update({
+                'locate_point_ctx': locate_context.get('locate_point_ctx', None),
+                'locate_global_ctx': locate_context.get('locate_global_ctx', None),
+                'locate_only': bool(locate_context.get('locate_only', False)),
+            })
+
         v_pred, L = self.denoiser(
             cnn_feature,
             sampled_feat,
@@ -765,6 +1101,7 @@ class FlowMatchingEvolution(nn.Module):
             contour_scale=contour_scale,
             detail_feat=detail_feat,
             x_self_cond=x_self_cond,
+            **denoiser_kwargs,
         )
         return v_pred, L
 
@@ -773,6 +1110,7 @@ class FlowMatchingEvolution(nn.Module):
         cnn_feature: torch.Tensor,
         i_it_py: torch.Tensor,
         py_ind: torch.Tensor,
+        batch: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, torch.Tensor]:
         h, w = cnn_feature.size(2), cnn_feature.size(3)
         sampled_feat = snake_gcn_utils.get_gcn_feature(cnn_feature, i_it_py, py_ind, h, w)
@@ -786,13 +1124,21 @@ class FlowMatchingEvolution(nn.Module):
             sampled_feat=sampled_feat,
             contour_scale=contour_scale,
         )
-        return {
+        ctx = {
             'sampled_feat': sampled_feat,
             'detail_feat': detail_feat,
             'contour_scale': contour_scale,
             'h': h,
             'w': w,
         }
+        if self._locate_token_enabled and batch is not None:
+            ctx['locate_context'] = self.build_locate_token_context(
+                batch,
+                i_it_py,
+                py_ind,
+                contour_scale=contour_scale,
+            )
+        return ctx
 
     @staticmethod
     def _gaussian_sample_logprob(sample: torch.Tensor, mean: torch.Tensor, std) -> torch.Tensor:
@@ -1005,6 +1351,7 @@ class FlowMatchingEvolution(nn.Module):
         detail_feat: Optional[torch.Tensor] = None,
         contour_scale: Optional[torch.Tensor] = None,
         x_self_cond: Optional[torch.Tensor] = None,
+        locate_context: Optional[Dict[str, torch.Tensor]] = None,
         step_mode: Optional[str] = None,
         noise_level: Optional[float] = None,
         sde_type: Optional[str] = None,
@@ -1032,6 +1379,7 @@ class FlowMatchingEvolution(nn.Module):
             t_tensor,
             contour_scale=contour_scale_flat,
             x_self_cond=x_self_cond,
+            locate_context=locate_context,
         )
 
         next_self_cond = None
@@ -1053,6 +1401,7 @@ class FlowMatchingEvolution(nn.Module):
                 t_next,
                 contour_scale=contour_scale_flat,
                 x_self_cond=next_self_cond,
+                locate_context=locate_context,
             )
             step_velocity = (v_pred + v_pred2) * 0.5
             step_mean = x_t + step_velocity * dt
@@ -1235,6 +1584,7 @@ class FlowMatchingEvolution(nn.Module):
         detail_feat,
         steps=None,
         noise_scale=None,
+        locate_context: Optional[Dict[str, torch.Tensor]] = None,
     ) -> torch.Tensor:
         if steps is None:
             steps = self.ode_steps
@@ -1284,6 +1634,7 @@ class FlowMatchingEvolution(nn.Module):
                 t_tensor,
                 contour_scale=contour_scale_flat,
                 x_self_cond=x_self_cond,
+                locate_context=locate_context,
             )
 
             # Update self-conditioning with current x1 estimate
@@ -1305,6 +1656,7 @@ class FlowMatchingEvolution(nn.Module):
                     t_next,
                     contour_scale=contour_scale_flat,
                     x_self_cond=x_self_cond,  # use updated self-cond for corrector step
+                    locate_context=locate_context,
                 )
                 x_t = x_t + (v_pred + v_pred2) * 0.5 * dt
             else:
@@ -1317,7 +1669,7 @@ class FlowMatchingEvolution(nn.Module):
         disp = self.denormalize_pred_disp(x_t, contour_scale)
         return self.clamp_pred_disp(disp, i_it_py)
 
-    def sample_disp(self, cnn_feature, i_it_py, c_it_py, py_ind, steps=None) -> torch.Tensor:
+    def sample_disp(self, cnn_feature, i_it_py, c_it_py, py_ind, steps=None, batch=None) -> torch.Tensor:
         """
         Euler ODE Solver for Flow Matching.
         V3.7.3: supports multi-trajectory averaging via infer_avg_samples config.
@@ -1341,19 +1693,37 @@ class FlowMatchingEvolution(nn.Module):
             sampled_feat=sampled_feat,
             contour_scale=contour_scale,
         )
+        locate_context = None
+        if self._locate_token_enabled and batch is not None:
+            locate_context = self.build_locate_token_context(
+                batch,
+                i_it_py,
+                py_ind,
+                contour_scale=contour_scale,
+            )
 
         avg_n = self._infer_avg_samples
         if avg_n > 1:
             all_disps = []
             for _ in range(avg_n):
                 d = self._sample_disp_from_sampled_feat(
-                    cnn_feature, i_it_py, c_it_py, py_ind, sampled_feat, detail_feat, steps=steps)
+                    cnn_feature, i_it_py, c_it_py, py_ind, sampled_feat, detail_feat,
+                    steps=steps, locate_context=locate_context)
                 all_disps.append(d)
-            return torch.stack(all_disps).mean(dim=0)
+            disp = torch.stack(all_disps).mean(dim=0)
+            if self._use_disp_gate and self._disp_gate_apply_inference:
+                gate = self.predict_disp_gate(sampled_feat, disp, contour_scale)
+                disp = disp * gate
+            return disp
 
-        return self._sample_disp_from_sampled_feat(
-            cnn_feature, i_it_py, c_it_py, py_ind, sampled_feat, detail_feat, steps=steps
+        disp = self._sample_disp_from_sampled_feat(
+            cnn_feature, i_it_py, c_it_py, py_ind, sampled_feat, detail_feat,
+            steps=steps, locate_context=locate_context
         )
+        if self._use_disp_gate and self._disp_gate_apply_inference:
+            gate = self.predict_disp_gate(sampled_feat, disp, contour_scale)
+            disp = disp * gate
+        return disp
 
     def sample_disp_iterative(
         self,
@@ -1364,6 +1734,7 @@ class FlowMatchingEvolution(nn.Module):
         num_iter_steps=3,
         fractions=None,
         ode_steps=None,
+        batch=None,
     ):
         """V3.4-style iterative refinement for Flow Matching."""
         if fractions is None:
@@ -1392,6 +1763,14 @@ class FlowMatchingEvolution(nn.Module):
                 sampled_feat=sampled_feat,
                 contour_scale=contour_scale,
             )
+            locate_context = None
+            if self._locate_token_enabled and batch is not None:
+                locate_context = self.build_locate_token_context(
+                    batch,
+                    current_contour,
+                    py_ind,
+                    contour_scale=contour_scale,
+                )
             # V6o: stochastic TTA ensemble for iterative inference
             avg_n = self._infer_avg_samples
             step_ns = self._iterative_noise_scales[step_idx] if (
@@ -1404,6 +1783,7 @@ class FlowMatchingEvolution(nn.Module):
                         cnn_feature, current_contour, c_it_py, py_ind,
                         sampled_feat, detail_feat, steps=ode_steps,
                         noise_scale=step_ns,
+                        locate_context=locate_context,
                     )
                     all_disps.append(d)
                 disp = torch.stack(all_disps).mean(dim=0)
@@ -1417,7 +1797,11 @@ class FlowMatchingEvolution(nn.Module):
                     detail_feat,
                     steps=ode_steps,
                     noise_scale=step_ns,
+                    locate_context=locate_context,
                 )
+            if self._use_disp_gate and self._disp_gate_apply_inference:
+                gate = self.predict_disp_gate(sampled_feat, disp, contour_scale)
+                disp = disp * gate
             frac = fractions[step_idx]
             applied_disp = disp * frac
             current_contour = current_contour + applied_disp
@@ -1436,6 +1820,16 @@ class FlowMatchingEvolution(nn.Module):
             fractions.append((target - prev) / remaining)
             prev = target
         return fractions
+
+    @staticmethod
+    def _octagon_init_from_extreme(extreme_points: torch.Tensor) -> torch.Tensor:
+        """Build the diffusion init contour from predicted/GT extreme points."""
+        if (not torch.is_tensor(extreme_points)) or extreme_points.numel() == 0:
+            if torch.is_tensor(extreme_points):
+                return extreme_points.new_zeros((0, snake_config.poly_num, 2))
+            return torch.zeros((0, snake_config.poly_num, 2))
+        octagon = snake_decode.get_octagon(extreme_points[None])
+        return snake_gcn_utils.uniform_upsample(octagon, snake_config.poly_num)[0]
 
     def forward(self, output: Dict[str, Any], cnn_feature: torch.Tensor, batch: Dict[str, Any]) -> Dict[str, Any]:
         ret = {}
@@ -1457,7 +1851,48 @@ class FlowMatchingEvolution(nn.Module):
                         out_h=h,
                         out_w=w,
                     )
+            init_source = str(getattr(global_cfg, 'diffusion_init_source', 'extreme')).strip().lower()
+            if init_source in ('gt_box_octagon', 'gt_bbox_octagon', 'box_octagon', 'bbox_octagon'):
+                train_dict = snake_gcn_utils.replace_training_init_with_gt_box_octagon(train_dict)
+                ret['diffusion_init_source'] = init_source
+            elif (
+                bool(getattr(global_cfg, 'use_pred_extreme_init_for_diffusion', False))
+                and torch.is_tensor(output.get('ex_pred', None))
+            ):
+                ex_for_init = output['ex_pred']
+                if bool(getattr(global_cfg, 'detach_pred_extreme_init', True)):
+                    ex_for_init = ex_for_init.detach()
+                pred_i_it_py = self._octagon_init_from_extreme(ex_for_init)
+                if pred_i_it_py.size(0) == train_dict['i_it_py'].size(0):
+                    prob_cfg = float(getattr(global_cfg, 'pred_extreme_init_prob', -1.0))
+                    pred_prob = 1.0 if prob_cfg < 0.0 else min(max(prob_cfg, 0.0), 1.0)
+                    num_inst = int(pred_i_it_py.size(0))
+                    if pred_prob >= 1.0:
+                        pred_mask = torch.ones((num_inst,), device=pred_i_it_py.device, dtype=torch.bool)
+                    elif pred_prob <= 0.0:
+                        pred_mask = torch.zeros((num_inst,), device=pred_i_it_py.device, dtype=torch.bool)
+                    else:
+                        pred_mask = torch.rand((num_inst,), device=pred_i_it_py.device) < pred_prob
+
+                    train_dict = dict(train_dict)
+                    if bool(pred_mask.any()):
+                        mix_mask = pred_mask.view(-1, 1, 1)
+                        train_dict['i_it_py'] = torch.where(mix_mask, pred_i_it_py, train_dict['i_it_py'])
+                        train_dict['c_it_py'] = snake_gcn_utils.img_poly_to_can_poly(train_dict['i_it_py'])
+                    train_dict['i_pred_4py'] = ex_for_init
+                    ret['pred_extreme_init_count'] = pred_mask.to(dtype=pred_i_it_py.dtype).sum()
+                    ret['gt_extreme_init_count'] = (~pred_mask).to(dtype=pred_i_it_py.dtype).sum()
+                    ret['pred_extreme_init_prob_effective'] = pred_i_it_py.new_tensor(float(pred_prob))
             ret.update(train_dict)
+            if torch.is_tensor(output.get('ex_pred', None)):
+                ret['ex_pred'] = output['ex_pred']
+                if torch.is_tensor(output.get('i_gt_4py', None)):
+                    ret['i_gt_4py'] = output['i_gt_4py']
+            if torch.is_tensor(output.get('ex_box_jitter_count', None)):
+                ret['ex_box_jitter_count'] = output['ex_box_jitter_count']
+            for debug_key in ('locate_feat_residual_absmax', 'locate_feat_adapter_last_absmax'):
+                if torch.is_tensor(output.get(debug_key, None)):
+                    ret[debug_key] = output[debug_key].detach()
             
             i_init_train_py = train_dict['i_it_py']
             c_init_train_py = train_dict['c_it_py']
@@ -1706,6 +2141,17 @@ class FlowMatchingEvolution(nn.Module):
                 sampled_feat=sampled_feat_curr,
                 contour_scale=contour_scale,
             )
+            locate_context_curr = None
+            if self._locate_token_enabled:
+                locate_context_curr = self.build_locate_token_context(
+                    batch,
+                    i_init_train_py,
+                    py_ind,
+                    contour_scale=contour_scale,
+                )
+                for debug_key in ('locate_map_absmax', 'locate_point_ctx_absmax'):
+                    if torch.is_tensor(locate_context_curr.get(debug_key, None)):
+                        ret[debug_key] = locate_context_curr[debug_key].detach()
 
             # V6r: self-conditioning — 50% of training steps use a dry-run prediction
             x_self_cond = None
@@ -1723,6 +2169,7 @@ class FlowMatchingEvolution(nn.Module):
                             t.view(-1),
                             contour_scale=contour_scale_flat,
                             x_self_cond=None,  # dry run always starts unconditioned
+                            locate_context=locate_context_curr,
                         )
                     # Self-cond = current estimate of clean displacement x1
                     x_self_cond = (x_t + (1.0 - t) * v_dry).detach()
@@ -1740,6 +2187,7 @@ class FlowMatchingEvolution(nn.Module):
                 t.view(-1),
                 contour_scale=contour_scale_flat,
                 x_self_cond=x_self_cond,
+                locate_context=locate_context_curr,
             )
 
             # 5. 计算目标速度 V_target = X_1 - X_0
@@ -1747,7 +2195,17 @@ class FlowMatchingEvolution(nn.Module):
             x1_pred = x_t + (1.0 - t) * v_pred
             pred_disp = self.denormalize_pred_disp(x1_pred, contour_scale)
             pred_disp = self.clamp_pred_disp(pred_disp, i_init_train_py)
-            pred_contours = i_init_train_py + pred_disp
+            gate_loss_val = pred_disp.new_zeros(())
+            disp_gate = pred_disp.new_ones((pred_disp.size(0), 1, 1))
+            disp_gate_target = pred_disp.new_ones((pred_disp.size(0), 1, 1))
+            pred_disp_for_contours = pred_disp
+            if self._use_disp_gate and self.disp_gate_head is not None:
+                disp_gate = self.predict_disp_gate(sampled_feat_curr, pred_disp, contour_scale)
+                disp_gate_target = self.compute_disp_gate_target(pred_disp, x1_raw)
+                gate_loss_val = F.smooth_l1_loss(disp_gate, disp_gate_target, reduction='mean')
+                if self._disp_gate_apply_training_pred:
+                    pred_disp_for_contours = pred_disp * disp_gate
+            pred_contours = i_init_train_py + pred_disp_for_contours
 
             # 6. Flow Matching Loss (V3.7: optional spectral decomposition)
             if self._use_curvature_reweight:
@@ -1785,6 +2243,9 @@ class FlowMatchingEvolution(nn.Module):
                 )
                 loss = loss + self._chamfer_loss_weight * chamfer_loss_val
 
+            if self._use_disp_gate and self._disp_gate_loss_weight > 0:
+                loss = loss + self._disp_gate_loss_weight * gate_loss_val
+
             # Add denoiser regularisation (Laplacian from V3.7, zero for others)
             loss = loss + L_reg
 
@@ -1794,18 +2255,41 @@ class FlowMatchingEvolution(nn.Module):
                 'diff_loss_total': loss,
                 'diff_loss1': loss,
                 'diff_loss_chamfer': chamfer_loss_val,
+                'diff_loss_gate': gate_loss_val,
+                'disp_gate_mean': disp_gate.mean(),
+                'disp_gate_target_mean': disp_gate_target.mean(),
                 'point_mask': point_mask_train,
                 'py_pred': [i_init_train_py],
                 'py': pred_contours,
                 'pred_contours': pred_contours,
-                'pred_disp': pred_disp,
+                'pred_disp': pred_disp_for_contours,
                 'v_pred': v_pred.mean(), # For observation logging optional
             })
             
         else:
             # 推理时进行ODE求解
             with torch.no_grad():
-                init = snake_gcn_utils.prepare_testing(output)
+                if (
+                    bool(getattr(global_cfg, 'use_pred_extreme_init_for_inference', False))
+                    and torch.is_tensor(output.get('ex', None))
+                ):
+                    ex = output['ex']
+                    i_it_py = self._octagon_init_from_extreme(ex)
+                    c_it_py = snake_gcn_utils.img_poly_to_can_poly(i_it_py)
+                    py_ind = output.get(
+                        'ex_py_ind',
+                        torch.zeros((i_it_py.size(0),), dtype=torch.long, device=i_it_py.device),
+                    )
+                    init = {
+                        'i_it_4py': ex,
+                        'c_it_4py': snake_gcn_utils.img_poly_to_can_poly(ex),
+                        'ind': py_ind,
+                        'i_it_py': i_it_py,
+                        'c_it_py': c_it_py,
+                        'py_ind': py_ind,
+                    }
+                else:
+                    init = snake_gcn_utils.prepare_testing(output)
                 ret.update(init)
                 
                 i_it_py = init['i_it_py']
@@ -1847,12 +2331,13 @@ class FlowMatchingEvolution(nn.Module):
                         num_iter_steps=iter_steps,
                         fractions=fractions,
                         ode_steps=iter_ode_steps,
+                        batch=batch,
                     )
                     if self.use_fourier_smooth > 0:
                         disp = self.fourier_smooth(disp, self.use_fourier_smooth)
                     ret.update({'disp': disp, 'py': i_it_py + disp})
                 else:
-                    disp = self.sample_disp(cnn_feature, i_it_py, c_it_py, py_ind, steps=self.ode_steps)
+                    disp = self.sample_disp(cnn_feature, i_it_py, c_it_py, py_ind, steps=self.ode_steps, batch=batch)
                     if self.use_fourier_smooth > 0:
                         disp = self.fourier_smooth(disp, self.use_fourier_smooth)
                     ret.update({

@@ -31,10 +31,14 @@ sys.argv += _remaining_argv
 
 import numpy as np
 import torch
+import torch.nn as nn
 import cv2
 
 from lib.config import cfg, args
 from lib.datasets import make_data_loader
+from lib.datasets.collate_batch import make_collator
+from lib.datasets.make_dataset import make_dataset
+from lib.datasets.transforms import make_transforms
 from lib.networks import make_network
 from lib.networks.diffusion.pretrain_evolution import remap_legacy_state_dict
 from lib.train import make_optimizer
@@ -269,9 +273,92 @@ def _lowfreq_basis(n_points: int, n_modes: int, device, dtype) -> torch.Tensor:
     return torch.stack(cols[:n_modes], dim=1)
 
 
+def _fourier_band_basis(n_points: int, k_min: int, k_max: int, device, dtype) -> torch.Tensor:
+    k_min = max(int(k_min), 1)
+    k_max = max(int(k_max), k_min)
+    theta = torch.linspace(0.0, 2.0 * math.pi, n_points + 1, device=device, dtype=dtype)[:-1]
+    cols = []
+    for freq in range(k_min, k_max + 1):
+        cols.append(math.sqrt(2.0 / float(n_points)) * torch.cos(float(freq) * theta))
+        cols.append(math.sqrt(2.0 / float(n_points)) * torch.sin(float(freq) * theta))
+    return torch.stack(cols, dim=1)
+
+
+def _poly_explorer_features(poly: torch.Tensor, frac: float, coord_scale: float = 128.0) -> torch.Tensor:
+    coord_scale = max(float(coord_scale), 1.0)
+    p = poly / coord_scale
+    mean = p.mean(dim=1)
+    std = p.std(dim=1, unbiased=False)
+    min_xy = p.amin(dim=1)
+    max_xy = p.amax(dim=1)
+    size = max_xy - min_xy
+    centered = p - mean[:, None, :]
+    radius = centered.norm(dim=-1)
+    radius_mean = radius.mean(dim=1, keepdim=True)
+    radius_std = radius.std(dim=1, unbiased=False, keepdim=True)
+    x, y = p[..., 0], p[..., 1]
+    area = 0.5 * (
+        x * torch.roll(y, shifts=-1, dims=1) - y * torch.roll(x, shifts=-1, dims=1)
+    ).sum(dim=1, keepdim=True).abs()
+    frac_t = torch.full((poly.size(0), 1), float(frac), device=poly.device, dtype=poly.dtype)
+    return torch.cat([mean, std, min_xy, max_xy, size, radius_mean, radius_std, area, frac_t], dim=1)
+
+
+class FourierExplorer(nn.Module):
+    def __init__(self, low_modes: int, detail_modes: int, hidden_dim: int = 64,
+                 mu_max: float = 0.50, logstd_min: float = -1.50, logstd_max: float = 0.70):
+        super().__init__()
+        self.low_modes = int(low_modes)
+        self.detail_modes = int(detail_modes)
+        self.mu_max = float(mu_max)
+        self.logstd_min = float(logstd_min)
+        self.logstd_max = float(logstd_max)
+        out_dim = 2 * (self.low_modes + self.detail_modes)
+        self.net = nn.Sequential(
+            nn.Linear(14, int(hidden_dim)),
+            nn.SiLU(),
+            nn.Linear(int(hidden_dim), int(hidden_dim)),
+            nn.SiLU(),
+            nn.Linear(int(hidden_dim), out_dim),
+        )
+        nn.init.zeros_(self.net[-1].weight)
+        nn.init.zeros_(self.net[-1].bias)
+
+    def forward(self, poly: torch.Tensor, frac: float):
+        feat = _poly_explorer_features(poly, frac, coord_scale=128.0)
+        out = self.net(feat)
+        n_low = self.low_modes
+        n_detail = self.detail_modes
+        low_mu_raw = out[:, :n_low]
+        low_logstd = out[:, n_low:2 * n_low]
+        off = 2 * n_low
+        detail_mu_raw = out[:, off:off + n_detail]
+        detail_logstd = out[:, off + n_detail:off + 2 * n_detail]
+        low_mu = torch.tanh(low_mu_raw) * self.mu_max
+        detail_mu = torch.tanh(detail_mu_raw) * self.mu_max
+        low_logstd = low_logstd.clamp(self.logstd_min, self.logstd_max)
+        detail_logstd = detail_logstd.clamp(self.logstd_min, self.logstd_max)
+        return low_mu, low_logstd, detail_mu, detail_logstd
+
+
+def _normal_z_logprob(z: torch.Tensor, mu: torch.Tensor, logstd: torch.Tensor) -> torch.Tensor:
+    var = torch.exp(2.0 * logstd).clamp_min(1e-12)
+    lp = -0.5 * (((z - mu) ** 2) / var + 2.0 * logstd + math.log(2.0 * math.pi))
+    return lp.mean(dim=1)
+
+
 def _geom_delta_from_z(poly: torch.Tensor, z: torch.Tensor, sigma: float) -> torch.Tensor:
     basis = _lowfreq_basis(poly.size(1), z.size(1), poly.device, poly.dtype)
     scalar = torch.matmul(z, basis.t()) * float(sigma)
+    return _contour_normals(poly) * scalar.unsqueeze(-1)
+
+
+def _band_detail_delta_from_z(poly: torch.Tensor, z: torch.Tensor, sigma: float,
+                              k_min: int, k_max: int, gate: float) -> torch.Tensor:
+    if float(gate) <= 0.0 or float(sigma) <= 0.0:
+        return torch.zeros_like(poly)
+    basis = _fourier_band_basis(poly.size(1), k_min, k_max, poly.device, poly.dtype)
+    scalar = torch.matmul(z, basis.t()) * float(sigma) * float(gate)
     return _contour_normals(poly) * scalar.unsqueeze(-1)
 
 
@@ -281,10 +368,39 @@ def _project_geom_z(poly: torch.Tensor, residual: torch.Tensor, sigma: float, n_
     return torch.matmul(scalar, basis)
 
 
+def _project_band_detail_z(poly: torch.Tensor, residual: torch.Tensor, sigma: float,
+                           k_min: int, k_max: int, gate: float) -> torch.Tensor:
+    basis = _fourier_band_basis(poly.size(1), k_min, k_max, poly.device, poly.dtype)
+    denom = max(float(sigma) * max(float(gate), 0.0), 1e-6)
+    scalar = (residual * _contour_normals(poly)).sum(dim=-1) / denom
+    return torch.matmul(scalar, basis)
+
+
 def _geom_action_logprob(action: torch.Tensor, mean: torch.Tensor, state: torch.Tensor,
                          sigma: float, n_modes: int) -> torch.Tensor:
     z = _project_geom_z(state, action.detach() - mean, sigma, n_modes)
     return _z_logprob(z)
+
+
+def _band_detail_action_logprob(action: torch.Tensor, mean: torch.Tensor, state: torch.Tensor,
+                                low_sigma: float, low_modes: int, detail_sigma: float,
+                                detail_k_min: int, detail_k_max: int, detail_gate: float,
+                                detail_logprob_weight: float) -> torch.Tensor:
+    residual = action.detach() - mean
+    z_low = _project_geom_z(state, residual, low_sigma, low_modes)
+    lp_low = _z_logprob(z_low)
+    if float(detail_gate) <= 0.0 or float(detail_sigma) <= 0.0 or float(detail_logprob_weight) <= 0.0:
+        return lp_low
+    z_detail = _project_band_detail_z(
+        state,
+        residual,
+        detail_sigma,
+        detail_k_min,
+        detail_k_max,
+        detail_gate,
+    )
+    lp_detail = _z_logprob(z_detail)
+    return lp_low + float(detail_logprob_weight) * lp_detail
 
 
 def _flow_disp_from_latent(flow, cnn_feature, i_state, c_state, py_ind, latent, steps: int) -> torch.Tensor:
@@ -371,6 +487,39 @@ def main():
     sigma_px = sigma_px[:outer_steps]
     sigma_feat = [x / max(float(snake_config.down_ratio), 1.0) for x in sigma_px]
     action_policy = str(cv('action_policy', 'geom')).strip().lower()
+    detail_k_min = int(cv('detail_k_min', 9))
+    detail_k_max = int(cv('detail_k_max', 24))
+    detail_sigma_px_cfg = cv('detail_sigma_px', [0.0, 0.35, 0.50])
+    if isinstance(detail_sigma_px_cfg, (int, float)):
+        detail_sigma_px = [float(detail_sigma_px_cfg)] * outer_steps
+    else:
+        detail_sigma_px = [float(x) for x in list(detail_sigma_px_cfg)]
+    if len(detail_sigma_px) < outer_steps:
+        detail_sigma_px = detail_sigma_px + [detail_sigma_px[-1]] * (outer_steps - len(detail_sigma_px))
+    detail_sigma_px = detail_sigma_px[:outer_steps]
+    detail_sigma_feat = [x / max(float(snake_config.down_ratio), 1.0) for x in detail_sigma_px]
+    detail_gate_cfg = cv('detail_gate', [0.0, 0.35, 0.55])
+    if isinstance(detail_gate_cfg, (int, float)):
+        detail_gate = [float(detail_gate_cfg)] * outer_steps
+    else:
+        detail_gate = [float(x) for x in list(detail_gate_cfg)]
+    if len(detail_gate) < outer_steps:
+        detail_gate = detail_gate + [detail_gate[-1]] * (outer_steps - len(detail_gate))
+    detail_gate = [min(max(float(x), 0.0), 1.0) for x in detail_gate[:outer_steps]]
+    detail_modes = _fourier_band_basis(128, detail_k_min, detail_k_max, torch.device('cpu'), torch.float32).size(1)
+    detail_logprob_weight = float(cv('detail_logprob_weight', 0.35))
+    prefix_distill_weight = float(cv('prefix_distill_weight', 0.0))
+    prefix_distill_steps_cfg = cv('prefix_distill_steps', [])
+    if isinstance(prefix_distill_steps_cfg, (int, float)):
+        prefix_distill_steps = {int(prefix_distill_steps_cfg)}
+    else:
+        prefix_distill_steps = {int(x) for x in list(prefix_distill_steps_cfg)}
+    prefix_distill_steps = {x for x in prefix_distill_steps if 0 <= x < outer_steps}
+    adaptive_explorer = _as_bool(cv('adaptive_explorer', False))
+    explorer_hidden_dim = int(cv('explorer_hidden_dim', 64))
+    explorer_mu_max = float(cv('explorer_mu_max', 0.50))
+    explorer_logstd_min = float(cv('explorer_logstd_min', -1.50))
+    explorer_logstd_max = float(cv('explorer_logstd_max', 0.70))
     df_step_mode = str(cv('df_step_mode', 'flow_grpo')).strip().lower()
     df_sde_type = str(cv('df_sde_type', 'sde')).strip().lower()
     df_noise_level = float(cv('df_noise_level', 0.05))
@@ -383,6 +532,7 @@ def main():
     gate_margin = float(cv('gate_margin', 0.0))
     grad_clip_norm = float(cv('grad_clip_norm', 0.3))
     lr = float(cv('lr', getattr(cfg.train, 'lr', 5e-8)))
+    explorer_lr = float(cv('explorer_lr', lr))
     eval_batches_n = int(cv('eval_batches', 4))
     eval_every = int(cv('eval_every', 20))
     save_every = int(cv('save_every', 50))
@@ -390,6 +540,11 @@ def main():
     seed = int(cv('seed', 20260525))
     freeze_yolo = _as_bool(cv('freeze_yolo', True))
     min_load_ratio = float(cv('min_load_ratio', 95.0))
+    max_contours = int(cv('max_contours', 0))
+    difficulty_index_path = str(cv('difficulty_index_path', '') or '').strip()
+    hard_oversample_factor = float(cv('hard_oversample_factor', 4.0))
+    hard_iou_thresh = float(cv('hard_iou_thresh', 0.8))
+    sigma_difficulty_scale = float(cv('sigma_difficulty_scale', 0.0))
 
     reward_w_region = float(cv('reward_w_region', 0.30))
     reward_w_dice = float(cv('reward_w_dice', 0.10))
@@ -402,6 +557,8 @@ def main():
     reward_burr_max_px = float(cv('reward_burr_max_px', 1.5))
     reward_burr_margin_px = float(cv('reward_burr_margin_px', 0.5))
     reward_burr_quantile = float(cv('reward_burr_quantile', 95.0))
+    reward_regression_weight = float(cv('reward_regression_weight', 0.0))
+    reward_regression_init_thresh = float(cv('reward_regression_init_thresh', 0.8))
     reward_global_weight = float(cv('reward_global_weight', 1.0))
     reward_detail_weight = float(cv('reward_detail_weight', 0.0))
     reward_detail_w_corner_dist = float(cv('reward_detail_w_corner_dist', 0.35))
@@ -443,15 +600,123 @@ def main():
     nbn = freeze_bn_running_stats(inner)
     print(f'[RL-V5] froze BN running stats on {nbn} layers.')
 
+    explorer = None
+    if adaptive_explorer:
+        if action_policy not in ('band_detail', 'geom_band_detail', 'detail_band'):
+            raise ValueError('adaptive_explorer currently requires action_policy=band_detail')
+        explorer_device = next(net_for_load.parameters()).device
+        explorer = FourierExplorer(
+            low_modes=geom_modes,
+            detail_modes=detail_modes,
+            hidden_dim=explorer_hidden_dim,
+            mu_max=explorer_mu_max,
+            logstd_min=explorer_logstd_min,
+            logstd_max=explorer_logstd_max,
+        ).to(explorer_device)
+        print(
+            '[RL-V5] adaptive Fourier explorer enabled '
+            f'(hidden={explorer_hidden_dim}, mu_max={explorer_mu_max}, '
+            f'logstd=[{explorer_logstd_min}, {explorer_logstd_max}]).'
+        )
+
     optimizer = make_optimizer(cfg, trainer.network)
     for group in optimizer.param_groups:
         group['lr'] = lr
+    if explorer is not None:
+        optimizer.add_param_group({
+            'params': list(explorer.parameters()),
+            'lr': explorer_lr,
+            'weight_decay': 0.0,
+        })
     print(f'[RL-V5] optimizer LR set to {lr}')
+    if explorer is not None:
+        print(f'[RL-V5] explorer LR set to {explorer_lr}')
 
     ref_flow = freeze_ref_flow(inner)
     print('[RL-V5] frozen reference flow snapshot created.')
 
-    train_loader = make_data_loader(cfg, is_train=True, is_distributed=False)
+    def _make_difficulty_train_loader():
+        if not difficulty_index_path:
+            return None
+        path = _project_path(difficulty_index_path)
+        try:
+            with open(path, 'r') as f:
+                index_data = json.load(f)
+        except Exception as e:
+            print(f'[RL-V5] WARNING: failed to load difficulty index {path}: {e}. Falling back to shuffle.')
+            return None
+
+        dataset = make_dataset(cfg, cfg.train.dataset, make_transforms(cfg, True), True)
+        samples = index_data.get('samples', {}) if isinstance(index_data, dict) else {}
+        if len(samples) != len(dataset):
+            print(
+                f'[RL-V5] WARNING: difficulty index sample count mismatch '
+                f'({len(samples)} vs dataset {len(dataset)}). Falling back to shuffle.'
+            )
+            return None
+
+        weights = []
+        mean_ious = []
+        hard_count = 0
+        missing_keys = []
+        hard_weight = max(float(hard_oversample_factor), 0.0)
+        for idx in range(len(dataset)):
+            rec = samples.get(str(idx))
+            if not isinstance(rec, dict) or 'mean_iou' not in rec:
+                missing_keys.append(idx)
+                continue
+            mean_iou = float(rec.get('mean_iou', 1.0))
+            mean_ious.append(mean_iou)
+            is_hard = mean_iou < float(hard_iou_thresh)
+            hard_count += int(is_hard)
+            weights.append(hard_weight if is_hard else 1.0)
+
+        if missing_keys:
+            print(
+                f'[RL-V5] WARNING: difficulty index missing keys, first={missing_keys[:5]}. '
+                'Falling back to shuffle.'
+            )
+            return None
+        if not weights or sum(weights) <= 0.0:
+            print('[RL-V5] WARNING: difficulty weights are empty/non-positive. Falling back to shuffle.')
+            return None
+
+        sampler = torch.utils.data.WeightedRandomSampler(
+            torch.as_tensor(weights, dtype=torch.double),
+            num_samples=len(dataset),
+            replacement=True,
+        )
+        batch_sampler = torch.utils.data.sampler.BatchSampler(
+            sampler,
+            int(cfg.train.batch_size),
+            drop_last=False,
+        )
+        loader_kwargs = {
+            'batch_sampler': batch_sampler,
+            'num_workers': int(cfg.train.num_workers),
+            'collate_fn': make_collator(cfg),
+            'pin_memory': True,
+        }
+        if int(cfg.train.num_workers) > 0:
+            loader_kwargs['persistent_workers'] = bool(
+                getattr(cfg, 'dataloader_persistent_workers', True)
+            )
+            prefetch_factor = int(getattr(cfg, 'dataloader_prefetch_factor', 0) or 0)
+            if prefetch_factor > 0:
+                loader_kwargs['prefetch_factor'] = prefetch_factor
+
+        hard_frac = 100.0 * hard_count / max(len(dataset), 1)
+        mean_iou_avg = float(np.mean(mean_ious)) if mean_ious else 1.0
+        print(
+            f'[RL-V5] difficulty sampler enabled: {hard_count}/{len(dataset)} '
+            f'hard samples ({hard_frac:.2f}%), factor={hard_weight:.2f}, '
+            f'thresh={hard_iou_thresh:.3f}, mean_iou={mean_iou_avg:.4f}'
+        )
+        return torch.utils.data.DataLoader(dataset, **loader_kwargs)
+
+    train_loader = _make_difficulty_train_loader()
+    if train_loader is None:
+        train_loader = make_data_loader(cfg, is_train=True, is_distributed=False)
     eval_batches = []
     try:
         eval_loader = make_data_loader(cfg, is_train=False, is_distributed=False)
@@ -483,6 +748,27 @@ def main():
             'geom_lowfreq_modes': geom_modes,
             'geom_sigma_px': sigma_px,
             'geom_sigma_feature': sigma_feat,
+            'band_detail': {
+                'enabled': action_policy in ('band_detail', 'geom_band_detail', 'detail_band'),
+                'k_min': detail_k_min,
+                'k_max': detail_k_max,
+                'modes': detail_modes,
+                'sigma_px': detail_sigma_px,
+                'gate': detail_gate,
+                'logprob_weight': detail_logprob_weight,
+            },
+            'prefix_distill': {
+                'weight': prefix_distill_weight,
+                'steps': sorted(prefix_distill_steps),
+            },
+            'adaptive_explorer': {
+                'enabled': bool(adaptive_explorer),
+                'hidden_dim': explorer_hidden_dim,
+                'mu_max': explorer_mu_max,
+                'logstd_min': explorer_logstd_min,
+                'logstd_max': explorer_logstd_max,
+                'lr': explorer_lr,
+            },
             'df_inner_step': {
                 'step_mode': df_step_mode,
                 'sde_type': df_sde_type,
@@ -506,6 +792,16 @@ def main():
                 'max_px': reward_burr_max_px,
                 'margin_px': reward_burr_margin_px,
                 'quantile': reward_burr_quantile,
+            },
+            'anti_regression': {
+                'weight': reward_regression_weight,
+                'init_thresh': reward_regression_init_thresh,
+            },
+            'difficulty_focus': {
+                'index_path': difficulty_index_path,
+                'hard_oversample_factor': hard_oversample_factor,
+                'hard_iou_thresh': hard_iou_thresh,
+                'sigma_difficulty_scale': sigma_difficulty_scale,
             },
             'curvature_detail_reward': {
                 'enabled': bool(reward_detail_weight > 0),
@@ -537,6 +833,7 @@ def main():
                 },
             },
             'viz_every': viz_every,
+            'max_contours': max_contours,
         }, f, indent=2)
 
     gcn = inner.gcn
@@ -571,6 +868,11 @@ def main():
         if i_gt.size(0) != i_init.size(0):
             n = min(i_init.size(0), i_gt.size(0))
             i_init, c_init, i_gt, py_ind = i_init[:n], c_init[:n], i_gt[:n], py_ind[:n]
+        if max_contours > 0 and i_init.size(0) > max_contours:
+            i_init = i_init[:max_contours]
+            c_init = c_init[:max_contours]
+            i_gt = i_gt[:max_contours]
+            py_ind = py_ind[:max_contours]
         if was_training:
             inner.train()
             freeze_bn_running_stats(inner)
@@ -601,6 +903,18 @@ def main():
         comps = {
             'global_score': global_score,
         }
+        if reward_regression_weight > 0:
+            comps['iou'] = compute_region_score(
+                poly,
+                gt,
+                H=int(image_hw[0]),
+                W=int(image_hw[1]),
+                w_boundary=0,
+                w_dice=0,
+                w_iou=1,
+                w_dist=0,
+                coord_scale=float(snake_config.down_ratio),
+            )
         if reward_detail_weight <= 0:
             return reward_global_weight * global_score, comps
         detail_score, detail_comps = compute_curvature_detail_score(
@@ -637,6 +951,7 @@ def main():
     def _deterministic_three_step(output, flow):
         current = output['i_it_py'].detach()
         total_disp = torch.zeros_like(current)
+        polys = [current.detach()]
         for frac in fractions:
             c_cur = snake_gcn_utils.img_poly_to_can_poly(current)
             action = _outer_action_mean(
@@ -644,12 +959,14 @@ def main():
             )
             current = (current + action).detach()
             total_disp = total_disp + action.detach()
-        return {'disp': total_disp, 'py': output['i_it_py'] + total_disp}
+            polys.append(current.detach())
+        return {'disp': total_disp, 'py': output['i_it_py'] + total_disp, 'polys': polys}
 
     @torch.no_grad()
-    def _sample_rollout(output):
+    def _sample_rollout(output, sigma_multiplier: float = 1.0):
         current = output['i_it_py'].detach()
         total_disp = torch.zeros_like(current)
+        sigma_multiplier = max(float(sigma_multiplier), 0.0)
         traj = {
             'states': [],
             'c_states': [],
@@ -657,6 +974,12 @@ def main():
             'old_logs': [],
             'fractions': [],
             'sigmas': [],
+            'detail_sigmas': [],
+            'outer_indices': [],
+            'prefix_states': [],
+            'prefix_c_states': [],
+            'prefix_fractions': [],
+            'prefix_indices': [],
             'polys': [current.detach()],
         }
         if action_policy in ('df', 'df_inner_step', 'diffusion_inner_step', 'flow_inner_step'):
@@ -728,16 +1051,68 @@ def main():
         for si, frac in enumerate(fractions):
             c_cur = snake_gcn_utils.img_poly_to_can_poly(current)
             mean = _outer_action_mean(gcn, output['cnn_feature'], current, c_cur, output['py_ind'], frac, ode_steps)
-            sigma = float(sigma_feat[si])
+            if prefix_distill_weight > 0.0 and si in prefix_distill_steps:
+                traj['prefix_states'].append(current.detach())
+                traj['prefix_c_states'].append(c_cur.detach())
+                traj['prefix_fractions'].append(float(frac))
+                traj['prefix_indices'].append(int(si))
+            sigma = float(sigma_feat[si]) * sigma_multiplier
+            low_active = sigma > 0.0
+            use_explorer = explorer is not None and action_policy in ('band_detail', 'geom_band_detail', 'detail_band')
+            low_mu = low_logstd = detail_mu = detail_logstd = None
+            if use_explorer:
+                low_mu, low_logstd, detail_mu, detail_logstd = explorer(current, float(frac))
             z = torch.randn((current.size(0), geom_modes), device=current.device, dtype=current.dtype)
-            action = mean + _geom_delta_from_z(current, z, sigma)
-            old_log = _z_logprob(z)
-            traj['states'].append(current.detach())
-            traj['c_states'].append(c_cur.detach())
-            traj['actions'].append(action.detach())
-            traj['old_logs'].append(old_log.detach())
-            traj['fractions'].append(float(frac))
-            traj['sigmas'].append(sigma)
+            if low_active and low_mu is not None:
+                z = low_mu + torch.exp(low_logstd) * z
+            low_delta = _geom_delta_from_z(current, z, sigma) if low_active else torch.zeros_like(current)
+            if low_active:
+                old_log = (
+                    _normal_z_logprob(z, low_mu, low_logstd)
+                    if low_mu is not None else _z_logprob(z)
+                )
+            else:
+                old_log = None
+            if action_policy in ('band_detail', 'geom_band_detail', 'detail_band'):
+                d_sigma = float(detail_sigma_feat[si]) * sigma_multiplier
+                d_gate = float(detail_gate[si])
+                detail_active = (
+                    d_sigma > 0.0 and d_gate > 0.0 and float(detail_logprob_weight) > 0.0
+                )
+                z_detail = torch.randn((current.size(0), detail_modes), device=current.device, dtype=current.dtype)
+                if detail_active and detail_mu is not None:
+                    z_detail = detail_mu + torch.exp(detail_logstd) * z_detail
+                detail_delta = (
+                    _band_detail_delta_from_z(
+                        current,
+                        z_detail,
+                        d_sigma,
+                        detail_k_min,
+                        detail_k_max,
+                        d_gate,
+                    )
+                    if detail_active else torch.zeros_like(current)
+                )
+                action = mean + low_delta + detail_delta
+                if detail_active:
+                    detail_log = float(detail_logprob_weight) * (
+                        _normal_z_logprob(z_detail, detail_mu, detail_logstd)
+                        if detail_mu is not None else _z_logprob(z_detail)
+                    )
+                    old_log = detail_log if old_log is None else old_log + detail_log
+            else:
+                d_sigma = 0.0
+                detail_active = False
+                action = mean + low_delta
+            if low_active or detail_active:
+                traj['states'].append(current.detach())
+                traj['c_states'].append(c_cur.detach())
+                traj['actions'].append(action.detach())
+                traj['old_logs'].append(old_log.detach())
+                traj['fractions'].append(float(frac))
+                traj['sigmas'].append(sigma)
+                traj['detail_sigmas'].append(float(d_sigma))
+                traj['outer_indices'].append(int(si))
             current = (current + action).detach()
             total_disp = total_disp + action.detach()
             traj['polys'].append(current.detach())
@@ -788,6 +1163,7 @@ def main():
     def _save_checkpoint(path: Path, step: int, metrics: Dict):
         _safe_torch_save({
             'state_dict': net_for_load.state_dict(),
+            'explorer_state_dict': None if explorer is None else explorer.state_dict(),
             'optimizer': optimizer.state_dict(),
             'step': int(step),
             'metrics': metrics,
@@ -797,7 +1173,9 @@ def main():
 
     @torch.no_grad()
     def _dump_group_viz(batch, output, rollouts: List[Dict], quality: torch.Tensor,
-                        baseline_score: torch.Tensor, step: int):
+                        baseline_score: torch.Tensor, step: int,
+                        deterministic_py: Optional[torch.Tensor] = None,
+                        deterministic_polys: Optional[List[torch.Tensor]] = None):
         if viz_every <= 0:
             return
         viz_dir = _THIS_DIR / 'visual' / f'rl_v5_{_cfg_stem()}'
@@ -845,6 +1223,14 @@ def main():
                 pts[:, 1] = np.clip(pts[:, 1], 0, H - 1)
                 loop = np.concatenate([pts, pts[:1]], axis=0)
                 cv2.polylines(canvas, [loop], True, color, thick)
+
+        det_py = deterministic_py
+        if det_py is None:
+            det_ret_for_viz = _deterministic_three_step(output, gcn)
+            det_py = det_ret_for_viz['py']
+            deterministic_polys = det_ret_for_viz.get('polys')
+        det_np = det_py.detach().cpu().numpy()[img_mask.cpu().numpy()] * scale
+        delta_stats = []
 
         panels = []
         colors = [(60, 220, 255), (80, 220, 80), (0, 170, 255), (255, 255, 255)]
@@ -901,6 +1287,108 @@ def main():
             cv2.imwrite(str(viz_dir / f'train_group_step{step:06d}_split.png'),
                         np.concatenate([split_legend, split_tape], axis=0))
 
+        delta_panels = []
+        delta_magnify = 12.0
+        for ri in order:
+            canvas = base.copy()
+            final_np = rollouts[ri]['py'].detach().cpu().numpy()[img_mask.cpu().numpy()] * scale
+            diff = final_np - det_np
+            diff_norm = np.linalg.norm(diff.reshape(-1, 2), axis=1)
+            mean_diff = float(diff_norm.mean()) if diff_norm.size else 0.0
+            max_diff = float(diff_norm.max()) if diff_norm.size else 0.0
+            delta_stats.append({
+                'k': int(ri),
+                'mean_abs_px': mean_diff,
+                'max_abs_px': max_diff,
+            })
+            draw(canvas, gt_np, (255, 0, 0), 3)
+            draw(canvas, det_np, (180, 180, 180), 3)
+            draw(canvas, final_np, (255, 255, 255), 2)
+            for poly_det, poly_final in zip(det_np, final_np):
+                amplified = poly_det + (poly_final - poly_det) * delta_magnify
+                step_stride = max(int(poly_det.shape[0] // 16), 1)
+                for pi in range(0, poly_det.shape[0], step_stride):
+                    p0 = np.round(poly_det[pi]).astype(np.int32)
+                    p1 = np.round(amplified[pi]).astype(np.int32)
+                    p0[0] = np.clip(p0[0], 0, W - 1)
+                    p0[1] = np.clip(p0[1], 0, H - 1)
+                    p1[0] = np.clip(p1[0], 0, W - 1)
+                    p1[1] = np.clip(p1[1], 0, H - 1)
+                    cv2.arrowedLine(canvas, tuple(p0), tuple(p1), (40, 40, 255), 1, cv2.LINE_AA, tipLength=0.25)
+            border = (80, 220, 80) if ri == best_idx else ((40, 40, 255) if ri == worst_idx else (90, 90, 90))
+            cv2.rectangle(canvas, (0, 0), (W - 1, H - 1), border, 4)
+            label = f"k={ri} Q={float(q_np[ri].mean()):+.4f} d_mean={mean_diff:.2f}px d_max={max_diff:.2f}px"
+            cv2.rectangle(canvas, (2, 2), (min(W-2, 560), 28), (0, 0, 0), -1)
+            cv2.putText(canvas, label, (6, 20), cv2.FONT_HERSHEY_SIMPLEX, 0.50, (0, 255, 0), 1, cv2.LINE_AA)
+            delta_panels.append(canvas)
+        if delta_panels:
+            delta_tape = np.concatenate(delta_panels, axis=1)
+            delta_legend = np.zeros((58, delta_tape.shape[1], 3), dtype=np.uint8)
+            cv2.putText(delta_legend, 'delta view: gray=deterministic baseline, white=sampled final, red arrows=sample-baseline displacement x12',
+                        (5, 22), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (255, 255, 255), 1, cv2.LINE_AA)
+            cv2.putText(delta_legend, 'This makes conservative exploration visible; d_mean/d_max are true pixel differences before magnification.',
+                        (5, 47), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (220, 220, 220), 1, cv2.LINE_AA)
+            cv2.imwrite(str(viz_dir / f'train_group_step{step:06d}_delta.png'),
+                        np.concatenate([delta_legend, delta_tape], axis=0))
+
+        step_delta_rows = []
+        step_delta_stats = []
+        if deterministic_polys is not None:
+            det_stage_np = [
+                p.detach().cpu().numpy()[img_mask.cpu().numpy()] * scale
+                for p in deterministic_polys
+            ]
+            n_stage = min(len(det_stage_np), min(len(r['polys']) for r in rollouts))
+            for ri in order:
+                row_panels = []
+                ri_stats = {'k': int(ri), 'stages': []}
+                for si in range(1, n_stage):
+                    canvas = base.copy()
+                    sample_stage = rollouts[ri]['polys'][si].detach().cpu().numpy()[img_mask.cpu().numpy()] * scale
+                    det_stage = det_stage_np[si]
+                    diff = sample_stage - det_stage
+                    diff_norm = np.linalg.norm(diff.reshape(-1, 2), axis=1)
+                    mean_diff = float(diff_norm.mean()) if diff_norm.size else 0.0
+                    max_diff = float(diff_norm.max()) if diff_norm.size else 0.0
+                    ri_stats['stages'].append({
+                        'stage': int(si),
+                        'mean_abs_px': mean_diff,
+                        'max_abs_px': max_diff,
+                    })
+                    draw(canvas, gt_np, (255, 0, 0), 2)
+                    draw(canvas, det_stage, (180, 180, 180), 3)
+                    draw(canvas, sample_stage, (255, 255, 255), 2)
+                    for poly_det, poly_sample in zip(det_stage, sample_stage):
+                        amplified = poly_det + (poly_sample - poly_det) * delta_magnify
+                        step_stride = max(int(poly_det.shape[0] // 16), 1)
+                        for pi in range(0, poly_det.shape[0], step_stride):
+                            p0 = np.round(poly_det[pi]).astype(np.int32)
+                            p1 = np.round(amplified[pi]).astype(np.int32)
+                            p0[0] = np.clip(p0[0], 0, W - 1)
+                            p0[1] = np.clip(p0[1], 0, H - 1)
+                            p1[0] = np.clip(p1[0], 0, W - 1)
+                            p1[1] = np.clip(p1[1], 0, H - 1)
+                            cv2.arrowedLine(canvas, tuple(p0), tuple(p1), (40, 40, 255), 1, cv2.LINE_AA, tipLength=0.25)
+                    cv2.rectangle(canvas, (2, 2), (min(W - 2, 520), 28), (0, 0, 0), -1)
+                    cv2.putText(canvas, f"k={ri} step{si} d_mean={mean_diff:.2f}px d_max={max_diff:.2f}px",
+                                (6, 20), cv2.FONT_HERSHEY_SIMPLEX, 0.50, (0, 255, 0), 1, cv2.LINE_AA)
+                    row_panels.append(canvas)
+                if row_panels:
+                    row = np.concatenate(row_panels, axis=1)
+                    border = (80, 220, 80) if ri == best_idx else ((40, 40, 255) if ri == worst_idx else (90, 90, 90))
+                    cv2.rectangle(row, (0, 0), (row.shape[1] - 1, row.shape[0] - 1), border, 4)
+                    step_delta_rows.append(row)
+                    step_delta_stats.append(ri_stats)
+            if step_delta_rows:
+                step_delta_tape = np.concatenate(step_delta_rows, axis=0)
+                step_delta_legend = np.zeros((58, step_delta_tape.shape[1], 3), dtype=np.uint8)
+                cv2.putText(step_delta_legend, 'step-delta view: columns compare sampled step1/step2/step3 with deterministic step1/step2/step3',
+                            (5, 22), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (255, 255, 255), 1, cv2.LINE_AA)
+                cv2.putText(step_delta_legend, 'gray=deterministic stage, white=sampled stage, red arrows=sample-stage displacement x12; true d_mean/d_max shown.',
+                            (5, 47), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (220, 220, 220), 1, cv2.LINE_AA)
+                cv2.imwrite(str(viz_dir / f'train_group_step{step:06d}_stepdelta.png'),
+                            np.concatenate([step_delta_legend, step_delta_tape], axis=0))
+
         meta = {
             'step': int(step),
             'type': 'v5_three_step_geom_action_group',
@@ -909,6 +1397,16 @@ def main():
             'best': int(best_idx),
             'worst': int(worst_idx),
             'quality_mean': [float(q_np[i].mean()) for i in range(len(rollouts))],
+            'delta_view': {
+                'magnify': float(delta_magnify),
+                'stats_for_shown_k': delta_stats,
+                'meaning': 'sampled final contour minus deterministic baseline final contour, measured in image pixels',
+            },
+            'step_delta_view': {
+                'magnify': float(delta_magnify),
+                'stats_for_shown_k': step_delta_stats,
+                'meaning': 'sampled stage contour minus deterministic contour at the same stage, measured in image pixels',
+            },
         }
         with open(viz_dir / f'train_group_step{step:06d}.json', 'w') as f:
             json.dump(meta, f, indent=2)
@@ -929,12 +1427,42 @@ def main():
             print(f'[RL-V5] step {step}: empty contour batch, skipping.')
             continue
 
+        init_iou = None
+        reg_mask = None
+        if reward_regression_weight > 0:
+            _, init_comps = _score_with_components(output['i_it_py'], i_gt, output['image_hw'])
+            init_iou = init_comps['iou'].detach()
+            reg_mask = (init_iou > reward_regression_init_thresh).float()
+
         det_ret = _deterministic_three_step(output, gcn)
         baseline_score, baseline_comps = _score_with_components(
             output['i_it_py'] + det_ret['disp'], i_gt, output['image_hw']
         )
         baseline_score = baseline_score.detach()
         baseline_comps = {k: v.detach() for k, v in baseline_comps.items()}
+        if sigma_difficulty_scale > 0.0 and 'iou' not in baseline_comps:
+            baseline_comps['iou'] = compute_region_score(
+                output['i_it_py'] + det_ret['disp'],
+                i_gt,
+                H=int(output['image_hw'][0]),
+                W=int(output['image_hw'][1]),
+                w_boundary=0,
+                w_dice=0,
+                w_iou=1,
+                w_dist=0,
+                coord_scale=float(snake_config.down_ratio),
+            ).detach()
+        sigma_multiplier = 1.0
+        if sigma_difficulty_scale > 0.0 and 'iou' in baseline_comps:
+            baseline_iou_mean = float(baseline_comps['iou'].mean().item()) if baseline_comps['iou'].numel() else 1.0
+            difficulty = max(float(hard_iou_thresh) - baseline_iou_mean, 0.0)
+            sigma_multiplier = 1.0 + float(sigma_difficulty_scale) * difficulty / max(float(hard_iou_thresh), 1e-6)
+        if reward_regression_weight > 0:
+            baseline_reg_penalty = (reg_mask * torch.relu(init_iou - baseline_comps['iou'])).detach()
+            baseline_score_adj = baseline_score - reward_regression_weight * baseline_reg_penalty
+        else:
+            baseline_reg_penalty = torch.zeros_like(baseline_score)
+            baseline_score_adj = baseline_score
 
         rollouts: List[Dict] = []
         final_scores = []
@@ -942,9 +1470,10 @@ def main():
         final_score_components: List[Dict[str, torch.Tensor]] = []
         burr_penalties = []
         burr_raws = []
+        regression_penalties = []
         old_log_counts = []
         for _ in range(k_rollouts):
-            ret = _sample_rollout(output)
+            ret = _sample_rollout(output, sigma_multiplier=sigma_multiplier)
             rollouts.append(ret)
             final_poly = output['i_it_py'] + ret['disp']
             score, score_comps = _score_with_components(final_poly, i_gt, output['image_hw'])
@@ -956,18 +1485,28 @@ def main():
                 max_px=reward_burr_max_px,
                 quantile=reward_burr_quantile,
             )
+            if reward_regression_weight > 0:
+                regression_penalty = (reg_mask * torch.relu(init_iou - score_comps['iou'].detach())).detach()
+            else:
+                regression_penalty = torch.zeros_like(score)
             final_scores.append(score)
             final_score_components.append({k: v.detach() for k, v in score_comps.items()})
-            final_scores_reward.append((score - reward_burr_weight * burr_penalty.detach()).detach())
+            final_scores_reward.append((
+                score - reward_burr_weight * burr_penalty.detach()
+                - reward_regression_weight * regression_penalty
+            ).detach())
             burr_penalties.append(burr_penalty.detach())
             burr_raws.append(burr_raw.detach())
+            regression_penalties.append(regression_penalty)
             old_log_counts.append(len(ret['old_logs']))
 
         final_scores_t = torch.stack(final_scores, dim=0).to(i_init.device)
         final_scores_reward_t = torch.stack(final_scores_reward, dim=0).to(i_init.device)
         burr_penalty_t = torch.stack(burr_penalties, dim=0).to(i_init.device)
         burr_raw_t = torch.stack(burr_raws, dim=0).to(i_init.device)
-        quality = final_scores_reward_t - baseline_score.unsqueeze(0)
+        regression_penalty_t = torch.stack(regression_penalties, dim=0).to(i_init.device)
+        regression_active_frac = float(reg_mask.mean().item()) if reg_mask is not None else 0.0
+        quality = final_scores_reward_t - baseline_score_adj.unsqueeze(0)
         gate = (quality.max(dim=0, keepdim=True).values > gate_margin).float()
         adv = quality / quality.std(dim=0, unbiased=False, keepdim=True).clamp_min(0.1)
         adv = adv.clamp(-adv_clip_max, adv_clip_max) * gate
@@ -976,7 +1515,8 @@ def main():
         gate_active_frac = float(gate.mean().item())
 
         total_actions = sum(len(t['actions']) for t in rollouts)
-        approx_kl_hist, ratio_hist, loss_hist = [], [], []
+        total_prefixes = sum(len(t.get('prefix_states', [])) for t in rollouts)
+        approx_kl_hist, ratio_hist, loss_hist, prefix_loss_hist = [], [], [], []
         early_stop_epoch = ppo_inner_epochs
 
         for epoch in range(ppo_inner_epochs):
@@ -1017,7 +1557,52 @@ def main():
                         mean_cur = _outer_action_mean(
                             gcn, output['cnn_feature'], state, c_state, output['py_ind'], frac, ode_steps
                         )
-                        lp_cur = _geom_action_logprob(action, mean_cur, state, sigma, geom_modes)
+                        if action_policy in ('band_detail', 'geom_band_detail', 'detail_band'):
+                            outer_idx = int(traj.get('outer_indices', [si])[si])
+                            d_idx = min(max(outer_idx, 0), len(detail_sigma_feat) - 1)
+                            detail_sigmas = traj.get('detail_sigmas', [])
+                            detail_sigma_cur = (
+                                float(detail_sigmas[si]) if si < len(detail_sigmas)
+                                else float(detail_sigma_feat[d_idx])
+                            )
+                            if explorer is not None:
+                                residual = action.detach() - mean_cur
+                                low_mu, low_logstd, detail_mu, detail_logstd = explorer(state, frac)
+                                lp_parts = []
+                                if float(sigma) > 0.0:
+                                    z_low = _project_geom_z(state, residual, sigma, geom_modes)
+                                    lp_parts.append(_normal_z_logprob(z_low, low_mu, low_logstd))
+                                d_sigma = detail_sigma_cur
+                                d_gate = float(detail_gate[d_idx])
+                                if d_sigma > 0.0 and d_gate > 0.0 and float(detail_logprob_weight) > 0.0:
+                                    z_detail = _project_band_detail_z(
+                                        state,
+                                        residual,
+                                        d_sigma,
+                                        detail_k_min,
+                                        detail_k_max,
+                                        d_gate,
+                                    )
+                                    lp_parts.append(
+                                        float(detail_logprob_weight)
+                                        * _normal_z_logprob(z_detail, detail_mu, detail_logstd)
+                                    )
+                                lp_cur = sum(lp_parts) if lp_parts else torch.zeros_like(old_log)
+                            else:
+                                lp_cur = _band_detail_action_logprob(
+                                    action,
+                                    mean_cur,
+                                    state,
+                                    sigma,
+                                    geom_modes,
+                                    detail_sigma_cur,
+                                    detail_k_min,
+                                    detail_k_max,
+                                    float(detail_gate[d_idx]),
+                                    detail_logprob_weight,
+                                )
+                        else:
+                            lp_cur = _geom_action_logprob(action, mean_cur, state, sigma, geom_modes)
                         std_cur = None
                     ratio = torch.exp(lp_cur - old_log)
                     unclipped = -adv_ri * ratio
@@ -1064,8 +1649,36 @@ def main():
                         epoch_kls.append(float(0.5 * torch.mean((lp_cur - old_log) ** 2).item()))
                         epoch_ratios.append(ratio.detach())
 
+                if prefix_distill_weight > 0.0 and traj.get('prefix_states'):
+                    for pi, state in enumerate(traj['prefix_states']):
+                        c_state = traj['prefix_c_states'][pi]
+                        frac = traj['prefix_fractions'][pi]
+                        mean_cur = _outer_action_mean(
+                            gcn, output['cnn_feature'], state, c_state, output['py_ind'], frac, ode_steps
+                        )
+                        with torch.no_grad():
+                            mean_ref = _outer_action_mean(
+                                ref_flow, output['cnn_feature'], state, c_state, output['py_ind'], frac, ode_steps
+                            )
+                        prefix_loss = torch.nn.functional.smooth_l1_loss(
+                            mean_cur,
+                            mean_ref,
+                            beta=1.0,
+                            reduction='mean',
+                        )
+                        scaled_prefix_loss = (
+                            float(prefix_distill_weight) * prefix_loss / max(total_prefixes, 1)
+                        )
+                        if scaled_prefix_loss.requires_grad:
+                            scaled_prefix_loss.backward()
+                        with torch.no_grad():
+                            prefix_loss_hist.append(float(prefix_loss.detach().item()))
+
+            trainable_params = [p for p in net_for_load.parameters() if p.requires_grad]
+            if explorer is not None:
+                trainable_params += [p for p in explorer.parameters() if p.requires_grad]
             grad_norm = torch.nn.utils.clip_grad_norm_(
-                [p for p in net_for_load.parameters() if p.requires_grad],
+                trainable_params,
                 max_norm=grad_clip_norm,
             )
             optimizer.step()
@@ -1102,8 +1715,18 @@ def main():
             'burr_raw_px_mean': float(burr_raw_t.mean().item()),
             'reward_burr_weight': float(reward_burr_weight),
             'reward_burr_quantile': float(reward_burr_quantile),
+            'regression_penalty_mean': float(regression_penalty_t.mean().item()),
+            'regression_active_frac': regression_active_frac,
+            'reward_regression_weight': float(reward_regression_weight),
+            'reward_regression_init_thresh': float(reward_regression_init_thresh),
             'gate_active_frac': gate_active_frac,
             'outer_log_count_mean': float(np.mean(old_log_counts)) if old_log_counts else 0.0,
+            'prefix_distill_count_mean': float(np.mean([
+                len(t.get('prefix_states', [])) for t in rollouts
+            ])) if rollouts else 0.0,
+            'prefix_distill_weight': float(prefix_distill_weight),
+            'prefix_distill_loss': float(np.mean(prefix_loss_hist)) if prefix_loss_hist else 0.0,
+            'adaptive_explorer': bool(explorer is not None),
             'approx_kl': float(np.mean(approx_kl_hist)) if approx_kl_hist else 0.0,
             'policy_loss': float(np.mean(loss_hist)) if loss_hist else 0.0,
             'grad_norm': float(grad_norm.detach().item() if torch.is_tensor(grad_norm) else grad_norm),
@@ -1115,6 +1738,7 @@ def main():
             'df_action_std': float(df_action_std),
             'geom_lowfreq_modes': int(geom_modes),
             'geom_sigma_px': [float(x) for x in sigma_px],
+            'sigma_difficulty_multiplier': float(sigma_multiplier),
             'lr': lr,
         }
         for key, value in baseline_comps.items():
@@ -1142,14 +1766,16 @@ def main():
             print(
                 f"[RL-V5] step={step}/{train_steps} reward={reward_mean:+.5f} "
                 f"best={metrics['quality_best_mean']:+.5f} gate={gate_active_frac:.2f} "
-                f"burr={metrics['burr_penalty_mean']:.3f} detail={metrics.get('final_detail_score_mean', 0.0):+.3f} "
+                f"dsig={sigma_multiplier:.2f} "
+                f"burr={metrics['burr_penalty_mean']:.3f} reg={metrics['regression_penalty_mean']:+.3f} "
+                f"detail={metrics.get('final_detail_score_mean', 0.0):+.3f} "
                 f"kl={metrics['approx_kl']:.6f} logs={metrics['outer_log_count_mean']:.1f}{extra}",
                 flush=True,
             )
 
         if viz_every > 0 and (step == 1 or step % viz_every == 0):
             try:
-                _dump_group_viz(batch, output, rollouts, quality, baseline_score, step)
+                _dump_group_viz(batch, output, rollouts, quality, baseline_score_adj, step, det_ret['py'], det_ret.get('polys'))
             except Exception as e:
                 print(f'[RL-V5] viz failed at step {step}: {e}', flush=True)
 

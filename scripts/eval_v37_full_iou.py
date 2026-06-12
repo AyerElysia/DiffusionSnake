@@ -33,6 +33,16 @@ from lib.datasets.transforms import make_transforms
 from lib.networks import make_network
 from lib.train.trainers import make_trainer
 from lib.utils.snake import snake_config, snake_decode, snake_gcn_utils
+from lib.utils.snake.viz_colors import (
+    UNMATCHED_COLOR_BGR,
+    draw_dashed_line,
+    draw_dotted_bbox,
+    draw_instance_legend,
+    draw_polyline_style,
+    draw_text_with_outline,
+    instance_color,
+    _INSTANCE_PALETTE_BGR,
+)
 
 
 def apply_gpu_override():
@@ -61,6 +71,7 @@ def apply_ablation_mode():
     if not mode:
         mode = 'config'
     cfg.eval_manual_gt_init = False
+    cfg.eval_manual_gt_box_octagon = False
 
     if mode in ('config', 'default'):
         pass
@@ -85,11 +96,18 @@ def apply_ablation_mode():
         cfg.use_gt_det = True
         cfg.use_pred_extreme_init_for_inference = False
         cfg.eval_manual_gt_init = True
+    elif mode in ('gt_box_octagon', 'gt_bbox_octagon', 'gt_box_init'):
+        cfg.eval_use_network_forward = False
+        cfg.use_gt_det = True
+        cfg.use_pred_extreme_init_for_inference = False
+        cfg.eval_manual_gt_init = True
+        cfg.eval_manual_gt_box_octagon = True
+        cfg.diffusion_init_source = 'gt_box_octagon'
     else:
         raise ValueError(
             f"Unsupported EVAL_ABLATION_MODE={mode}. "
             "Use config, pred_det_pred_ext, gt_det_pred_ext, "
-            "pred_det_bbox_init, gt_det_bbox_init, or gt_init."
+            "pred_det_bbox_init, gt_det_bbox_init, gt_box_octagon, or gt_init."
         )
 
     print(
@@ -282,6 +300,17 @@ def get_extreme_points_torch(pts, thresh=0.02):
 
 def build_init_polys(batch, gt_all):
     batch_size, num_contours, num_points, _ = gt_all.shape
+    init_source = str(getattr(cfg, 'diffusion_init_source', 'extreme')).strip().lower()
+    if (
+        bool(getattr(cfg, 'eval_manual_gt_box_octagon', False))
+        or init_source in ('gt_box_octagon', 'gt_bbox_octagon', 'box_octagon', 'bbox_octagon')
+    ):
+        gt_flat = gt_all.view(batch_size * num_contours, num_points, 2)
+        if 'ct_01' in batch:
+            keep = batch['ct_01'].view(-1).bool()
+            gt_flat = gt_flat[keep]
+        return snake_gcn_utils.build_box_octagon_from_poly(gt_flat, num_points)
+
     if 'i_it_py' in batch and batch['i_it_py'].numel() > 0:
         return batch['i_it_py'].view(-1, num_points, 2)
 
@@ -357,47 +386,6 @@ def soften_color(color, alpha=0.45):
     base = np.array(color, dtype=np.float32)
     gray = np.array([190, 190, 190], dtype=np.float32)
     return tuple(int(v) for v in (alpha * base + (1.0 - alpha) * gray))
-
-
-def draw_dashed_line(img, p1, p2, color, thickness=1, dash_len=8, gap_len=5):
-    p1 = np.asarray(p1, dtype=np.float32)
-    p2 = np.asarray(p2, dtype=np.float32)
-    vec = p2 - p1
-    dist = float(np.linalg.norm(vec))
-    if dist < 1e-3:
-        return
-    direction = vec / dist
-    pos = 0.0
-    while pos < dist:
-        start = p1 + direction * pos
-        end = p1 + direction * min(pos + dash_len, dist)
-        cv2.line(
-            img,
-            tuple(np.round(start).astype(np.int32)),
-            tuple(np.round(end).astype(np.int32)),
-            color,
-            thickness=thickness,
-            lineType=cv2.LINE_AA,
-        )
-        pos += dash_len + gap_len
-
-
-def draw_polyline_style(img, poly, color, closed=True, thickness=1, style='solid'):
-    pts = np.round(poly).astype(np.int32)
-    if len(pts) < 2:
-        return
-    if style == 'solid':
-        cv2.polylines(img, [pts], closed, color, thickness, lineType=cv2.LINE_AA)
-        return
-    n = len(pts)
-    edge_count = n if closed else n - 1
-    for i in range(edge_count):
-        p1 = pts[i]
-        p2 = pts[(i + 1) % n]
-        if style == 'dotted':
-            draw_dashed_line(img, p1, p2, color, thickness=thickness, dash_len=2, gap_len=6)
-        else:
-            draw_dashed_line(img, p1, p2, color, thickness=thickness, dash_len=9, gap_len=6)
 
 
 def crop_poly_view(img, polys, margin=28):
@@ -489,7 +477,7 @@ def save_visual(
     show_init = os.environ.get('VIS_SHOW_INIT', '0') != '0'
     show_text = os.environ.get('VIS_SHOW_TEXT', '0') != '0'
     show_unmatched = os.environ.get('VIS_SHOW_UNMATCHED', '0') != '0'
-    color_mode = os.environ.get('VIS_COLOR_MODE', 'role').strip().lower()
+    color_mode = os.environ.get('VIS_COLOR_MODE', 'instance').strip().lower()
     use_role_color = color_mode not in ('label', 'label_color', 'old', 'oldstyle')
     gt_role_color = (80, 255, 80)
     pred_role_color = (60, 60, 255)
@@ -506,6 +494,96 @@ def save_visual(
     for gt_idx, pred_idx in enumerate(matched_pred):
         if 0 <= int(pred_idx) < len(pred_polys):
             pred_to_gt[int(pred_idx)] = gt_idx
+
+    if color_mode == 'instance':
+        show_det_box = os.environ.get('VIS_SHOW_DET_BOX', '1') != '0'
+
+        def _pred_instance_color(pred_idx):
+            gt_idx = pred_to_gt.get(int(pred_idx))
+            return instance_color(gt_idx) if gt_idx is not None else UNMATCHED_COLOR_BGR
+
+        def _show_pred_index(pred_idx):
+            return int(pred_idx) in pred_to_gt or show_unmatched
+
+        # Init polygons are still saved separately; overlay drawing is controlled by VIS_SHOW_INIT.
+        for pred_idx, poly in enumerate(init_polys):
+            color = _pred_instance_color(pred_idx)
+            draw_polyline_style(init_all_debug, poly, color, thickness=1, style='dotted')
+            if not _show_pred_index(pred_idx):
+                continue
+            draw_polyline_style(init_vis, poly, color, thickness=1, style='dotted')
+            if show_det_box:
+                draw_dotted_bbox(vis, poly, color, thickness=1)
+                draw_dotted_bbox(label_vis, poly, color, thickness=1)
+            if show_init:
+                draw_polyline_style(vis, poly, color, thickness=1, style='dotted')
+                draw_polyline_style(label_vis, poly, color, thickness=1, style='dotted')
+
+        for gt_idx, poly in enumerate(gt_polys):
+            color = instance_color(gt_idx)
+            draw_polyline_style(vis, poly, color, thickness=2, style='solid')
+            draw_polyline_style(label_vis, poly, color, thickness=2, style='solid')
+            draw_polyline_style(gt_vis, poly, color, thickness=2, style='solid')
+
+        for pred_idx, poly in enumerate(pred_polys):
+            color = _pred_instance_color(pred_idx)
+            draw_polyline_style(pred_all_debug, poly, color, thickness=2, style='dashed')
+            if not _show_pred_index(pred_idx):
+                continue
+            draw_polyline_style(vis, poly, color, thickness=2, style='dashed')
+            draw_polyline_style(label_vis, poly, color, thickness=2, style='dashed')
+            draw_polyline_style(pred_vis, poly, color, thickness=2, style='dashed')
+
+        if show_text:
+            for gt_idx, iou in enumerate(per_contour_iou):
+                pred_idx = int(matched_pred[gt_idx]) if gt_idx < len(matched_pred) else -1
+                if pred_idx < 0 or pred_idx >= len(pred_polys):
+                    continue
+                pred_poly = np.asarray(pred_polys[pred_idx], dtype=np.float32)
+                if pred_poly.ndim != 2 or pred_poly.shape[0] == 0:
+                    continue
+                cx = int(pred_poly[:, 0].mean())
+                cy = int(pred_poly[:, 1].mean())
+                draw_text_with_outline(
+                    vis,
+                    'g{}:{:.1f}%'.format(gt_idx, iou * 100.0),
+                    (cx - 30, cy),
+                    font_scale=0.32,
+                    thickness=1,
+                )
+
+        draw_instance_legend(vis, range(len(gt_polys)))
+        cv2.imwrite(os.path.join(sample_dir, 'overlay.png'), vis)
+        cv2.imwrite(os.path.join(sample_dir, 'overlay_label_color.png'), label_vis)
+        cv2.imwrite(os.path.join(sample_dir, 'gt_only.png'), gt_vis)
+        cv2.imwrite(os.path.join(sample_dir, 'pred_only.png'), pred_vis)
+        cv2.imwrite(os.path.join(sample_dir, 'init_only.png'), init_vis)
+        if not show_unmatched:
+            cv2.imwrite(os.path.join(sample_dir, 'pred_all_debug.png'), pred_all_debug)
+            cv2.imwrite(os.path.join(sample_dir, 'init_all_debug.png'), init_all_debug)
+
+        if os.environ.get('VIS_SAVE_PAIRS', '1') != '0':
+            pair_dir = os.path.join(sample_dir, 'pairs')
+            os.makedirs(pair_dir, exist_ok=True)
+            for gt_idx, gt_poly in enumerate(gt_polys):
+                pred_idx = int(matched_pred[gt_idx]) if gt_idx < len(matched_pred) else -1
+                if pred_idx < 0 or pred_idx >= len(pred_polys):
+                    continue
+                color = instance_color(gt_idx)
+                pair_vis = img.copy()
+                draw_polyline_style(pair_vis, gt_poly, color, thickness=2, style='solid')
+                if show_det_box and pred_idx < len(init_polys):
+                    draw_dotted_bbox(pair_vis, init_polys[pred_idx], color, thickness=1)
+                draw_polyline_style(pair_vis, pred_polys[pred_idx], color, thickness=2, style='dashed')
+                crop_polys = [gt_poly, pred_polys[pred_idx]]
+                if pred_idx < len(init_polys):
+                    crop_polys.append(init_polys[pred_idx])
+                crop = crop_poly_view(pair_vis, crop_polys)
+                iou = float(per_contour_iou[gt_idx]) if gt_idx < len(per_contour_iou) else 0.0
+                label = int(gt_labels[gt_idx]) if gt_idx < len(gt_labels) else 0
+                out_name = f'gt_{gt_idx:03d}_label_{label:02d}_iou_{iou:.3f}.png'
+                cv2.imwrite(os.path.join(pair_dir, out_name), crop)
+        return
 
     # Draw init separately by default. When requested in overlay, keep it faint.
     for pred_idx, poly in enumerate(init_polys):
@@ -588,6 +666,8 @@ def save_visual(
 
 def eval_sample(model, device, batch, ode_steps=10, save_visuals=False, sample_dir=None):
     for k, v in batch.items():
+        if k == 'locate_feat' or str(k).startswith('locate_feat_'):
+            continue
         if isinstance(v, torch.Tensor):
             batch[k] = v.to(device)
 
@@ -681,6 +761,13 @@ def eval_sample(model, device, batch, ode_steps=10, save_visuals=False, sample_d
                         cnn_feature = cnn_feature * (1.0 + mask_guidance_alpha * mask_guidance)
             else:
                 raise RuntimeError(f'Manual GT-init eval does not support detector_backend={detector_backend}')
+
+            locate_feat_stats = {}
+            if hasattr(core, 'apply_locate_feature_injection'):
+                cnn_feature, locate_feat_stats = core.apply_locate_feature_injection(cnn_feature, batch)
+            if hasattr(core, 'apply_locate_feature_replacement'):
+                cnn_feature, replace_stats = core.apply_locate_feature_replacement(cnn_feature, batch)
+                locate_feat_stats.update(replace_stats)
 
             if use_sam_gt_box_init:
                 i_it_py = build_sam_gt_box_init_polys(batch, gt_all, device)
@@ -908,6 +995,7 @@ def main():
         'eval_use_network_forward': bool(getattr(cfg, 'eval_use_network_forward', False)),
         'use_gt_det': bool(getattr(cfg, 'use_gt_det', False)),
         'use_pred_extreme_init_for_inference': bool(getattr(cfg, 'use_pred_extreme_init_for_inference', False)),
+        'diffusion_init_source': str(getattr(cfg, 'diffusion_init_source', 'extreme')),
         'eval_seed': eval_seed,
         'ode_steps': ode_steps,
         'dataset': cfg.test.dataset,
