@@ -48,7 +48,7 @@ ul.bul.o li::before{background:var(--orange)}
 .anim{background:#0a1426;border:1px solid var(--line);border-radius:14px;overflow:hidden;margin:16px 0}
 .anim .cap{padding:9px 14px;font-size:12.5px;color:var(--txt3);border-bottom:1px solid var(--line);display:flex;justify-content:space-between;align-items:center;gap:10px;flex-wrap:wrap}
 .anim .cap b{color:var(--sky);font-weight:600}
-canvas{display:block;width:100%}
+canvas{display:block;width:100%;height:auto}
 .ctrl{display:flex;align-items:center;gap:14px;padding:10px 16px;border-top:1px solid var(--line);background:rgba(0,0,0,.2);flex-wrap:wrap}
 .btn{background:var(--panel2);border:1px solid var(--line);color:var(--txt);padding:7px 14px;border-radius:8px;cursor:pointer;font-size:13px;transition:.15s}
 .btn:hover{border-color:var(--sky);color:var(--sky)}
@@ -341,7 +341,21 @@ const C={}, // canvases
   rand=(a,b)=>a+Math.random()*(b-a),
   lerp=(a,b,t)=>a+(b-a)*t,
   lerpP=(p,q,t)=>({x:lerp(p.x,q.x,t),y:lerp(p.y,q.y,t)});
-function fit(cv){const dpr=window.devicePixelRatio||1;const r=cv.getBoundingClientRect();cv.width=r.width*dpr;cv.height=cv.height*dpr;const ctx=cv.getContext('2d');ctx.setTransform(dpr,0,0,dpr,0,0);return {ctx,w:r.width,h:r.height};}
+function fit(cv){
+  const dpr=window.devicePixelRatio||1;
+  let r=cv.getBoundingClientRect();
+  // If not laid out yet (zero size), fall back to the HTML height attribute + a sane width
+  // so the backing store stays bounded and never runs away.
+  let w=r.width,h=r.height;
+  if(w<2){w=cv.parentElement?cv.parentElement.getBoundingClientRect().width:600;}
+  if(h<2){h=parseInt(cv.getAttribute('height'),10)||300;}
+  const W=Math.round(w*dpr),H=Math.round(h*dpr);
+  // only (re)alloc backing store when size actually changes -> avoids runaway growth
+  if(cv.width!==W)cv.width=W;
+  if(cv.height!==H)cv.height=H;
+  const ctx=cv.getContext('2d');ctx.setTransform(dpr,0,0,dpr,0,0);
+  return {ctx,w,h};
+}
 function drawSpline(ctx,pts,close=true){
   const n=pts.length;if(!n)return;ctx.beginPath();
   for(let i=0;i<n;i++){
