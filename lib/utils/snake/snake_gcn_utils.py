@@ -34,6 +34,9 @@ def prepare_training_init(ret, batch):
 
 
 def prepare_testing(output):
+    # 测试/推理阶段统一入口：优先使用外部传入的 SAM init；
+    # 否则读取 output['detection'] 中的 bbox/score，走 prepare_testing_init。
+    # 返回的 i_it_py/c_it_py/py_ind 会被 diffusion/flow evolution 当作初始 contour。
     if 'sam_i_it_py' in output and output['sam_i_it_py'] is not None:
         i_it_py = output['sam_i_it_py']
         c_it_py = output.get('sam_c_it_py', img_poly_to_can_poly(i_it_py))
@@ -120,23 +123,38 @@ def replace_training_init_with_gt_box_octagon(train_dict):
 
 
 def prepare_testing_init(box, score): # 上采样40个点构建八边形     没必要深究
+    # 推理初始化入口：detector 只提供 bbox，形状通常是 [B, N, 4]，
+    # 每个框为网络输入坐标系下的 [x1, y1, x2, y2]；score 形状为 [B, N]。
+    # 本函数把 bbox 变成 Snake/V4.6c 后续模块能处理的初始轮廓：
+    #   i_it_4py: 图像坐标下的初始 polygon，点数为 init_poly_num(通常 40)；
+    #   c_it_4py: canonical 坐标，用于 GCN/feature 采样时减少绝对位置影响；
+    #   ind: 每个 polygon 属于 batch 中第几张图。
+    # 这里不重新检测目标，只把已有 bbox 转成可演化的初始形状。
     if box.numel() == 0 or score.numel() == 0 or box.size(1) == 0:
         empty_poly = box.new_zeros((0, snake_config.init_poly_num, 2))
         empty_ind = torch.zeros((0,), dtype=torch.long, device=box.device)
         return {'i_it_4py': empty_poly, 'c_it_4py': empty_poly.clone(), 'ind': empty_ind}
 
+    # snake_decode.get_init 根据配置把矩形 bbox 先变成 quadrangle/octagon/box。
+    # 当前 V4.6c 配置使用 octagon，因此不是把 raw rectangle 四个角直接送进 evolution。
     i_it_4pys = snake_decode.get_init(box)
     if i_it_4pys.numel() == 0 or i_it_4pys.size(1) == 0:
         empty_poly = box.new_zeros((0, snake_config.init_poly_num, 2))
         empty_ind = torch.zeros((0,), dtype=torch.long, device=box.device)
         return {'i_it_4py': empty_poly, 'c_it_4py': empty_poly.clone(), 'ind': empty_ind}
 
+    # get_octagon 只有 12 个关键点；uniform_upsample 均匀补点到 init_poly_num=40，
+    # 让后续 extreme refine 使用固定形状的 [N,40,2] 张量。
     i_it_4pys = uniform_upsample(i_it_4pys, snake_config.init_poly_num)  # init_poly_num = 40
     c_it_4pys = img_poly_to_can_poly(i_it_4pys)
 
+    # Snake 特征图 stride 为 4，所以这里除以 4，把输入图像坐标缩放到 feature 坐标。
+    # 报告 adapter 写 final contour 时会再乘回 4.0。
     i_it_4pys = i_it_4pys / 4.0
     c_it_4pys = c_it_4pys / 4.0
 
+    # score <= 1e-4 的候选视为无效，不进入 evolution。
+    # 对外部 Eagle 分支 score=1.0 是文本输出占位，因此只要 bbox 有效就会被保留。
     ind = score > 1e-4  # 0.0001 - 匹配实际检测置信度范围
     if ind.dim() == 1:
         ind = ind.unsqueeze(0)

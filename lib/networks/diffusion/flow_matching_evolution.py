@@ -556,6 +556,16 @@ class FlowMatchingEvolution(nn.Module):
         # At inference: always condition on previous ODE step's x1 prediction
         self._use_self_conditioning = bool(getattr(global_cfg, 'v3_7_use_self_conditioning', False))
         self._max_disp_frac = float(getattr(global_cfg, 'fm_max_disp_frac', 0.0))
+        self._geom_bridge = bool(getattr(global_cfg, 'flow_geom_bridge', False))
+        self._resample_feat_at_xt = bool(getattr(global_cfg, 'flow_resample_feat_at_xt', False))
+        self._geom_sched_sampling = bool(getattr(global_cfg, 'flow_geom_sched_sampling', False))
+        self._geom_sched_inner_steps = int(getattr(global_cfg, 'flow_geom_sched_inner_steps', 2))
+        self._geom_sched_prob = float(getattr(global_cfg, 'flow_geom_sched_prob', 1.0))
+        self._geom_infer_resample_per_ode = bool(
+            getattr(global_cfg, 'flow_geom_infer_resample_per_ode_step', False)
+        )
+        self._geom_x0_jitter = float(getattr(global_cfg, 'flow_geom_x0_jitter', 0.0))
+        self._geom_xt_jitter_rel = float(getattr(global_cfg, 'flow_geom_xt_jitter_rel', 0.0))
 
         # Optional supervised displacement gate. The gate predicts how much of
         # the proposed residual should be applied for contours that are already
@@ -1553,6 +1563,7 @@ class FlowMatchingEvolution(nn.Module):
                 x_self_cond = next_self_cond
 
         disp = self.denormalize_pred_disp(x, ctx['contour_scale'])
+        disp = self.clamp_pred_disp(disp, i_it_py)
         py = i_it_py + disp
         return {
             'latents': latents_seq,
@@ -1669,6 +1680,62 @@ class FlowMatchingEvolution(nn.Module):
         disp = self.denormalize_pred_disp(x_t, contour_scale)
         return self.clamp_pred_disp(disp, i_it_py)
 
+    def _sample_disp_geom_bridge(
+        self,
+        cnn_feature,
+        i_it_py,
+        c_it_py,
+        py_ind,
+        steps=None,
+        noise_scale=None,
+        locate_context: Optional[Dict[str, torch.Tensor]] = None,
+    ) -> torch.Tensor:
+        if steps is None:
+            steps = self.ode_steps
+
+        device = i_it_py.device
+        N = i_it_py.size(0)
+        h, w = cnn_feature.size(2), cnn_feature.size(3)
+        contour_scale = self.compute_contour_scale(i_it_py)
+        contour_scale_flat = contour_scale.view(-1)
+        x_t = torch.zeros_like(i_it_py)
+        if self._geom_x0_jitter > 0:
+            x_t = x_t + torch.randn_like(i_it_py) * self._geom_x0_jitter
+        dt = 1.0 / steps
+
+        for i in range(steps):
+            t_val = i * dt
+            cur = i_it_py + self.denormalize_pred_disp(x_t, contour_scale)
+            sampled_feat = snake_gcn_utils.get_gcn_feature(cnn_feature, cur, py_ind, h, w)
+            detail_feat = self.sample_detail_features(
+                cnn_feature,
+                cur,
+                py_ind,
+                h,
+                w,
+                sampled_feat=sampled_feat,
+                contour_scale=contour_scale,
+            )
+            t_tensor = torch.full((N,), t_val, device=device, dtype=torch.float32)
+            # Geometric bridge inference in v4_6c skips self-conditioning, disp-gate, latent-policy, and avg-samples.
+            v_pred, _ = self.predict_velocity(
+                cnn_feature,
+                i_it_py,
+                c_it_py,
+                sampled_feat,
+                detail_feat,
+                py_ind,
+                x_t,
+                t_tensor,
+                contour_scale=contour_scale_flat,
+                x_self_cond=None,
+                locate_context=locate_context,
+            )
+            x_t = x_t + v_pred * dt
+
+        disp = self.denormalize_pred_disp(x_t, contour_scale)
+        return self.clamp_pred_disp(disp, i_it_py)
+
     def sample_disp(self, cnn_feature, i_it_py, c_it_py, py_ind, steps=None, batch=None) -> torch.Tensor:
         """
         Euler ODE Solver for Flow Matching.
@@ -1680,10 +1747,28 @@ class FlowMatchingEvolution(nn.Module):
         device = i_it_py.device
         N = i_it_py.size(0)
         h, w = cnn_feature.size(2), cnn_feature.size(3)
+        contour_scale = self.compute_contour_scale(i_it_py)
+
+        if self._geom_bridge and self._geom_infer_resample_per_ode:
+            locate_context = None
+            if self._locate_token_enabled and batch is not None:
+                locate_context = self.build_locate_token_context(
+                    batch,
+                    i_it_py,
+                    py_ind,
+                    contour_scale=contour_scale,
+                )
+            return self._sample_disp_geom_bridge(
+                cnn_feature,
+                i_it_py,
+                c_it_py,
+                py_ind,
+                steps=steps,
+                locate_context=locate_context,
+            )
         
         # 推理时：先进行一次特征采样
         sampled_feat = snake_gcn_utils.get_gcn_feature(cnn_feature, i_it_py, py_ind, h, w)
-        contour_scale = self.compute_contour_scale(i_it_py)
         detail_feat = self.sample_detail_features(
             cnn_feature,
             i_it_py,
@@ -1770,7 +1855,7 @@ class FlowMatchingEvolution(nn.Module):
                     current_contour,
                     py_ind,
                     contour_scale=contour_scale,
-                )
+            )
             # V6o: stochastic TTA ensemble for iterative inference
             avg_n = self._infer_avg_samples
             step_ns = self._iterative_noise_scales[step_idx] if (
@@ -1779,26 +1864,48 @@ class FlowMatchingEvolution(nn.Module):
             if avg_n > 1:
                 all_disps = []
                 for _ in range(avg_n):
-                    d = self._sample_disp_from_sampled_feat(
-                        cnn_feature, current_contour, c_it_py, py_ind,
-                        sampled_feat, detail_feat, steps=ode_steps,
-                        noise_scale=step_ns,
-                        locate_context=locate_context,
-                    )
+                    if self._geom_bridge and self._geom_infer_resample_per_ode:
+                        d = self._sample_disp_geom_bridge(
+                            cnn_feature,
+                            current_contour,
+                            c_it_py,
+                            py_ind,
+                            steps=ode_steps,
+                            noise_scale=step_ns,
+                            locate_context=locate_context,
+                        )
+                    else:
+                        d = self._sample_disp_from_sampled_feat(
+                            cnn_feature, current_contour, c_it_py, py_ind,
+                            sampled_feat, detail_feat, steps=ode_steps,
+                            noise_scale=step_ns,
+                            locate_context=locate_context,
+                        )
                     all_disps.append(d)
                 disp = torch.stack(all_disps).mean(dim=0)
             else:
-                disp = self._sample_disp_from_sampled_feat(
-                    cnn_feature,
-                    current_contour,
-                    c_it_py,
-                    py_ind,
-                    sampled_feat,
-                    detail_feat,
-                    steps=ode_steps,
-                    noise_scale=step_ns,
-                    locate_context=locate_context,
-                )
+                if self._geom_bridge and self._geom_infer_resample_per_ode:
+                    disp = self._sample_disp_geom_bridge(
+                        cnn_feature,
+                        current_contour,
+                        c_it_py,
+                        py_ind,
+                        steps=ode_steps,
+                        noise_scale=step_ns,
+                        locate_context=locate_context,
+                    )
+                else:
+                    disp = self._sample_disp_from_sampled_feat(
+                        cnn_feature,
+                        current_contour,
+                        c_it_py,
+                        py_ind,
+                        sampled_feat,
+                        detail_feat,
+                        steps=ode_steps,
+                        noise_scale=step_ns,
+                        locate_context=locate_context,
+                    )
             if self._use_disp_gate and self._disp_gate_apply_inference:
                 gate = self.predict_disp_gate(sampled_feat, disp, contour_scale)
                 disp = disp * gate
@@ -1824,6 +1931,11 @@ class FlowMatchingEvolution(nn.Module):
     @staticmethod
     def _octagon_init_from_extreme(extreme_points: torch.Tensor) -> torch.Tensor:
         """Build the diffusion init contour from predicted/GT extreme points."""
+        # V4.6c 推理时若 use_pred_extreme_init_for_inference=True，
+        # ct_snake.attach_extreme_prediction 会先产生 output['ex']。
+        # 这里把 4 个 refined extreme points 变成 octagon，再均匀上采样到 snake_config.poly_num
+        # 个点，作为 flow/diffusion evolution 的初始 contour。
+        # 这一步仍然依赖 detector bbox 的位置；bbox 错了，octagon 也会在错误区域附近。
         if (not torch.is_tensor(extreme_points)) or extreme_points.numel() == 0:
             if torch.is_tensor(extreme_points):
                 return extreme_points.new_zeros((0, snake_config.poly_num, 2))
@@ -1944,7 +2056,7 @@ class FlowMatchingEvolution(nn.Module):
             x1_raw = i_gt_py - i_init_train_py
 
             used_mixed_iter_interp = False
-            if self.use_iterative_refinement:
+            if self.use_iterative_refinement and not self._geom_bridge:
                 iter_steps = int(getattr(global_cfg, 'iterative_num_steps', 3))
                 full_disp = x1_raw.clone()
                 B = x1_raw.size(0)
@@ -2103,7 +2215,7 @@ class FlowMatchingEvolution(nn.Module):
                 i_init_train_py = i_init_train_py + full_disp * frac
                 x1_raw = full_disp * (1.0 - frac)
 
-            if self._small_disp_prob > 0 and not used_mixed_iter_interp:
+            if self._small_disp_prob > 0 and not used_mixed_iter_interp and not self._geom_bridge:
                 prob = min(max(self._small_disp_prob, 0.0), 1.0)
                 small_mask = torch.rand(x1_raw.size(0), device=device) < prob
                 if small_mask.any():
@@ -2127,14 +2239,91 @@ class FlowMatchingEvolution(nn.Module):
 
             # --- Flow Matching Core ---
             t = self.sample_train_t(N, device=device, dtype=x1.dtype)
-            x0 = self.sample_train_x0(x1)
-            x_t = (1.0 - t) * x0 + t * x1
+            if self._geom_bridge:
+                x0 = torch.zeros_like(x1)
+                if self._geom_x0_jitter > 0:
+                    x0 = x0 + torch.randn_like(x1) * self._geom_x0_jitter
+            else:
+                x0 = self.sample_train_x0(x1)
+            use_geom_sched_sampling = (
+                self._geom_bridge
+                and self._geom_sched_sampling
+                and self._resample_feat_at_xt
+            )
+            if use_geom_sched_sampling:
+                sched_prob = min(max(self._geom_sched_prob, 0.0), 1.0)
+                use_geom_sched_sampling = torch.rand(1, device=device).item() < sched_prob
+
+            if use_geom_sched_sampling:
+                inner_steps = max(int(self._geom_sched_inner_steps), 0)
+                dt_inner = 1.0 / float(inner_steps + 1)
+                k_land = int(torch.randint(inner_steps + 1, (1,), device=device).item())
+                t_land = x1.new_full((N, 1, 1), float(k_land) * dt_inner)
+
+                with torch.no_grad():
+                    x_roll = torch.zeros_like(x1)
+                    for j in range(k_land):
+                        t_j_scalar = float(j) * dt_inner
+                        t_j = x1.new_full((N, 1, 1), t_j_scalar)
+                        cur_j = (
+                            i_init_train_py
+                            + self.denormalize_pred_disp(x_roll, contour_scale)
+                        ).detach()
+                        sampled_feat_j = snake_gcn_utils.get_gcn_feature(
+                            cnn_feature, cur_j, py_ind, h, w
+                        )
+                        detail_feat_j = self.sample_detail_features(
+                            cnn_feature,
+                            cur_j,
+                            py_ind,
+                            h,
+                            w,
+                            sampled_feat=sampled_feat_j,
+                            contour_scale=contour_scale,
+                        )
+                        locate_context_j = None
+                        if self._locate_token_enabled:
+                            locate_context_j = self.build_locate_token_context(
+                                batch,
+                                cur_j,
+                                py_ind,
+                                contour_scale=contour_scale,
+                            )
+                        v_j, _ = self.predict_velocity(
+                            cnn_feature,
+                            i_init_train_py,
+                            c_init_train_py,
+                            sampled_feat_j,
+                            detail_feat_j,
+                            py_ind,
+                            x_roll,
+                            t_j.view(-1),
+                            contour_scale=contour_scale_flat,
+                            x_self_cond=None,
+                            locate_context=locate_context_j,
+                        )
+                        x_roll = x_roll + v_j * dt_inner
+                x_t = x_roll.detach()
+                t = t_land
+            else:
+                x_t = (1.0 - t) * x0 + t * x1
+
+            # relative perturbation on x_t: noise scaled by per-point GT displacement magnitude.
+            # sigma_rel * |x1| * randn -> auto-adapts to each point/sample, avoids guessing absolute scale.
+            if self._geom_xt_jitter_rel > 0:
+                x1_norm = x1.norm(dim=-1, keepdim=True).clamp_min(1e-6)
+                x_t = x_t + torch.randn_like(x_t) * (self._geom_xt_jitter_rel * x1_norm)
 
             # --- 特征采样 & 预测 ---
-            sampled_feat_curr = snake_gcn_utils.get_gcn_feature(cnn_feature, i_init_train_py, py_ind, h, w)
+            if self._geom_bridge and self._resample_feat_at_xt:
+                xt_disp_raw = self.denormalize_pred_disp(x_t, contour_scale)
+                feat_poly = (i_init_train_py + xt_disp_raw).detach()
+            else:
+                feat_poly = i_init_train_py
+            sampled_feat_curr = snake_gcn_utils.get_gcn_feature(cnn_feature, feat_poly, py_ind, h, w)
             detail_feat_curr = self.sample_detail_features(
                 cnn_feature,
-                i_init_train_py,
+                feat_poly,
                 py_ind,
                 h,
                 w,
@@ -2145,7 +2334,7 @@ class FlowMatchingEvolution(nn.Module):
             if self._locate_token_enabled:
                 locate_context_curr = self.build_locate_token_context(
                     batch,
-                    i_init_train_py,
+                    feat_poly,
                     py_ind,
                     contour_scale=contour_scale,
                 )
@@ -2191,7 +2380,10 @@ class FlowMatchingEvolution(nn.Module):
             )
 
             # 5. 计算目标速度 V_target = X_1 - X_0
-            v_target = x1 - x0
+            if use_geom_sched_sampling:
+                v_target = x1
+            else:
+                v_target = x1 - x0
             x1_pred = x_t + (1.0 - t) * v_pred
             pred_disp = self.denormalize_pred_disp(x1_pred, contour_scale)
             pred_disp = self.clamp_pred_disp(pred_disp, i_init_train_py)
@@ -2267,13 +2459,17 @@ class FlowMatchingEvolution(nn.Module):
             })
             
         else:
-            # 推理时进行ODE求解
+            # 推理时进行 ODE/flow 求解：从 i_it_py 初始轮廓出发，预测每个点的位移 disp。
+            # 输出 ret['py'] = i_it_py + disp，即最终 contour；报告里的 final_contours.jsonl
+            # 读取的就是这个最终多边形，而不是 detector 的 raw bbox。
             with torch.no_grad():
                 if (
                     bool(getattr(global_cfg, 'use_pred_extreme_init_for_inference', False))
                     and torch.is_tensor(output.get('ex', None))
                 ):
                     ex = output['ex']
+                    # 当前配置优先使用 extreme refine 后的 ex 初始化：
+                    # refined extreme -> octagon -> 128 点 contour -> evolution。
                     i_it_py = self._octagon_init_from_extreme(ex)
                     c_it_py = snake_gcn_utils.img_poly_to_can_poly(i_it_py)
                     py_ind = output.get(
@@ -2300,6 +2496,9 @@ class FlowMatchingEvolution(nn.Module):
                     disp = torch.zeros_like(i_it_py)
                     ret.update({'disp': disp, 'py': i_it_py})
                 elif self.use_iterative_refinement:
+                    # V4.6c 当前配置使用 iterative flow refinement：
+                    # 从 init contour 出发分多段预测位移，最后 ret['py'] 才是 final contour。
+                    # 这里不会删除 detector false positive；每个输入 bbox 都会尝试生成一个 contour。
                     iter_steps = int(getattr(global_cfg, 'iterative_num_steps', 3))
                     use_rich_infer_schedule = bool(
                         getattr(global_cfg, 'v4_9_use_rich_infer_schedule', False)

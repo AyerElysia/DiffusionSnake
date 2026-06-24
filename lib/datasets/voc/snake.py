@@ -195,9 +195,47 @@ class Dataset(data.Dataset):
         stem = Path(str(img_path)).stem
         return os.path.join(self.locate_feat_cache_root, self.locate_feat_split, f'{stem}.npz')
 
+    def _locate_feat_npy_path(self, img_path):
+        # Uncompressed sibling cache: <cache_root>_npy/<split>/<stem>.npy (+ <stem>.meta.npz).
+        # Memmap-readable, no zip decompress -> ~1000x faster than the .npz path.
+        stem = Path(str(img_path)).stem
+        npy_root = self.locate_feat_cache_root.rstrip('/') + '_npy'
+        npy_path = os.path.join(npy_root, self.locate_feat_split, f'{stem}.npy')
+        meta_path = os.path.join(npy_root, self.locate_feat_split, f'{stem}.meta.npz')
+        return npy_path, meta_path
+
+    def _load_locate_feature_npy(self, npy_path, meta_path):
+        feat = np.ascontiguousarray(np.load(npy_path, mmap_mode='r'), dtype=np.float16)
+        meta_arrays = {}
+        if os.path.exists(meta_path):
+            with np.load(meta_path) as mz:
+                meta_arrays = {k: mz[k] for k in mz.files}
+
+        def get_meta(key, default):
+            return meta_arrays[key] if key in meta_arrays else default
+
+        return {
+            'locate_feat': feat,
+            'locate_feat_grid_hw': np.asarray(get_meta('grid_hw', feat.shape[-2:]), dtype=np.int32),
+            'locate_feat_orig_hw': np.asarray(get_meta('orig_hw', [0, 0]), dtype=np.int32),
+            'locate_feat_resized_hw': np.asarray(get_meta('resized_hw', [0, 0]), dtype=np.int32),
+            'locate_feat_padded_hw': np.asarray(get_meta('padded_hw', [0, 0]), dtype=np.int32),
+            'locate_feat_pad': np.asarray(get_meta('pad', [0, 0, 0, 0]), dtype=np.int32),
+            'locate_feat_scale': np.asarray(get_meta('scale', [1.0]), dtype=np.float32),
+            'locate_feat_patch_size': np.asarray(get_meta('patch_size', [14]), dtype=np.int32),
+            'locate_feat_path': npy_path,
+        }
+
     def _load_locate_feature(self, img_path):
         if not self.locate_feat_enabled:
             return {}
+        # Fast path: uncompressed .npy memmap cache if present.
+        npy_path, meta_path = self._locate_feat_npy_path(img_path)
+        if os.path.exists(npy_path):
+            try:
+                return self._load_locate_feature_npy(npy_path, meta_path)
+            except Exception as exc:
+                raise RuntimeError(f"Failed to read Locate feature npy cache {npy_path}: {exc}") from exc
         feat_path = self._locate_feat_path(img_path)
         if not os.path.exists(feat_path):
             raise FileNotFoundError(

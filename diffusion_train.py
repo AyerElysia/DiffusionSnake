@@ -884,7 +884,7 @@ def main():
         if total_steps is not None:
             ckpt['total_steps'] = int(total_steps)
         if epoch is not None:
-            ckpt_path = os.path.join(ckpt_dir, f'epoch_{int(epoch)}.pt')
+            ckpt_path = os.path.join(ckpt_dir, f'ep{int(epoch)}_st{int(step)}_{time.strftime("%m%d_%H%M")}.pt')
         else:
             ckpt_path = os.path.join(ckpt_dir, f'step_{int(step)}.pt')
         torch.save(ckpt, ckpt_path)
@@ -1111,6 +1111,7 @@ def main():
                         pass
 
                 del output, loss, loss_stats, batch
+                torch.cuda.empty_cache()
                 if stop_after_step:
                     break
 

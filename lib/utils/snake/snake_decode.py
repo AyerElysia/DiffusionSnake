@@ -152,6 +152,8 @@ def decode_ext_hm(ext_hm, bbox, vote, ct):
 '''
 
 def get_quadrangle(box):
+    # 将 bbox 的上/左/下/右中点取出来，作为后续 octagon 的 4 个 extreme-like 点。
+    # 输入 box 仍是 detector/adapter 给出的 [x1,y1,x2,y2]，这里不产生新的检测目标。
     x_min, y_min, x_max, y_max = box[..., 0], box[..., 1], box[..., 2], box[..., 3]
     quadrangle = [
         (x_min + x_max) / 2., y_min,
@@ -176,6 +178,10 @@ def get_box(box):
 
 
 def get_init(box):
+    # box 是 detector 输出的 bbox，形状为 [B, N, 4]，坐标顺序 [x1,y1,x2,y2]。
+    # 这里决定 bbox 变成哪种初始轮廓：quadrangle、octagon 或 rectangle。
+    # V4.6c 当前配置使用 octagon：先从 bbox 取上/左/下/右四个 extreme-like 点，
+    # 再扩展为更贴近目标外形的十二点 octagon，给后续 refine/evolution 一个比矩形更平滑的起点。
     # x_min, y_min, x_max, y_max = box[..., 0], box[..., 1], box[..., 2], box[..., 3]
     # # 计算每个检测框的宽高比
     # scale = (y_max - y_min) / (x_max - x_min)  # [batch, num]
@@ -204,7 +210,10 @@ def get_init(box):
 
 
 def get_octagon(ex):
-    # ex shape: [..., 4, 2] in Top, Left, Bottom, Right order.
+    # ex shape: [..., 4, 2]，顺序是 Top, Left, Bottom, Right。
+    # octagon 不是八个点的严格几何八边形；这里按 DeepSnake 约定生成 12 个控制点：
+    # 在四个 extreme 点附近沿水平/垂直方向各补若干点，避免初始 contour 只有尖锐四边。
+    # 这些点后面会被 uniform_upsample 到固定点数，作为 diffusion/evolution 的初始轮廓。
     # Match the canonical DeepSnake implementation used by dataset construction.
     w = ex[..., 3, 0] - ex[..., 1, 0]
     h = ex[..., 2, 1] - ex[..., 0, 1]

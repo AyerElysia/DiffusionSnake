@@ -841,6 +841,8 @@ class Network(nn.Module):
             self.diffusion_loss_fn = None
 
         if self.use_extreme_refine:
+            # V4.6c detext 配置启用该分支：bbox 先变 40 点初始轮廓，
+            # extreme_refiner 再预测 refined extreme points，供 diffusion inference 重建 octagon。
             self.extreme_fuse = nn.Conv1d(128, 64, kernel_size=1)
             self.extreme_refiner = Snake(state_dim=128, feature_dim=64 + 2, conv_type='dgrid')
             print("[Snake] Extreme-point refinement head enabled for octagon initialization.")
@@ -1065,6 +1067,9 @@ class Network(nn.Module):
         return jitter_init, jitter_can, i_it_4py.new_tensor(float(i_it_4py.size(0)))
 
     def predict_extreme_points(self, cnn_feature, i_it_4py, c_it_4py, ind):
+        # extreme refine 头：输入是 bbox-derived 40 点初始轮廓和 CNN feature，
+        # 输出是 refined 的 4 个 extreme points。它不是重新找目标类别，
+        # 而是在 detector bbox 给出的局部区域内微调上/左/下/右关键点。
         if (
             self.extreme_refiner is None
             or self.extreme_fuse is None
@@ -1085,9 +1090,15 @@ class Network(nn.Module):
         offset, _ = self.extreme_refiner(init_input, adj, i_it_4py)
         refined = i_it_4py + offset.permute(0, 2, 1)
         stride = max(int(snake_config.init_poly_num // 4), 1)
+        # init_poly_num=40 时每 10 个点取一个，得到 4 个 refined extreme points。
+        # 后续 diffusion inference 会用这些点重新构造 octagon 初始化。
         return refined[:, ::stride][:, :4]
 
     def attach_extreme_prediction(self, output, cnn_feature, batch=None):
+        # 把 extreme refine 的结果挂到 output 字典上。
+        # 推理时 output['detection'] 已包含 [x1,y1,x2,y2,score,class0]；
+        # 这里调用 prepare_testing_init 将 bbox 变成初始 polygon，再预测 refined extreme。
+        # 如果没有有效 bbox，就不会生成 output['ex']，后续 evolution 会得到空 contour。
         if not self.use_extreme_refine:
             return output
 

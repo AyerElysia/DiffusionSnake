@@ -259,18 +259,25 @@ def _contour_normals(poly: torch.Tensor) -> torch.Tensor:
     return normal / normal.norm(dim=-1, keepdim=True).clamp_min(1e-6)
 
 
-def _lowfreq_basis(n_points: int, n_modes: int, device, dtype) -> torch.Tensor:
+def _lowfreq_basis(n_points: int, n_modes: int, device, dtype, damp_highfreq: bool = False) -> torch.Tensor:
     n_modes = max(int(n_modes), 1)
     theta = torch.linspace(0.0, 2.0 * math.pi, n_points + 1, device=device, dtype=dtype)[:-1]
     cols = [torch.ones_like(theta) / math.sqrt(float(n_points))]
+    freqs = [0]
     freq = 1
     while len(cols) < n_modes:
         cols.append(math.sqrt(2.0 / float(n_points)) * torch.cos(float(freq) * theta))
+        freqs.append(freq)
         if len(cols) >= n_modes:
             break
         cols.append(math.sqrt(2.0 / float(n_points)) * torch.sin(float(freq) * theta))
+        freqs.append(freq)
         freq += 1
-    return torch.stack(cols[:n_modes], dim=1)
+    basis = torch.stack(cols[:n_modes], dim=1)
+    if damp_highfreq:
+        decay = basis.new_tensor([1.0 / (1.0 + 0.5 * float(k)) for k in freqs[:n_modes]])
+        basis = basis * decay.view(1, -1)
+    return basis
 
 
 def _fourier_band_basis(n_points: int, k_min: int, k_max: int, device, dtype) -> torch.Tensor:
@@ -306,16 +313,23 @@ def _poly_explorer_features(poly: torch.Tensor, frac: float, coord_scale: float 
 
 class FourierExplorer(nn.Module):
     def __init__(self, low_modes: int, detail_modes: int, hidden_dim: int = 64,
-                 mu_max: float = 0.50, logstd_min: float = -1.50, logstd_max: float = 0.70):
+                 mu_max: float = 0.50, logstd_min: float = -1.50, logstd_max: float = 0.70,
+                 feature_dim: int = 64, feature_embed_dim: int = 32):
         super().__init__()
         self.low_modes = int(low_modes)
         self.detail_modes = int(detail_modes)
         self.mu_max = float(mu_max)
         self.logstd_min = float(logstd_min)
         self.logstd_max = float(logstd_max)
+        feature_dim = max(int(feature_dim), 1)
+        feature_embed_dim = max(int(feature_embed_dim), 4)
+        self.feature_proj = nn.Sequential(
+            nn.Linear(feature_dim, feature_embed_dim),
+            nn.SiLU(),
+        )
         out_dim = 2 * (self.low_modes + self.detail_modes)
         self.net = nn.Sequential(
-            nn.Linear(14, int(hidden_dim)),
+            nn.Linear(14 + feature_embed_dim, int(hidden_dim)),
             nn.SiLU(),
             nn.Linear(int(hidden_dim), int(hidden_dim)),
             nn.SiLU(),
@@ -324,8 +338,11 @@ class FourierExplorer(nn.Module):
         nn.init.zeros_(self.net[-1].weight)
         nn.init.zeros_(self.net[-1].bias)
 
-    def forward(self, poly: torch.Tensor, frac: float):
-        feat = _poly_explorer_features(poly, frac, coord_scale=128.0)
+    def forward(self, poly: torch.Tensor, sampled_feat: torch.Tensor, frac: float):
+        geom_feat = _poly_explorer_features(poly, frac, coord_scale=128.0)
+        pooled_feat = sampled_feat.mean(dim=-1).to(device=poly.device, dtype=poly.dtype)
+        img_feat = self.feature_proj(pooled_feat)
+        feat = torch.cat([geom_feat, img_feat], dim=1)
         out = self.net(feat)
         n_low = self.low_modes
         n_detail = self.detail_modes
@@ -341,14 +358,300 @@ class FourierExplorer(nn.Module):
         return low_mu, low_logstd, detail_mu, detail_logstd
 
 
+class PointExplorerPolicy(nn.Module):
+    """Image-conditioned per-point normal-direction exploration policy."""
+
+    def __init__(
+        self,
+        outer_steps: int,
+        feature_dim: int,
+        feature_embed_dim: int = 32,
+        hidden_dim: int = 96,
+        mu_scale: float = 0.10,
+        init_std: float = 0.08,
+        logstd_min: float = -4.0,
+        logstd_max: float = -0.3,
+        gate_max: float = 1.2,
+    ):
+        super().__init__()
+        outer_steps = max(int(outer_steps), 1)
+        feature_dim = max(int(feature_dim), 1)
+        feature_embed_dim = max(int(feature_embed_dim), 4)
+        hidden_dim = max(int(hidden_dim), 16)
+        self.feature_proj = nn.Sequential(
+            nn.Linear(feature_dim, feature_embed_dim),
+            nn.SiLU(),
+            nn.Linear(feature_embed_dim, feature_embed_dim),
+            nn.SiLU(),
+        )
+        self.step_embed = nn.Embedding(outer_steps, feature_embed_dim)
+        # state_rel(2), c_state(2), normal(2), mean_rel(2), curvature(1),
+        # contour scale(1), fraction(1), sampled feature embedding, step embedding.
+        in_dim = 2 + 2 + 2 + 2 + 1 + 1 + 1 + feature_embed_dim + feature_embed_dim
+        self.net = nn.Sequential(
+            nn.Linear(in_dim, hidden_dim),
+            nn.SiLU(),
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.SiLU(),
+            nn.Linear(hidden_dim, 3),
+        )
+        self.mu_scale = float(mu_scale)
+        self.init_logstd = math.log(max(float(init_std), 1e-6))
+        self.logstd_min = float(logstd_min)
+        self.logstd_max = float(logstd_max)
+        self.gate_max = max(float(gate_max), 1e-6)
+        nn.init.zeros_(self.net[-1].weight)
+        nn.init.zeros_(self.net[-1].bias)
+        init_gate = min(max(1.0 / self.gate_max, 1e-4), 1.0 - 1e-4)
+        self.net[-1].bias.data[2] = math.log(init_gate / (1.0 - init_gate))
+
+    def forward(
+        self,
+        step_index: int,
+        state: torch.Tensor,
+        c_state: torch.Tensor,
+        mean_action: torch.Tensor,
+        sampled_feat: torch.Tensor,
+        frac: float,
+    ):
+        idx = max(0, min(int(step_index), self.step_embed.num_embeddings - 1))
+        center = state.mean(dim=1, keepdim=True)
+        scale = (state - center).norm(dim=-1, keepdim=True).mean(dim=1, keepdim=True).clamp_min(1.0)
+        state_rel = (state - center) / scale
+        mean_rel = mean_action / scale
+        normal = _contour_normals(state)
+        lap = torch.roll(state, 1, dims=1) - 2.0 * state + torch.roll(state, -1, dims=1)
+        curvature = (lap.norm(dim=-1, keepdim=True) / scale).clamp(max=4.0)
+        scale_feat = torch.log(scale).expand(-1, state.size(1), 1) / math.log(256.0)
+        frac_feat = torch.full(
+            (state.size(0), state.size(1), 1),
+            float(frac),
+            device=state.device,
+            dtype=state.dtype,
+        )
+        local_feat = sampled_feat.transpose(1, 2).to(device=state.device, dtype=state.dtype)
+        local_feat = self.feature_proj(local_feat)
+        step_id = torch.full((state.size(0), state.size(1)), idx, device=state.device, dtype=torch.long)
+        step_feat = self.step_embed(step_id).to(dtype=state.dtype)
+        inp = torch.cat([
+            state_rel,
+            c_state.to(dtype=state.dtype),
+            normal,
+            mean_rel,
+            curvature,
+            scale_feat,
+            frac_feat,
+            local_feat,
+            step_feat,
+        ], dim=-1)
+        raw = self.net(inp)
+        mu = torch.tanh(raw[..., 0]) * self.mu_scale
+        logstd = (raw[..., 1] + self.init_logstd).clamp(self.logstd_min, self.logstd_max)
+        gate = torch.sigmoid(raw[..., 2]).unsqueeze(-1) * self.gate_max
+        return mu, logstd, gate
+
+
+class StructuredMixtureExplorer(nn.Module):
+    """Mixture of per-contour structured Laplace residual policies.
+
+    Each component predicts a full per-point normal-direction residual field.
+    A contour-level categorical variable selects the component, so one rollout
+    keeps a coherent hypothesis instead of independently switching modes per
+    point.
+    """
+
+    def __init__(
+        self,
+        outer_steps: int,
+        feature_dim: int,
+        num_modes: int = 4,
+        feature_embed_dim: int = 32,
+        hidden_dim: int = 128,
+        loc_scale: float = 0.12,
+        init_scale: float = 0.08,
+        logscale_min: float = -5.0,
+        logscale_max: float = -0.2,
+        gate_max: float = 1.2,
+    ):
+        super().__init__()
+        outer_steps = max(int(outer_steps), 1)
+        feature_dim = max(int(feature_dim), 1)
+        num_modes = max(int(num_modes), 1)
+        feature_embed_dim = max(int(feature_embed_dim), 4)
+        hidden_dim = max(int(hidden_dim), 16)
+        self.num_modes = num_modes
+        self.loc_scale = float(loc_scale)
+        self.init_logscale = math.log(max(float(init_scale), 1e-6))
+        self.logscale_min = float(logscale_min)
+        self.logscale_max = float(logscale_max)
+        self.gate_max = max(float(gate_max), 1e-6)
+
+        self.feature_proj = nn.Sequential(
+            nn.Linear(feature_dim, feature_embed_dim),
+            nn.SiLU(),
+            nn.Linear(feature_embed_dim, feature_embed_dim),
+            nn.SiLU(),
+        )
+        self.step_embed = nn.Embedding(outer_steps, feature_embed_dim)
+        # Same geometry features as the point policy, plus local image embedding.
+        point_in_dim = 2 + 2 + 2 + 2 + 1 + 1 + 1 + feature_embed_dim + feature_embed_dim
+        self.point_net = nn.Sequential(
+            nn.Linear(point_in_dim, hidden_dim),
+            nn.SiLU(),
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.SiLU(),
+            nn.Linear(hidden_dim, 2 * num_modes),
+        )
+        # _poly_explorer_features gives 14 global geometry values.
+        mode_in_dim = 14 + feature_embed_dim + feature_embed_dim
+        self.mode_net = nn.Sequential(
+            nn.Linear(mode_in_dim, hidden_dim),
+            nn.SiLU(),
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.SiLU(),
+            nn.Linear(hidden_dim, 2 * num_modes),
+        )
+        nn.init.zeros_(self.point_net[-1].weight)
+        nn.init.zeros_(self.point_net[-1].bias)
+        nn.init.zeros_(self.mode_net[-1].weight)
+        nn.init.zeros_(self.mode_net[-1].bias)
+        init_gate = min(max(1.0 / self.gate_max, 1e-4), 1.0 - 1e-4)
+        self.mode_net[-1].bias.data[num_modes:] = math.log(init_gate / (1.0 - init_gate))
+
+    def forward(
+        self,
+        step_index: int,
+        state: torch.Tensor,
+        c_state: torch.Tensor,
+        mean_action: torch.Tensor,
+        sampled_feat: torch.Tensor,
+        frac: float,
+    ):
+        idx = max(0, min(int(step_index), self.step_embed.num_embeddings - 1))
+        center = state.mean(dim=1, keepdim=True)
+        scale = (state - center).norm(dim=-1, keepdim=True).mean(dim=1, keepdim=True).clamp_min(1.0)
+        state_rel = (state - center) / scale
+        mean_rel = mean_action / scale
+        normal = _contour_normals(state)
+        lap = torch.roll(state, 1, dims=1) - 2.0 * state + torch.roll(state, -1, dims=1)
+        curvature = (lap.norm(dim=-1, keepdim=True) / scale).clamp(max=4.0)
+        scale_feat = torch.log(scale).expand(-1, state.size(1), 1) / math.log(256.0)
+        frac_feat = torch.full(
+            (state.size(0), state.size(1), 1),
+            float(frac),
+            device=state.device,
+            dtype=state.dtype,
+        )
+        local_feat = sampled_feat.transpose(1, 2).to(device=state.device, dtype=state.dtype)
+        local_feat = self.feature_proj(local_feat)
+        step_id = torch.full((state.size(0), state.size(1)), idx, device=state.device, dtype=torch.long)
+        step_feat = self.step_embed(step_id).to(dtype=state.dtype)
+        point_inp = torch.cat([
+            state_rel,
+            c_state.to(dtype=state.dtype),
+            normal,
+            mean_rel,
+            curvature,
+            scale_feat,
+            frac_feat,
+            local_feat,
+            step_feat,
+        ], dim=-1)
+        point_raw = self.point_net(point_inp)
+        loc_raw, logscale_raw = torch.chunk(point_raw, 2, dim=-1)
+        loc = torch.tanh(loc_raw) * self.loc_scale
+        logscale = (logscale_raw + self.init_logscale).clamp(self.logscale_min, self.logscale_max)
+
+        global_feat = _poly_explorer_features(state, frac, coord_scale=128.0)
+        pooled_feat = local_feat.mean(dim=1)
+        step_global = self.step_embed(
+            torch.full((state.size(0),), idx, device=state.device, dtype=torch.long)
+        ).to(dtype=state.dtype)
+        mode_raw = self.mode_net(torch.cat([global_feat, pooled_feat, step_global], dim=1))
+        mode_logits = mode_raw[:, :self.num_modes]
+        gate = torch.sigmoid(mode_raw[:, self.num_modes:]) * self.gate_max
+        return loc, logscale, mode_logits, gate
+
+
 def _normal_z_logprob(z: torch.Tensor, mu: torch.Tensor, logstd: torch.Tensor) -> torch.Tensor:
     var = torch.exp(2.0 * logstd).clamp_min(1e-12)
     lp = -0.5 * (((z - mu) ** 2) / var + 2.0 * logstd + math.log(2.0 * math.pi))
     return lp.mean(dim=1)
 
 
-def _geom_delta_from_z(poly: torch.Tensor, z: torch.Tensor, sigma: float) -> torch.Tensor:
-    basis = _lowfreq_basis(poly.size(1), z.size(1), poly.device, poly.dtype)
+def _point_normal_logprob(delta_n: torch.Tensor, mu: torch.Tensor, logstd: torch.Tensor) -> torch.Tensor:
+    var = torch.exp(2.0 * logstd).clamp_min(1e-12)
+    lp = -0.5 * (((delta_n - mu) ** 2) / var + 2.0 * logstd + math.log(2.0 * math.pi))
+    return lp.mean(dim=1)
+
+
+def _point_action_logprob(
+    action: torch.Tensor,
+    mean_action: torch.Tensor,
+    state: torch.Tensor,
+    mu: torch.Tensor,
+    logstd: torch.Tensor,
+    gate: torch.Tensor,
+) -> torch.Tensor:
+    residual = action.detach() - gate * mean_action
+    delta_n = (residual * _contour_normals(state)).sum(dim=-1)
+    return _point_normal_logprob(delta_n, mu, logstd)
+
+
+def _sample_laplace_like(x: torch.Tensor) -> torch.Tensor:
+    u = torch.rand_like(x).clamp(1e-6, 1.0 - 1e-6) - 0.5
+    return -torch.sign(u) * torch.log1p(-2.0 * u.abs())
+
+
+def _gather_mode_points(x: torch.Tensor, mode_idx: torch.Tensor) -> torch.Tensor:
+    # x: [N, P, M], mode_idx: [N] -> [N, P]
+    idx = mode_idx.view(-1, 1, 1).expand(-1, x.size(1), 1)
+    return x.gather(dim=2, index=idx).squeeze(2)
+
+
+def _gather_mode_scalar(x: torch.Tensor, mode_idx: torch.Tensor) -> torch.Tensor:
+    # x: [N, M], mode_idx: [N] -> [N]
+    return x.gather(dim=1, index=mode_idx.view(-1, 1)).squeeze(1)
+
+
+def _mixture_laplace_logprob(
+    delta_n: torch.Tensor,
+    loc: torch.Tensor,
+    logscale: torch.Tensor,
+    mode_logits: torch.Tensor,
+    mode_idx: torch.Tensor,
+) -> torch.Tensor:
+    loc_m = _gather_mode_points(loc, mode_idx)
+    logscale_m = _gather_mode_points(logscale, mode_idx)
+    inv_scale = torch.exp(-logscale_m).clamp_max(1e6)
+    lp_point = -torch.abs(delta_n - loc_m) * inv_scale - logscale_m - math.log(2.0)
+    lp_mode = _gather_mode_scalar(torch.log_softmax(mode_logits, dim=1), mode_idx)
+    return lp_point.mean(dim=1) + lp_mode
+
+
+def _structured_mixture_action_logprob(
+    action: torch.Tensor,
+    mean_action: torch.Tensor,
+    state: torch.Tensor,
+    loc: torch.Tensor,
+    logscale: torch.Tensor,
+    mode_logits: torch.Tensor,
+    gate: torch.Tensor,
+    mode_idx: torch.Tensor,
+) -> torch.Tensor:
+    gate_m = _gather_mode_scalar(gate, mode_idx).view(-1, 1, 1)
+    residual = action.detach() - gate_m * mean_action
+    delta_n = (residual * _contour_normals(state)).sum(dim=-1)
+    return _mixture_laplace_logprob(delta_n, loc, logscale, mode_logits, mode_idx)
+
+
+def _geom_delta_from_z(
+    poly: torch.Tensor,
+    z: torch.Tensor,
+    sigma: float,
+    damp_highfreq: bool = False,
+) -> torch.Tensor:
+    basis = _lowfreq_basis(poly.size(1), z.size(1), poly.device, poly.dtype, damp_highfreq=damp_highfreq)
     scalar = torch.matmul(z, basis.t()) * float(sigma)
     return _contour_normals(poly) * scalar.unsqueeze(-1)
 
@@ -362,10 +665,20 @@ def _band_detail_delta_from_z(poly: torch.Tensor, z: torch.Tensor, sigma: float,
     return _contour_normals(poly) * scalar.unsqueeze(-1)
 
 
-def _project_geom_z(poly: torch.Tensor, residual: torch.Tensor, sigma: float, n_modes: int) -> torch.Tensor:
-    basis = _lowfreq_basis(poly.size(1), n_modes, poly.device, poly.dtype)
+def _project_geom_z(
+    poly: torch.Tensor,
+    residual: torch.Tensor,
+    sigma: float,
+    n_modes: int,
+    damp_highfreq: bool = False,
+) -> torch.Tensor:
+    basis = _lowfreq_basis(poly.size(1), n_modes, poly.device, poly.dtype, damp_highfreq=damp_highfreq)
     scalar = (residual * _contour_normals(poly)).sum(dim=-1) / max(float(sigma), 1e-6)
-    return torch.matmul(scalar, basis)
+    z = torch.matmul(scalar, basis)
+    if damp_highfreq:
+        norm_sq = basis.pow(2).sum(dim=0).clamp_min(1e-12)
+        z = z / norm_sq.view(1, -1)
+    return z
 
 
 def _project_band_detail_z(poly: torch.Tensor, residual: torch.Tensor, sigma: float,
@@ -377,17 +690,18 @@ def _project_band_detail_z(poly: torch.Tensor, residual: torch.Tensor, sigma: fl
 
 
 def _geom_action_logprob(action: torch.Tensor, mean: torch.Tensor, state: torch.Tensor,
-                         sigma: float, n_modes: int) -> torch.Tensor:
-    z = _project_geom_z(state, action.detach() - mean, sigma, n_modes)
+                         sigma: float, n_modes: int, damp_highfreq: bool = False) -> torch.Tensor:
+    z = _project_geom_z(state, action.detach() - mean, sigma, n_modes, damp_highfreq=damp_highfreq)
     return _z_logprob(z)
 
 
 def _band_detail_action_logprob(action: torch.Tensor, mean: torch.Tensor, state: torch.Tensor,
                                 low_sigma: float, low_modes: int, detail_sigma: float,
                                 detail_k_min: int, detail_k_max: int, detail_gate: float,
-                                detail_logprob_weight: float) -> torch.Tensor:
+                                detail_logprob_weight: float,
+                                damp_highfreq: bool = False) -> torch.Tensor:
     residual = action.detach() - mean
-    z_low = _project_geom_z(state, residual, low_sigma, low_modes)
+    z_low = _project_geom_z(state, residual, low_sigma, low_modes, damp_highfreq=damp_highfreq)
     lp_low = _z_logprob(z_low)
     if float(detail_gate) <= 0.0 or float(detail_sigma) <= 0.0 or float(detail_logprob_weight) <= 0.0:
         return lp_low
@@ -517,9 +831,51 @@ def main():
     prefix_distill_steps = {x for x in prefix_distill_steps if 0 <= x < outer_steps}
     adaptive_explorer = _as_bool(cv('adaptive_explorer', False))
     explorer_hidden_dim = int(cv('explorer_hidden_dim', 64))
+    explorer_feature_dim = int(cv('explorer_feature_dim', 64))
+    explorer_feature_embed_dim = int(cv('explorer_feature_embed_dim', 32))
     explorer_mu_max = float(cv('explorer_mu_max', 0.50))
     explorer_logstd_min = float(cv('explorer_logstd_min', -1.50))
     explorer_logstd_max = float(cv('explorer_logstd_max', 0.70))
+    geom_lowfreq_damp_highfreq = _as_bool(cv('geom_lowfreq_damp_highfreq', False))
+    point_policy_active = action_policy in (
+        'point_explorer', 'per_point_explorer', 'image_point_explorer', 'point_normal'
+    )
+    structured_mixture_active = action_policy in (
+        'structured_mixture', 'mixture_laplace', 'structured_laplace', 'contour_mixture'
+    )
+    point_steps_cfg = cv('point_explorer_steps', [outer_steps - 1])
+    if isinstance(point_steps_cfg, (int, float)):
+        point_explorer_steps = {int(point_steps_cfg)}
+    else:
+        point_explorer_steps = {int(x) for x in list(point_steps_cfg)}
+    point_explorer_steps = {x for x in point_explorer_steps if 0 <= x < outer_steps}
+    point_explorer_feature_dim = int(cv('point_explorer_feature_dim', 64))
+    point_explorer_feature_embed_dim = int(cv('point_explorer_feature_embed_dim', 32))
+    point_explorer_hidden_dim = int(cv('point_explorer_hidden_dim', 96))
+    point_explorer_mu_scale_px = float(cv('point_explorer_mu_scale_px', 0.40))
+    point_explorer_init_std_px = float(cv('point_explorer_init_std_px', 0.25))
+    point_explorer_logstd_min = float(cv('point_explorer_logstd_min', -4.0))
+    point_explorer_logstd_max = float(cv('point_explorer_logstd_max', -0.3))
+    point_explorer_gate_max = float(cv('point_explorer_gate_max', 1.2))
+    point_explorer_lr = float(cv('point_explorer_lr', cv('explorer_lr', getattr(cfg.train, 'lr', 5e-8))))
+    point_explorer_freeze_flow = _as_bool(cv('point_explorer_freeze_flow', True))
+    mixture_steps_cfg = cv('mixture_steps', [outer_steps - 1])
+    if isinstance(mixture_steps_cfg, (int, float)):
+        mixture_steps = {int(mixture_steps_cfg)}
+    else:
+        mixture_steps = {int(x) for x in list(mixture_steps_cfg)}
+    mixture_steps = {x for x in mixture_steps if 0 <= x < outer_steps}
+    mixture_modes = int(cv('mixture_modes', 4))
+    mixture_feature_dim = int(cv('mixture_feature_dim', 64))
+    mixture_feature_embed_dim = int(cv('mixture_feature_embed_dim', 32))
+    mixture_hidden_dim = int(cv('mixture_hidden_dim', 128))
+    mixture_loc_scale_px = float(cv('mixture_loc_scale_px', 0.50))
+    mixture_init_scale_px = float(cv('mixture_init_scale_px', 0.30))
+    mixture_logscale_min = float(cv('mixture_logscale_min', -5.0))
+    mixture_logscale_max = float(cv('mixture_logscale_max', -0.2))
+    mixture_gate_max = float(cv('mixture_gate_max', 1.2))
+    mixture_lr = float(cv('mixture_lr', cv('explorer_lr', getattr(cfg.train, 'lr', 5e-8))))
+    mixture_freeze_flow = _as_bool(cv('mixture_freeze_flow', True))
     df_step_mode = str(cv('df_step_mode', 'flow_grpo')).strip().lower()
     df_sde_type = str(cv('df_sde_type', 'sde')).strip().lower()
     df_noise_level = float(cv('df_noise_level', 0.05))
@@ -582,7 +938,8 @@ def main():
     ckpt_path = _resolve_checkpoint_path()
     if ckpt_path is None:
         raise FileNotFoundError('No base checkpoint found. Set resume_path or CKPT_PATH.')
-    sd = _adapt_state_dict(net_for_load, _extract_state_dict(torch.load(str(ckpt_path), map_location='cpu')))
+    raw_ckpt = torch.load(str(ckpt_path), map_location='cpu')
+    sd = _adapt_state_dict(net_for_load, _extract_state_dict(raw_ckpt))
     missing, unexpected = net_for_load.load_state_dict(sd, strict=False)
     total = len(list(net_for_load.state_dict().keys()))
     load_ratio = 100.0 * (total - len(missing)) / max(total, 1)
@@ -595,7 +952,11 @@ def main():
         for name in ('yolo', 'cnn_proj', 'cnn_proj_p3', 'swin_snake_feature'):
             _set_requires_grad(getattr(inner, name, None), False)
         print('[RL-V5] froze detector/feature projection parameters.')
-    _set_requires_grad(inner.gcn, True)
+    freeze_gcn_for_external_policy = (
+        (point_policy_active and point_explorer_freeze_flow)
+        or (structured_mixture_active and mixture_freeze_flow)
+    )
+    _set_requires_grad(inner.gcn, not freeze_gcn_for_external_policy)
     inner.train()
     nbn = freeze_bn_running_stats(inner)
     print(f'[RL-V5] froze BN running stats on {nbn} layers.')
@@ -612,25 +973,103 @@ def main():
             mu_max=explorer_mu_max,
             logstd_min=explorer_logstd_min,
             logstd_max=explorer_logstd_max,
+            feature_dim=explorer_feature_dim,
+            feature_embed_dim=explorer_feature_embed_dim,
         ).to(explorer_device)
         print(
             '[RL-V5] adaptive Fourier explorer enabled '
             f'(hidden={explorer_hidden_dim}, mu_max={explorer_mu_max}, '
-            f'logstd=[{explorer_logstd_min}, {explorer_logstd_max}]).'
+            f'logstd=[{explorer_logstd_min}, {explorer_logstd_max}], '
+            f'feature_dim={explorer_feature_dim}, feature_embed={explorer_feature_embed_dim}).'
         )
 
-    optimizer = make_optimizer(cfg, trainer.network)
-    for group in optimizer.param_groups:
-        group['lr'] = lr
+    point_explorer = None
+    if point_policy_active:
+        point_explorer = PointExplorerPolicy(
+            outer_steps=outer_steps,
+            feature_dim=point_explorer_feature_dim,
+            feature_embed_dim=point_explorer_feature_embed_dim,
+            hidden_dim=point_explorer_hidden_dim,
+            mu_scale=point_explorer_mu_scale_px / max(float(snake_config.down_ratio), 1.0),
+            init_std=point_explorer_init_std_px / max(float(snake_config.down_ratio), 1.0),
+            logstd_min=point_explorer_logstd_min,
+            logstd_max=point_explorer_logstd_max,
+            gate_max=point_explorer_gate_max,
+        ).to(next(net_for_load.parameters()).device)
+        print(
+            '[RL-V5] point explorer enabled '
+            f'(steps={sorted(point_explorer_steps)}, hidden={point_explorer_hidden_dim}, '
+            f'mu_scale_px={point_explorer_mu_scale_px}, init_std_px={point_explorer_init_std_px}, '
+            f'gate_max={point_explorer_gate_max}, freeze_flow={point_explorer_freeze_flow}).'
+        )
+        if isinstance(raw_ckpt, dict) and isinstance(raw_ckpt.get('point_explorer_state_dict'), dict):
+            point_explorer.load_state_dict(raw_ckpt['point_explorer_state_dict'], strict=False)
+            print('[RL-V5] loaded point explorer from checkpoint.')
+
+    mixture_explorer = None
+    if structured_mixture_active:
+        mixture_explorer = StructuredMixtureExplorer(
+            outer_steps=outer_steps,
+            feature_dim=mixture_feature_dim,
+            num_modes=mixture_modes,
+            feature_embed_dim=mixture_feature_embed_dim,
+            hidden_dim=mixture_hidden_dim,
+            loc_scale=mixture_loc_scale_px / max(float(snake_config.down_ratio), 1.0),
+            init_scale=mixture_init_scale_px / max(float(snake_config.down_ratio), 1.0),
+            logscale_min=mixture_logscale_min,
+            logscale_max=mixture_logscale_max,
+            gate_max=mixture_gate_max,
+        ).to(next(net_for_load.parameters()).device)
+        print(
+            '[RL-V5] structured mixture explorer enabled '
+            f'(steps={sorted(mixture_steps)}, modes={mixture_modes}, hidden={mixture_hidden_dim}, '
+            f'loc_scale_px={mixture_loc_scale_px}, init_scale_px={mixture_init_scale_px}, '
+            f'gate_max={mixture_gate_max}, freeze_flow={mixture_freeze_flow}).'
+        )
+        if isinstance(raw_ckpt, dict) and isinstance(raw_ckpt.get('mixture_explorer_state_dict'), dict):
+            mixture_explorer.load_state_dict(raw_ckpt['mixture_explorer_state_dict'], strict=False)
+            print('[RL-V5] loaded structured mixture explorer from checkpoint.')
+
+    net_trainable = [p for p in trainer.network.parameters() if p.requires_grad]
+    if net_trainable:
+        optimizer = make_optimizer(cfg, trainer.network)
+        for group in optimizer.param_groups:
+            group['lr'] = lr
+    else:
+        optimizer = None
+    extra_param_groups = []
     if explorer is not None:
-        optimizer.add_param_group({
+        extra_param_groups.append({
             'params': list(explorer.parameters()),
             'lr': explorer_lr,
             'weight_decay': 0.0,
         })
+    if point_explorer is not None:
+        extra_param_groups.append({
+            'params': list(point_explorer.parameters()),
+            'lr': point_explorer_lr,
+            'weight_decay': 0.0,
+        })
+    if mixture_explorer is not None:
+        extra_param_groups.append({
+            'params': list(mixture_explorer.parameters()),
+            'lr': mixture_lr,
+            'weight_decay': 0.0,
+        })
+    if optimizer is None:
+        if not extra_param_groups:
+            raise RuntimeError('No trainable parameters for RL-V5.')
+        optimizer = torch.optim.AdamW(extra_param_groups, lr=lr, weight_decay=0.0)
+    else:
+        for group in extra_param_groups:
+            optimizer.add_param_group(group)
     print(f'[RL-V5] optimizer LR set to {lr}')
     if explorer is not None:
         print(f'[RL-V5] explorer LR set to {explorer_lr}')
+    if point_explorer is not None:
+        print(f'[RL-V5] point explorer LR set to {point_explorer_lr}')
+    if mixture_explorer is not None:
+        print(f'[RL-V5] structured mixture explorer LR set to {mixture_lr}')
 
     ref_flow = freeze_ref_flow(inner)
     print('[RL-V5] frozen reference flow snapshot created.')
@@ -746,6 +1185,7 @@ def main():
             'ode_steps': ode_steps,
             'action_policy': action_policy,
             'geom_lowfreq_modes': geom_modes,
+            'geom_lowfreq_damp_highfreq': bool(geom_lowfreq_damp_highfreq),
             'geom_sigma_px': sigma_px,
             'geom_sigma_feature': sigma_feat,
             'band_detail': {
@@ -764,10 +1204,41 @@ def main():
             'adaptive_explorer': {
                 'enabled': bool(adaptive_explorer),
                 'hidden_dim': explorer_hidden_dim,
+                'feature_dim': explorer_feature_dim,
+                'feature_embed_dim': explorer_feature_embed_dim,
                 'mu_max': explorer_mu_max,
                 'logstd_min': explorer_logstd_min,
                 'logstd_max': explorer_logstd_max,
                 'lr': explorer_lr,
+            },
+            'point_explorer': {
+                'enabled': bool(point_explorer is not None),
+                'steps': sorted(point_explorer_steps),
+                'feature_dim': point_explorer_feature_dim,
+                'feature_embed_dim': point_explorer_feature_embed_dim,
+                'hidden_dim': point_explorer_hidden_dim,
+                'mu_scale_px': point_explorer_mu_scale_px,
+                'init_std_px': point_explorer_init_std_px,
+                'logstd_min': point_explorer_logstd_min,
+                'logstd_max': point_explorer_logstd_max,
+                'gate_max': point_explorer_gate_max,
+                'lr': point_explorer_lr,
+                'freeze_flow': point_explorer_freeze_flow,
+            },
+            'structured_mixture': {
+                'enabled': bool(mixture_explorer is not None),
+                'steps': sorted(mixture_steps),
+                'modes': mixture_modes,
+                'feature_dim': mixture_feature_dim,
+                'feature_embed_dim': mixture_feature_embed_dim,
+                'hidden_dim': mixture_hidden_dim,
+                'loc_scale_px': mixture_loc_scale_px,
+                'init_scale_px': mixture_init_scale_px,
+                'logscale_min': mixture_logscale_min,
+                'logscale_max': mixture_logscale_max,
+                'gate_max': mixture_gate_max,
+                'lr': mixture_lr,
+                'freeze_flow': mixture_freeze_flow,
             },
             'df_inner_step': {
                 'step_mode': df_step_mode,
@@ -976,6 +1447,10 @@ def main():
             'sigmas': [],
             'detail_sigmas': [],
             'outer_indices': [],
+            'geom_sampled_feats': [],
+            'point_sampled_feats': [],
+            'mixture_sampled_feats': [],
+            'mixture_mode_indices': [],
             'prefix_states': [],
             'prefix_c_states': [],
             'prefix_fractions': [],
@@ -1056,16 +1531,87 @@ def main():
                 traj['prefix_c_states'].append(c_cur.detach())
                 traj['prefix_fractions'].append(float(frac))
                 traj['prefix_indices'].append(int(si))
+            if mixture_explorer is not None:
+                if si in mixture_steps:
+                    ctx = gcn.prepare_sampling_context(output['cnn_feature'], current, output['py_ind'])
+                    sampled_feat = ctx['sampled_feat'].detach()
+                    loc, logscale, mode_logits, mode_gate = mixture_explorer(
+                        si, current, c_cur, mean, sampled_feat, float(frac)
+                    )
+                    mode_dist = torch.distributions.Categorical(logits=mode_logits)
+                    mode_idx = mode_dist.sample()
+                    loc_m = _gather_mode_points(loc, mode_idx)
+                    logscale_m = _gather_mode_points(logscale, mode_idx)
+                    eps = _sample_laplace_like(loc_m)
+                    delta_n = loc_m + torch.exp(logscale_m) * eps
+                    gate_m = _gather_mode_scalar(mode_gate, mode_idx).view(-1, 1, 1)
+                    action = gate_m * mean + _contour_normals(current) * delta_n.unsqueeze(-1)
+                    old_log = _mixture_laplace_logprob(
+                        delta_n,
+                        loc,
+                        logscale,
+                        mode_logits,
+                        mode_idx,
+                    )
+                    traj['states'].append(current.detach())
+                    traj['c_states'].append(c_cur.detach())
+                    traj['actions'].append(action.detach())
+                    traj['old_logs'].append(old_log.detach())
+                    traj['fractions'].append(float(frac))
+                    traj['sigmas'].append(float(mixture_init_scale_px / max(float(snake_config.down_ratio), 1.0)))
+                    traj['detail_sigmas'].append(0.0)
+                    traj['outer_indices'].append(int(si))
+                    traj['mixture_sampled_feats'].append(sampled_feat)
+                    traj['mixture_mode_indices'].append(mode_idx.detach())
+                else:
+                    action = mean
+                current = (current + action).detach()
+                total_disp = total_disp + action.detach()
+                traj['polys'].append(current.detach())
+                continue
+            if point_explorer is not None:
+                if si in point_explorer_steps:
+                    ctx = gcn.prepare_sampling_context(output['cnn_feature'], current, output['py_ind'])
+                    sampled_feat = ctx['sampled_feat'].detach()
+                    mu_n, logstd_n, gate = point_explorer(si, current, c_cur, mean, sampled_feat, float(frac))
+                    delta_n = mu_n + torch.exp(logstd_n) * torch.randn_like(mu_n)
+                    action = gate * mean + _contour_normals(current) * delta_n.unsqueeze(-1)
+                    old_log = _point_normal_logprob(delta_n, mu_n, logstd_n)
+                    traj['states'].append(current.detach())
+                    traj['c_states'].append(c_cur.detach())
+                    traj['actions'].append(action.detach())
+                    traj['old_logs'].append(old_log.detach())
+                    traj['fractions'].append(float(frac))
+                    traj['sigmas'].append(float(point_explorer_init_std_px / max(float(snake_config.down_ratio), 1.0)))
+                    traj['detail_sigmas'].append(0.0)
+                    traj['outer_indices'].append(int(si))
+                    traj['point_sampled_feats'].append(sampled_feat)
+                else:
+                    action = mean
+                current = (current + action).detach()
+                total_disp = total_disp + action.detach()
+                traj['polys'].append(current.detach())
+                continue
             sigma = float(sigma_feat[si]) * sigma_multiplier
             low_active = sigma > 0.0
             use_explorer = explorer is not None and action_policy in ('band_detail', 'geom_band_detail', 'detail_band')
             low_mu = low_logstd = detail_mu = detail_logstd = None
+            geom_sampled_feat = None
             if use_explorer:
-                low_mu, low_logstd, detail_mu, detail_logstd = explorer(current, float(frac))
+                ctx = gcn.prepare_sampling_context(output['cnn_feature'], current, output['py_ind'])
+                geom_sampled_feat = ctx['sampled_feat'].detach()
+                low_mu, low_logstd, detail_mu, detail_logstd = explorer(
+                    current,
+                    geom_sampled_feat,
+                    float(frac),
+                )
             z = torch.randn((current.size(0), geom_modes), device=current.device, dtype=current.dtype)
             if low_active and low_mu is not None:
                 z = low_mu + torch.exp(low_logstd) * z
-            low_delta = _geom_delta_from_z(current, z, sigma) if low_active else torch.zeros_like(current)
+            low_delta = (
+                _geom_delta_from_z(current, z, sigma, damp_highfreq=geom_lowfreq_damp_highfreq)
+                if low_active else torch.zeros_like(current)
+            )
             if low_active:
                 old_log = (
                     _normal_z_logprob(z, low_mu, low_logstd)
@@ -1113,6 +1659,8 @@ def main():
                 traj['sigmas'].append(sigma)
                 traj['detail_sigmas'].append(float(d_sigma))
                 traj['outer_indices'].append(int(si))
+                if use_explorer:
+                    traj['geom_sampled_feats'].append(geom_sampled_feat)
             current = (current + action).detach()
             total_disp = total_disp + action.detach()
             traj['polys'].append(current.detach())
@@ -1164,6 +1712,8 @@ def main():
         _safe_torch_save({
             'state_dict': net_for_load.state_dict(),
             'explorer_state_dict': None if explorer is None else explorer.state_dict(),
+            'point_explorer_state_dict': None if point_explorer is None else point_explorer.state_dict(),
+            'mixture_explorer_state_dict': None if mixture_explorer is None else mixture_explorer.state_dict(),
             'optimizer': optimizer.state_dict(),
             'step': int(step),
             'metrics': metrics,
@@ -1557,7 +2107,48 @@ def main():
                         mean_cur = _outer_action_mean(
                             gcn, output['cnn_feature'], state, c_state, output['py_ind'], frac, ode_steps
                         )
-                        if action_policy in ('band_detail', 'geom_band_detail', 'detail_band'):
+                        if mixture_explorer is not None:
+                            outer_idx = int(traj.get('outer_indices', [si])[si])
+                            sampled_feat = traj['mixture_sampled_feats'][si]
+                            mode_idx = traj['mixture_mode_indices'][si]
+                            loc, logscale, mode_logits, mode_gate = mixture_explorer(
+                                outer_idx,
+                                state,
+                                c_state,
+                                mean_cur,
+                                sampled_feat,
+                                frac,
+                            )
+                            lp_cur = _structured_mixture_action_logprob(
+                                action,
+                                mean_cur,
+                                state,
+                                loc,
+                                logscale,
+                                mode_logits,
+                                mode_gate,
+                                mode_idx,
+                            )
+                        elif point_explorer is not None:
+                            outer_idx = int(traj.get('outer_indices', [si])[si])
+                            sampled_feat = traj['point_sampled_feats'][si]
+                            mu_n, logstd_n, gate_cur = point_explorer(
+                                outer_idx,
+                                state,
+                                c_state,
+                                mean_cur,
+                                sampled_feat,
+                                frac,
+                            )
+                            lp_cur = _point_action_logprob(
+                                action,
+                                mean_cur,
+                                state,
+                                mu_n,
+                                logstd_n,
+                                gate_cur,
+                            )
+                        elif action_policy in ('band_detail', 'geom_band_detail', 'detail_band'):
                             outer_idx = int(traj.get('outer_indices', [si])[si])
                             d_idx = min(max(outer_idx, 0), len(detail_sigma_feat) - 1)
                             detail_sigmas = traj.get('detail_sigmas', [])
@@ -1567,10 +2158,17 @@ def main():
                             )
                             if explorer is not None:
                                 residual = action.detach() - mean_cur
-                                low_mu, low_logstd, detail_mu, detail_logstd = explorer(state, frac)
+                                sampled_feat = traj['geom_sampled_feats'][si]
+                                low_mu, low_logstd, detail_mu, detail_logstd = explorer(state, sampled_feat, frac)
                                 lp_parts = []
                                 if float(sigma) > 0.0:
-                                    z_low = _project_geom_z(state, residual, sigma, geom_modes)
+                                    z_low = _project_geom_z(
+                                        state,
+                                        residual,
+                                        sigma,
+                                        geom_modes,
+                                        damp_highfreq=geom_lowfreq_damp_highfreq,
+                                    )
                                     lp_parts.append(_normal_z_logprob(z_low, low_mu, low_logstd))
                                 d_sigma = detail_sigma_cur
                                 d_gate = float(detail_gate[d_idx])
@@ -1600,9 +2198,17 @@ def main():
                                     detail_k_max,
                                     float(detail_gate[d_idx]),
                                     detail_logprob_weight,
+                                    damp_highfreq=geom_lowfreq_damp_highfreq,
                                 )
                         else:
-                            lp_cur = _geom_action_logprob(action, mean_cur, state, sigma, geom_modes)
+                            lp_cur = _geom_action_logprob(
+                                action,
+                                mean_cur,
+                                state,
+                                sigma,
+                                geom_modes,
+                                damp_highfreq=geom_lowfreq_damp_highfreq,
+                            )
                         std_cur = None
                     ratio = torch.exp(lp_cur - old_log)
                     unclipped = -adv_ri * ratio
@@ -1637,8 +2243,17 @@ def main():
                                 mean_ref = _outer_action_mean(
                                     ref_flow, output['cnn_feature'], state, c_state, output['py_ind'], frac, ode_steps
                                 )
-                            mean_shift_z = _project_geom_z(state, mean_cur - mean_ref, sigma, geom_modes)
-                            kl_loss = 0.5 * mean_shift_z.pow(2).mean() / max(total_actions, 1)
+                            if mixture_explorer is not None or point_explorer is not None:
+                                kl_loss = 0.5 * (mean_cur - mean_ref).pow(2).mean() / max(total_actions, 1)
+                            else:
+                                mean_shift_z = _project_geom_z(
+                                    state,
+                                    mean_cur - mean_ref,
+                                    sigma,
+                                    geom_modes,
+                                    damp_highfreq=geom_lowfreq_damp_highfreq,
+                                )
+                                kl_loss = 0.5 * mean_shift_z.pow(2).mean() / max(total_actions, 1)
                         loss = policy_loss + kl_beta * kl_loss
                     else:
                         loss = policy_loss
@@ -1677,6 +2292,10 @@ def main():
             trainable_params = [p for p in net_for_load.parameters() if p.requires_grad]
             if explorer is not None:
                 trainable_params += [p for p in explorer.parameters() if p.requires_grad]
+            if point_explorer is not None:
+                trainable_params += [p for p in point_explorer.parameters() if p.requires_grad]
+            if mixture_explorer is not None:
+                trainable_params += [p for p in mixture_explorer.parameters() if p.requires_grad]
             grad_norm = torch.nn.utils.clip_grad_norm_(
                 trainable_params,
                 max_norm=grad_clip_norm,
@@ -1741,6 +2360,47 @@ def main():
             'sigma_difficulty_multiplier': float(sigma_multiplier),
             'lr': lr,
         }
+        if point_explorer is not None:
+            with torch.no_grad():
+                p_step = min(sorted(point_explorer_steps)[0], len(fractions) - 1) if point_explorer_steps else 0
+                p_frac = float(fractions[p_step])
+                p_state = output['i_it_py'].detach()
+                p_c_state = snake_gcn_utils.img_poly_to_can_poly(p_state)
+                p_mean = _outer_action_mean(gcn, output['cnn_feature'], p_state, p_c_state, output['py_ind'], p_frac, ode_steps)
+                p_ctx = gcn.prepare_sampling_context(output['cnn_feature'], p_state, output['py_ind'])
+                p_mu, p_logstd, p_gate = point_explorer(
+                    p_step, p_state, p_c_state, p_mean, p_ctx['sampled_feat'].detach(), p_frac
+                )
+                metrics.update({
+                    'point_explorer': True,
+                    'point_mu_abs_px': float((p_mu.abs() * float(snake_config.down_ratio)).mean().item()),
+                    'point_std_px': float((torch.exp(p_logstd) * float(snake_config.down_ratio)).mean().item()),
+                    'point_gate_mean': float(p_gate.mean().item()),
+                    'point_freeze_flow': bool(point_explorer_freeze_flow),
+                })
+        if mixture_explorer is not None:
+            with torch.no_grad():
+                m_step = min(sorted(mixture_steps)[0], len(fractions) - 1) if mixture_steps else 0
+                m_frac = float(fractions[m_step])
+                m_state = output['i_it_py'].detach()
+                m_c_state = snake_gcn_utils.img_poly_to_can_poly(m_state)
+                m_mean = _outer_action_mean(gcn, output['cnn_feature'], m_state, m_c_state, output['py_ind'], m_frac, ode_steps)
+                m_ctx = gcn.prepare_sampling_context(output['cnn_feature'], m_state, output['py_ind'])
+                m_loc, m_logscale, m_logits, m_gate = mixture_explorer(
+                    m_step, m_state, m_c_state, m_mean, m_ctx['sampled_feat'].detach(), m_frac
+                )
+                m_probs = torch.softmax(m_logits, dim=1)
+                m_entropy = -(m_probs * torch.log(m_probs.clamp_min(1e-8))).sum(dim=1).mean()
+                metrics.update({
+                    'structured_mixture': True,
+                    'mixture_modes': int(mixture_modes),
+                    'mixture_loc_abs_px': float((m_loc.abs() * float(snake_config.down_ratio)).mean().item()),
+                    'mixture_scale_px': float((torch.exp(m_logscale) * float(snake_config.down_ratio)).mean().item()),
+                    'mixture_gate_mean': float(m_gate.mean().item()),
+                    'mixture_prob_max_mean': float(m_probs.max(dim=1).values.mean().item()),
+                    'mixture_entropy': float(m_entropy.item()),
+                    'mixture_freeze_flow': bool(mixture_freeze_flow),
+                })
         for key, value in baseline_comps.items():
             metrics[f'baseline_{key}_mean'] = float(value.mean().item())
         if final_score_components:
