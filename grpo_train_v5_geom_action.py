@@ -44,7 +44,7 @@ from lib.networks.diffusion.pretrain_evolution import remap_legacy_state_dict
 from lib.train import make_optimizer
 from lib.train.grpo_v2_utils import EMA, freeze_bn_running_stats, freeze_ref_flow, percentiles
 from lib.train.rewards.curvature_detail_reward import compute_curvature_detail_score
-from lib.train.rewards.region_reward import compute_region_score
+from lib.train.rewards.region_reward import compute_region_score, compute_nsd_score
 from lib.train.trainers import make_trainer
 from lib.utils.snake import snake_config, snake_gcn_utils
 
@@ -259,6 +259,26 @@ def _contour_normals(poly: torch.Tensor) -> torch.Tensor:
     return normal / normal.norm(dim=-1, keepdim=True).clamp_min(1e-6)
 
 
+def _circular_smooth_1d(x: torch.Tensor, kernel_size: int = 9) -> torch.Tensor:
+    """
+    1-D circular (wrap-around) Gaussian smoothing along the contour dimension (dim=1).
+    x: (B, N)  →  returns (B, N) with same mean but smooth spatial structure.
+    """
+    import torch.nn.functional as F
+    k = max(int(kernel_size) | 1, 3)  # ensure odd, min 3
+    sigma_k = k / 6.0
+    idx = torch.arange(k, dtype=x.dtype, device=x.device) - k // 2
+    kernel = torch.exp(-idx ** 2 / (2.0 * sigma_k ** 2))
+    kernel = kernel / kernel.sum()
+    pad = k // 2
+    # circular padding: tile the contour at both ends
+    x_pad = torch.cat([x[:, -pad:], x, x[:, :pad]], dim=1)  # (B, N+2*pad)
+    x_pad = x_pad.unsqueeze(1)                               # (B, 1, N+2*pad)
+    w = kernel.view(1, 1, -1)                                # (1, 1, k)
+    smoothed = F.conv1d(x_pad, w, padding=0).squeeze(1)     # (B, N)
+    return smoothed
+
+
 def _lowfreq_basis(n_points: int, n_modes: int, device, dtype, damp_highfreq: bool = False) -> torch.Tensor:
     n_modes = max(int(n_modes), 1)
     theta = torch.linspace(0.0, 2.0 * math.pi, n_points + 1, device=device, dtype=dtype)[:-1]
@@ -371,7 +391,7 @@ class PointExplorerPolicy(nn.Module):
         init_std: float = 0.08,
         logstd_min: float = -4.0,
         logstd_max: float = -0.3,
-        gate_max: float = 1.2,
+        gate_max: float = 1.2,  # kept for checkpoint-compat; unused
     ):
         super().__init__()
         outer_steps = max(int(outer_steps), 1)
@@ -399,11 +419,8 @@ class PointExplorerPolicy(nn.Module):
         self.init_logstd = math.log(max(float(init_std), 1e-6))
         self.logstd_min = float(logstd_min)
         self.logstd_max = float(logstd_max)
-        self.gate_max = max(float(gate_max), 1e-6)
         nn.init.zeros_(self.net[-1].weight)
         nn.init.zeros_(self.net[-1].bias)
-        init_gate = min(max(1.0 / self.gate_max, 1e-4), 1.0 - 1e-4)
-        self.net[-1].bias.data[2] = math.log(init_gate / (1.0 - init_gate))
 
     def forward(
         self,
@@ -447,8 +464,8 @@ class PointExplorerPolicy(nn.Module):
         raw = self.net(inp)
         mu = torch.tanh(raw[..., 0]) * self.mu_scale
         logstd = (raw[..., 1] + self.init_logstd).clamp(self.logstd_min, self.logstd_max)
-        gate = torch.sigmoid(raw[..., 2]).unsqueeze(-1) * self.gate_max
-        return mu, logstd, gate
+        # gate output (raw[..., 2]) is ignored; effective gate=1.0
+        return mu, logstd
 
 
 class StructuredMixtureExplorer(nn.Module):
@@ -471,7 +488,7 @@ class StructuredMixtureExplorer(nn.Module):
         init_scale: float = 0.08,
         logscale_min: float = -5.0,
         logscale_max: float = -0.2,
-        gate_max: float = 1.2,
+        gate_max: float = 1.2,  # kept for checkpoint-compat; unused
     ):
         super().__init__()
         outer_steps = max(int(outer_steps), 1)
@@ -484,7 +501,6 @@ class StructuredMixtureExplorer(nn.Module):
         self.init_logscale = math.log(max(float(init_scale), 1e-6))
         self.logscale_min = float(logscale_min)
         self.logscale_max = float(logscale_max)
-        self.gate_max = max(float(gate_max), 1e-6)
 
         self.feature_proj = nn.Sequential(
             nn.Linear(feature_dim, feature_embed_dim),
@@ -515,8 +531,6 @@ class StructuredMixtureExplorer(nn.Module):
         nn.init.zeros_(self.point_net[-1].bias)
         nn.init.zeros_(self.mode_net[-1].weight)
         nn.init.zeros_(self.mode_net[-1].bias)
-        init_gate = min(max(1.0 / self.gate_max, 1e-4), 1.0 - 1e-4)
-        self.mode_net[-1].bias.data[num_modes:] = math.log(init_gate / (1.0 - init_gate))
 
     def forward(
         self,
@@ -569,8 +583,315 @@ class StructuredMixtureExplorer(nn.Module):
         ).to(dtype=state.dtype)
         mode_raw = self.mode_net(torch.cat([global_feat, pooled_feat, step_global], dim=1))
         mode_logits = mode_raw[:, :self.num_modes]
-        gate = torch.sigmoid(mode_raw[:, self.num_modes:]) * self.gate_max
-        return loc, logscale, mode_logits, gate
+        # gate output (mode_raw[:, num_modes:]) is ignored; effective gate=1.0
+        return loc, logscale, mode_logits
+
+
+class FMVelocityPolicy(nn.Module):
+    """
+    Per-outer-step scalar policy aligned with FM velocity direction.
+    Outputs (mu, logstd) for the scale factor applied to FM velocity direction.
+    The exploration action = FM_mean_direction * scale * sigma_px
+    """
+
+    def __init__(self, outer_steps: int, feature_dim: int = 64,
+                 feature_embed_dim: int = 32, hidden_dim: int = 64,
+                 init_logstd: float = -1.0, logstd_min: float = -4.0,
+                 logstd_max: float = 1.0):
+        super().__init__()
+        self.outer_steps = int(outer_steps)
+        self.init_logstd = float(init_logstd)
+        self.logstd_min = float(logstd_min)
+        self.logstd_max = float(logstd_max)
+        self.step_embed = nn.Embedding(max(int(outer_steps), 1), max(int(feature_embed_dim), 4))
+        in_dim = max(int(feature_dim), 1) + max(int(feature_embed_dim), 4)
+        self.net = nn.Sequential(
+            nn.Linear(in_dim, max(int(hidden_dim), 16)),
+            nn.ReLU(),
+            nn.Linear(max(int(hidden_dim), 16), 2),  # mu, raw_logstd
+        )
+        # init: mu≈0, logstd≈init_logstd
+        nn.init.zeros_(self.net[-1].weight)
+        nn.init.constant_(self.net[-1].bias, 0.0)
+
+    def forward(self, step_idx: int, poly: torch.Tensor, c_poly: torch.Tensor,
+                mean: torch.Tensor, sampled_feat: torch.Tensor, frac: float):
+        """
+        Returns (mu, logstd) both shape (B, 1).
+        """
+        B = poly.size(0)
+        idx = max(0, min(int(step_idx), self.step_embed.num_embeddings - 1))
+        step_t = torch.full((B,), idx, device=poly.device, dtype=torch.long)
+        s_emb = self.step_embed(step_t)  # (B, feature_embed_dim)
+        # use mean of sampled_feat as global poly feature
+        feat = (
+            sampled_feat.mean(dim=1) if sampled_feat.dim() == 3 else sampled_feat
+        ).to(device=poly.device, dtype=poly.dtype)  # (B, feature_dim)
+        x = torch.cat([feat, s_emb.to(dtype=poly.dtype)], dim=-1)
+        out = self.net(x)  # (B, 2)
+        mu = out[:, :1]  # (B, 1)
+        raw_logstd = out[:, 1:2]  # (B, 1)
+        logstd = (raw_logstd + self.init_logstd).clamp(self.logstd_min, self.logstd_max)
+        return mu, logstd
+
+
+class PerPointFMVelocityPolicy(nn.Module):
+    """
+    Per-point FM velocity policy.
+    Global branch outputs a shared (mu, logstd); per-point branch adds a small
+    tanh-limited offset to mu for each contour point.  logstd remains global —
+    this avoids the O(N) ratio-variance blowup that kills per-point logstd.
+
+    forward → (mu_pp: B×N, logstd_g: B×1)
+    """
+
+    def __init__(
+        self,
+        outer_steps: int,
+        feature_dim: int = 128,
+        feature_embed_dim: int = 32,
+        hidden_dim: int = 64,
+        init_logstd: float = -1.0,
+        logstd_min: float = -4.0,
+        logstd_max: float = 1.0,
+        offset_scale: float = 0.3,
+    ):
+        super().__init__()
+        self.outer_steps = int(outer_steps)
+        self.init_logstd = float(init_logstd)
+        self.logstd_min = float(logstd_min)
+        self.logstd_max = float(logstd_max)
+        self.offset_scale = float(offset_scale)
+
+        self.step_embed = nn.Embedding(
+            max(int(outer_steps), 1), max(int(feature_embed_dim), 4)
+        )
+        # ── global branch: pool(sampled_feat) + step_emb → (mu_g, raw_logstd)
+        global_in = max(int(feature_dim), 1) + max(int(feature_embed_dim), 4)
+        self.global_net = nn.Sequential(
+            nn.Linear(global_in, max(int(hidden_dim), 16)),
+            nn.ReLU(),
+            nn.Linear(max(int(hidden_dim), 16), 2),  # mu_g, raw_logstd
+        )
+        nn.init.zeros_(self.global_net[-1].weight)
+        nn.init.constant_(self.global_net[-1].bias, 0.0)
+
+        # ── per-point branch: sampled_feat_i + step_emb + vel_mag_norm → mu_offset
+        # extra vel_mag_norm feature: +1 dim
+        point_in = max(int(feature_dim), 1) + max(int(feature_embed_dim), 4) + 1
+        self.point_net = nn.Sequential(
+            nn.Linear(point_in, max(int(hidden_dim), 16)),
+            nn.ReLU(),
+            nn.Linear(max(int(hidden_dim), 16), 1),  # raw mu_offset per point
+        )
+        nn.init.zeros_(self.point_net[-1].weight)
+        nn.init.zeros_(self.point_net[-1].bias)
+
+    def forward(
+        self,
+        step_idx: int,
+        poly: torch.Tensor,
+        c_poly: torch.Tensor,
+        mean_action: torch.Tensor,  # FM velocity, shape (B, N_poly, 2)
+        sampled_feat: torch.Tensor,  # (B, N_samp, C) or (B, C, N_samp)
+        frac: float,
+    ):
+        """Returns (mu_pp: B×N_poly, logstd_g: B×1)."""
+        B = poly.size(0)
+        N_poly = mean_action.size(1)
+
+        # ── normalise sampled_feat to (B, N_samp, C)
+        if sampled_feat.dim() == 3 and sampled_feat.size(1) != sampled_feat.size(2):
+            if sampled_feat.size(1) > sampled_feat.size(2):
+                # (B, C, N_samp) → (B, N_samp, C)
+                sampled_feat = sampled_feat.transpose(1, 2)
+        sf = sampled_feat.to(device=poly.device, dtype=poly.dtype)  # (B, N_samp, C)
+
+        idx = max(0, min(int(step_idx), self.step_embed.num_embeddings - 1))
+        step_t = torch.full((B,), idx, device=poly.device, dtype=torch.long)
+        s_emb = self.step_embed(step_t).to(dtype=poly.dtype)  # (B, E)
+
+        # ── global branch: pool over N_samp
+        global_feat = sf.mean(dim=1)  # (B, C)
+        g_in = torch.cat([global_feat, s_emb], dim=-1)  # (B, C+E)
+        g_out = self.global_net(g_in)  # (B, 2)
+        mu_g = g_out[:, :1]  # (B, 1)
+        raw_logstd = g_out[:, 1:2]  # (B, 1)
+        logstd_g = (raw_logstd + self.init_logstd).clamp(self.logstd_min, self.logstd_max)
+
+        # ── FM velocity magnitude feature over N_poly contour points
+        vel_mag = mean_action.norm(dim=-1, keepdim=True)  # (B, N_poly, 1)
+        vel_mag_norm = vel_mag / (vel_mag.mean(dim=1, keepdim=True).clamp_min(1e-6))
+
+        # ── per-point branch: expand global_feat + step_emb to N_poly
+        #    so that the output has shape (B, N_poly), matching contour layout.
+        gf_exp = global_feat.unsqueeze(1).expand(-1, N_poly, -1)   # (B, N_poly, C)
+        s_emb_exp = s_emb.unsqueeze(1).expand(-1, N_poly, -1)      # (B, N_poly, E)
+        p_in = torch.cat([gf_exp, s_emb_exp, vel_mag_norm], dim=-1)  # (B, N_poly, C+E+1)
+        mu_offset_raw = self.point_net(p_in).squeeze(-1)  # (B, N_poly)
+
+        # tanh-limited offset keeps per-point corrections small
+        mu_pp = mu_g + torch.tanh(mu_offset_raw) * self.offset_scale  # (B, N_poly)
+        return mu_pp, logstd_g
+
+
+def _per_point_fm_velocity_logprob(
+    scale_per_point: torch.Tensor,  # (B, N) — sampled scale
+    mu_per_point: torch.Tensor,     # (B, N)
+    global_logstd: torch.Tensor,    # (B, 1)
+) -> torch.Tensor:
+    """
+    Log-prob under N(mu_per_point, exp(global_logstd)^2), averaged over N.
+    Returns (B,).
+    """
+    var = torch.exp(2.0 * global_logstd).clamp_min(1e-12)  # (B, 1)
+    lp = -0.5 * (
+        (scale_per_point - mu_per_point) ** 2 / var
+        + 2.0 * global_logstd
+        + math.log(2.0 * math.pi)
+    )  # (B, N)
+    return lp.mean(dim=1)  # (B,)
+
+
+class PerPointFMScalePolicy(nn.Module):
+    """
+    Per-point multiplicative FM scale policy — tanh-bounded parameterisation.
+
+    Sampling:
+        raw_pp ~ N(mu_pp, exp(logstd_pp)^2)          # unbounded Gaussian in raw space
+        scale_pp = tanh(raw_pp) * max_scale            # bounded to (-max_scale, +max_scale)
+        action   = fm_velocity * (1 + scale_pp)        # multiplier in (1-A, 1+A)
+
+    Design rationale:
+      • scale=0 → pure FM prediction (correct initialisation: last-layer bias=0)
+      • multiplier always in (1-A, 1+A), e.g. (0.75, 1.25) with A=0.25
+      • no reversal possible; exploration is a fine-tuning of per-point amplitude
+      • tanh reparameterisation yields unbiased log_prob (no truncated-Gaussian bias)
+      • stored key 'fm_velocity_scales' now holds raw_pp (pre-tanh) for PPO reuse
+
+    forward() returns (mu_pp: B×N, logstd_pp: B×1) for the raw (pre-tanh) Gaussian.
+    """
+
+    def __init__(
+        self,
+        outer_steps: int,
+        feature_dim: int = 128,
+        feature_embed_dim: int = 32,
+        hidden_dim: int = 64,
+        init_logstd: float = -0.5,
+        logstd_min: float = -3.0,
+        logstd_max: float = 2.0,
+        offset_scale: float = 0.5,
+        max_scale: float = 0.25,
+    ):
+        super().__init__()
+        self.outer_steps = int(outer_steps)
+        self.init_logstd = float(init_logstd)
+        self.logstd_min = float(logstd_min)
+        self.logstd_max = float(logstd_max)
+        self.offset_scale = float(offset_scale)
+        self.max_scale = float(max_scale)  # tanh bound: scale_pp ∈ (-A,+A), multiplier ∈ (1-A,1+A)
+
+        self.step_embed = nn.Embedding(
+            max(int(outer_steps), 1), max(int(feature_embed_dim), 4)
+        )
+        # Global branch: pool(sampled_feat) + step_emb → (mu_g, raw_logstd_g)
+        global_in = max(int(feature_dim), 1) + max(int(feature_embed_dim), 4)
+        self.global_net = nn.Sequential(
+            nn.Linear(global_in, max(int(hidden_dim), 16)),
+            nn.ReLU(),
+            nn.Linear(max(int(hidden_dim), 16), 2),  # mu_g, raw_logstd_g
+        )
+        nn.init.zeros_(self.global_net[-1].weight)
+        nn.init.constant_(self.global_net[-1].bias, 0.0)
+
+        # Per-point branch: per-point feat + step_emb + vel_mag_norm → mu_offset
+        point_in = max(int(feature_dim), 1) + max(int(feature_embed_dim), 4) + 1
+        self.point_net = nn.Sequential(
+            nn.Linear(point_in, max(int(hidden_dim), 16)),
+            nn.ReLU(),
+            nn.Linear(max(int(hidden_dim), 16), 1),  # raw mu_offset per point
+        )
+        nn.init.zeros_(self.point_net[-1].weight)
+        nn.init.zeros_(self.point_net[-1].bias)
+
+    def forward(
+        self,
+        step_idx: int,
+        poly: torch.Tensor,
+        c_poly: torch.Tensor,
+        mean_action: torch.Tensor,  # FM velocity (B, N_poly, 2)
+        sampled_feat: torch.Tensor,  # (B, N_samp, C) or (B, C, N_samp)
+        frac: float,
+    ):
+        """Returns (mu_pp: B×N, logstd_pp: B×1 broadcast-ready)."""
+        B = poly.size(0)
+        N_poly = mean_action.size(1)
+
+        # Normalise sampled_feat to (B, N_samp, C)
+        if sampled_feat.dim() == 3 and sampled_feat.size(1) != sampled_feat.size(2):
+            if sampled_feat.size(1) > sampled_feat.size(2):
+                sampled_feat = sampled_feat.transpose(1, 2)
+        sf = sampled_feat.to(device=poly.device, dtype=poly.dtype)
+
+        idx = max(0, min(int(step_idx), self.step_embed.num_embeddings - 1))
+        step_t = torch.full((B,), idx, device=poly.device, dtype=torch.long)
+        s_emb = self.step_embed(step_t).to(dtype=poly.dtype)  # (B, E)
+
+        # Global branch
+        global_feat = sf.mean(dim=1)  # (B, C)
+        g_in = torch.cat([global_feat, s_emb], dim=-1)
+        g_out = self.global_net(g_in)  # (B, 2)
+        mu_g = g_out[:, :1]            # (B, 1)
+        raw_logstd = g_out[:, 1:2]     # (B, 1)
+        logstd_pp = (raw_logstd + self.init_logstd).clamp(self.logstd_min, self.logstd_max)  # (B,1)
+
+        # FM velocity magnitude feature
+        vel_mag = mean_action.norm(dim=-1, keepdim=True)       # (B, N_poly, 1)
+        vel_mag_norm = vel_mag / (vel_mag.mean(dim=1, keepdim=True).clamp_min(1e-6))
+
+        # Per-point mu offset
+        gf_exp = global_feat.unsqueeze(1).expand(-1, N_poly, -1)   # (B, N_poly, C)
+        s_emb_exp = s_emb.unsqueeze(1).expand(-1, N_poly, -1)      # (B, N_poly, E)
+        p_in = torch.cat([gf_exp, s_emb_exp, vel_mag_norm], dim=-1)
+        mu_offset_raw = self.point_net(p_in).squeeze(-1)  # (B, N_poly)
+
+        mu_pp = mu_g + torch.tanh(mu_offset_raw) * self.offset_scale  # (B, N_poly)
+        return mu_pp, logstd_pp  # (B, N), (B, 1)
+
+
+def _per_point_fm_scale_logprob(
+    raw_pp: torch.Tensor,     # (B, N) — PRE-TANH sample stored at rollout time
+    mu_pp: torch.Tensor,      # (B, N) — current policy mean (in raw/pre-tanh space)
+    logstd_pp: torch.Tensor,  # (B, 1) or (B, N) — current policy logstd
+    max_scale: float = 0.25,  # tanh bound (must match policy's max_scale)
+) -> torch.Tensor:
+    """
+    Log-prob of tanh-bounded per-point scale under the tanh-squashed Gaussian.
+
+    Sampling:  raw_pp ~ N(mu_pp, exp(logstd_pp)^2)
+               scale_pp = tanh(raw_pp) * max_scale    ← bounded, no log_prob bias
+
+    Change-of-variables formula:
+        log p(scale_pp) = log N(raw_pp; mu_pp, sigma^2)
+                        - log(max_scale)
+                        - log(1 - tanh^2(raw_pp))
+
+    raw_pp is stored at rollout time (detached); mu_pp / logstd_pp come from the
+    current policy and carry gradients for PPO.  Returns per-batch mean (B,).
+    """
+    var = torch.exp(2.0 * logstd_pp).clamp_min(1e-12)
+    # Gaussian log-prob in the raw (pre-tanh) space
+    lp_gauss = -0.5 * (
+        (raw_pp - mu_pp) ** 2 / var
+        + 2.0 * logstd_pp
+        + math.log(2.0 * math.pi)
+    )  # (B, N)
+    # tanh Jacobian correction: log|d scale_pp / d raw_pp| = log(max_scale*(1-tanh^2))
+    tanh_raw = torch.tanh(raw_pp)
+    log_jacob = math.log(max_scale) + torch.log1p(-tanh_raw.pow(2).clamp(max=1.0 - 1e-6))
+    lp = lp_gauss - log_jacob   # subtract log|Jacobian| for change-of-variables
+    return lp.mean(dim=1)  # (B,)
 
 
 def _normal_z_logprob(z: torch.Tensor, mu: torch.Tensor, logstd: torch.Tensor) -> torch.Tensor:
@@ -591,9 +912,9 @@ def _point_action_logprob(
     state: torch.Tensor,
     mu: torch.Tensor,
     logstd: torch.Tensor,
-    gate: torch.Tensor,
 ) -> torch.Tensor:
-    residual = action.detach() - gate * mean_action
+    # gate=1.0: residual = action - mean_action
+    residual = action.detach() - mean_action
     delta_n = (residual * _contour_normals(state)).sum(dim=-1)
     return _point_normal_logprob(delta_n, mu, logstd)
 
@@ -636,13 +957,27 @@ def _structured_mixture_action_logprob(
     loc: torch.Tensor,
     logscale: torch.Tensor,
     mode_logits: torch.Tensor,
-    gate: torch.Tensor,
     mode_idx: torch.Tensor,
 ) -> torch.Tensor:
-    gate_m = _gather_mode_scalar(gate, mode_idx).view(-1, 1, 1)
-    residual = action.detach() - gate_m * mean_action
+    # gate=1.0: residual = action - mean_action
+    residual = action.detach() - mean_action
     delta_n = (residual * _contour_normals(state)).sum(dim=-1)
     return _mixture_laplace_logprob(delta_n, loc, logscale, mode_logits, mode_idx)
+
+
+def _fm_velocity_logprob(action: torch.Tensor, mean: torch.Tensor,
+                         state: torch.Tensor, scale: torch.Tensor,
+                         mu: torch.Tensor, logstd: torch.Tensor,
+                         sigma: float) -> torch.Tensor:
+    """
+    action = mean + contour_normals(state) * scale * sigma
+    scale is the sampled scalar per batch, shape (B, 1)
+    mu / logstd are also (B, 1)
+    log_prob = sum of N(scale | mu, exp(logstd)^2) over the scalar dim -> (B,)
+    """
+    var = torch.exp(2.0 * logstd).clamp_min(1e-12)
+    lp = -0.5 * (((scale - mu) ** 2) / var + 2.0 * logstd + math.log(2.0 * math.pi))
+    return lp.sum(dim=-1)  # sum over the scalar dim -> (B,)
 
 
 def _geom_delta_from_z(
@@ -781,6 +1116,7 @@ def main():
         print(f'[RL-V5] Override GPU -> {gpu_override}')
 
     train_steps = int(cv('train_steps', 300))
+    rl_resume_ckpt = str(getattr(cfg, 'rl_v4_resume_ckpt', '') or '').strip()
     k_rollouts = int(cv('k', 8))
     outer_steps = int(cv('outer_steps', 3))
     fractions = [float(x) for x in list(cv('fractions', [0.3333, 0.5, 1.0]))]
@@ -856,7 +1192,6 @@ def main():
     point_explorer_init_std_px = float(cv('point_explorer_init_std_px', 0.25))
     point_explorer_logstd_min = float(cv('point_explorer_logstd_min', -4.0))
     point_explorer_logstd_max = float(cv('point_explorer_logstd_max', -0.3))
-    point_explorer_gate_max = float(cv('point_explorer_gate_max', 1.2))
     point_explorer_lr = float(cv('point_explorer_lr', cv('explorer_lr', getattr(cfg.train, 'lr', 5e-8))))
     point_explorer_freeze_flow = _as_bool(cv('point_explorer_freeze_flow', True))
     mixture_steps_cfg = cv('mixture_steps', [outer_steps - 1])
@@ -873,19 +1208,29 @@ def main():
     mixture_init_scale_px = float(cv('mixture_init_scale_px', 0.30))
     mixture_logscale_min = float(cv('mixture_logscale_min', -5.0))
     mixture_logscale_max = float(cv('mixture_logscale_max', -0.2))
-    mixture_gate_max = float(cv('mixture_gate_max', 1.2))
     mixture_lr = float(cv('mixture_lr', cv('explorer_lr', getattr(cfg.train, 'lr', 5e-8))))
     mixture_freeze_flow = _as_bool(cv('mixture_freeze_flow', True))
     df_step_mode = str(cv('df_step_mode', 'flow_grpo')).strip().lower()
     df_sde_type = str(cv('df_sde_type', 'sde')).strip().lower()
     df_noise_level = float(cv('df_noise_level', 0.05))
     df_action_std = float(cv('df_action_std', 1.0))
+    df_sde_window_size = int(cv('df_sde_window_size', 0))          # 0 = all steps (old behaviour)
+    df_sde_window_range_start = int(cv('df_sde_window_range_start', 0))
+    df_sde_window_range_end = int(cv('df_sde_window_range_end', 0))  # 0 = use ode_steps
     ppo_inner_epochs = int(cv('ppo_inner_epochs', 2))
     ppo_clip = float(cv('ppo_clip', 0.05))
     ppo_kl_target = float(cv('ppo_kl_target', 0.002))
     kl_beta = float(cv('kl_beta', 0.01))
     adv_clip_max = float(cv('adv_clip_max', 2.0))
-    gate_margin = float(cv('gate_margin', 0.0))
+    # Per-step shaped reward: blend terminal-only advantage with per-step advantage.
+    # 0.0 = terminal-only (original behaviour); 1.0 = pure per-step; 0.5 = equal blend.
+    per_step_reward_weight = float(cv('per_step_reward_weight', 0.0))
+    # How the per-step credit is measured:
+    #   'seq_delta'    : q(polys[si+1]) - q(polys[si])            (mid-contour sequential delta)
+    #   'full_extrap'  : q(polys[si] + (polys[si+1]-polys[si])/frac)  (full-displacement extrapolation)
+    # 'full_extrap' judges each action by the endpoint contour it *points to* (frac=1),
+    # putting every step on the same yardstick regardless of its frac step size.
+    per_step_credit_mode = str(cv('per_step_credit_mode', 'seq_delta')).strip().lower()
     grad_clip_norm = float(cv('grad_clip_norm', 0.3))
     lr = float(cv('lr', getattr(cfg.train, 'lr', 5e-8)))
     explorer_lr = float(cv('explorer_lr', lr))
@@ -917,6 +1262,9 @@ def main():
     reward_regression_init_thresh = float(cv('reward_regression_init_thresh', 0.8))
     reward_global_weight = float(cv('reward_global_weight', 1.0))
     reward_detail_weight = float(cv('reward_detail_weight', 0.0))
+    # delta-NSD reward: use NSD(final)-NSD(det_final) instead of absolute score
+    use_delta_nsd_reward = _as_bool(cv('use_delta_nsd_reward', False))
+    nsd_delta_px = float(cv('nsd_delta_px', 2.0))
     reward_detail_w_corner_dist = float(cv('reward_detail_w_corner_dist', 0.35))
     reward_detail_w_curv_match = float(cv('reward_detail_w_curv_match', 0.20))
     reward_detail_w_local_biou = float(cv('reward_detail_w_local_biou', 0.10))
@@ -994,13 +1342,12 @@ def main():
             init_std=point_explorer_init_std_px / max(float(snake_config.down_ratio), 1.0),
             logstd_min=point_explorer_logstd_min,
             logstd_max=point_explorer_logstd_max,
-            gate_max=point_explorer_gate_max,
         ).to(next(net_for_load.parameters()).device)
         print(
             '[RL-V5] point explorer enabled '
             f'(steps={sorted(point_explorer_steps)}, hidden={point_explorer_hidden_dim}, '
             f'mu_scale_px={point_explorer_mu_scale_px}, init_std_px={point_explorer_init_std_px}, '
-            f'gate_max={point_explorer_gate_max}, freeze_flow={point_explorer_freeze_flow}).'
+            f'freeze_flow={point_explorer_freeze_flow}).'
         )
         if isinstance(raw_ckpt, dict) and isinstance(raw_ckpt.get('point_explorer_state_dict'), dict):
             point_explorer.load_state_dict(raw_ckpt['point_explorer_state_dict'], strict=False)
@@ -1018,17 +1365,77 @@ def main():
             init_scale=mixture_init_scale_px / max(float(snake_config.down_ratio), 1.0),
             logscale_min=mixture_logscale_min,
             logscale_max=mixture_logscale_max,
-            gate_max=mixture_gate_max,
         ).to(next(net_for_load.parameters()).device)
         print(
             '[RL-V5] structured mixture explorer enabled '
             f'(steps={sorted(mixture_steps)}, modes={mixture_modes}, hidden={mixture_hidden_dim}, '
             f'loc_scale_px={mixture_loc_scale_px}, init_scale_px={mixture_init_scale_px}, '
-            f'gate_max={mixture_gate_max}, freeze_flow={mixture_freeze_flow}).'
+            f'freeze_flow={mixture_freeze_flow}).'
         )
         if isinstance(raw_ckpt, dict) and isinstance(raw_ckpt.get('mixture_explorer_state_dict'), dict):
             mixture_explorer.load_state_dict(raw_ckpt['mixture_explorer_state_dict'], strict=False)
             print('[RL-V5] loaded structured mixture explorer from checkpoint.')
+
+    fm_velocity_policy = None
+    if action_policy in ('fm_velocity', 'per_point_fm_velocity', 'per_point_fm_scale'):
+        fmv_hidden_dim = int(cv('fm_velocity_hidden_dim', 64))
+        fmv_feature_dim = int(cv('fm_velocity_feature_dim', 64))
+        fmv_feature_embed_dim = int(cv('fm_velocity_feature_embed_dim', 32))
+        fmv_init_logstd = float(cv('fm_velocity_init_logstd', -1.0))
+        fmv_logstd_min = float(cv('fm_velocity_logstd_min', -4.0))
+        fmv_logstd_max = float(cv('fm_velocity_logstd_max', 1.0))
+        fmv_lr = float(cv('fm_velocity_lr', cv('explorer_lr', getattr(cfg.train, 'lr', 4e-8))))
+        fmv_smooth_k = int(cv('fm_velocity_smooth_k', 9))
+        _dev = next(iter(trainer.network.parameters())).device
+        if action_policy == 'per_point_fm_scale':
+            # Tanh-bounded per-point FM scale: multiplier in (1-A, 1+A), no reversal
+            fmv_offset_scale = float(cv('fm_velocity_offset_scale', 0.5))
+            fmv_max_scale = float(cv('fm_velocity_max_scale', 0.25))
+            fm_velocity_policy = PerPointFMScalePolicy(
+                outer_steps=outer_steps,
+                feature_dim=fmv_feature_dim,
+                feature_embed_dim=fmv_feature_embed_dim,
+                hidden_dim=fmv_hidden_dim,
+                init_logstd=fmv_init_logstd,
+                logstd_min=fmv_logstd_min,
+                logstd_max=fmv_logstd_max,
+                offset_scale=fmv_offset_scale,
+                max_scale=fmv_max_scale,
+            ).to(_dev)
+            print(f'[RL-V5] per_point_fm_scale_policy: outer_steps={outer_steps}, '
+                  f'hidden={fmv_hidden_dim}, feature_dim={fmv_feature_dim}, '
+                  f'init_logstd={fmv_init_logstd}, offset_scale={fmv_offset_scale}, '
+                  f'max_scale={fmv_max_scale}, fmv_lr={fmv_lr}')
+        elif action_policy == 'per_point_fm_velocity':
+            fmv_offset_scale = float(cv('fm_velocity_offset_scale', 0.3))
+            fm_velocity_policy = PerPointFMVelocityPolicy(
+                outer_steps=outer_steps,
+                feature_dim=fmv_feature_dim,
+                feature_embed_dim=fmv_feature_embed_dim,
+                hidden_dim=fmv_hidden_dim,
+                init_logstd=fmv_init_logstd,
+                logstd_min=fmv_logstd_min,
+                logstd_max=fmv_logstd_max,
+                offset_scale=fmv_offset_scale,
+            ).to(_dev)
+            print(f'[RL-V5] per_point_fm_velocity_policy: outer_steps={outer_steps}, '
+                  f'hidden={fmv_hidden_dim}, feature_dim={fmv_feature_dim}, '
+                  f'offset_scale={fmv_offset_scale}, fmv_lr={fmv_lr}')
+        else:
+            fm_velocity_policy = FMVelocityPolicy(
+                outer_steps=outer_steps,
+                feature_dim=fmv_feature_dim,
+                feature_embed_dim=fmv_feature_embed_dim,
+                hidden_dim=fmv_hidden_dim,
+                init_logstd=fmv_init_logstd,
+                logstd_min=fmv_logstd_min,
+                logstd_max=fmv_logstd_max,
+            ).to(_dev)
+            print(f'[RL-V5] fm_velocity_policy: outer_steps={outer_steps}, hidden={fmv_hidden_dim}, '
+                  f'sigma_px={sigma_px}, fmv_lr={fmv_lr}')
+        if isinstance(raw_ckpt, dict) and isinstance(raw_ckpt.get('fm_velocity_policy_state_dict'), dict):
+            fm_velocity_policy.load_state_dict(raw_ckpt['fm_velocity_policy_state_dict'], strict=False)
+            print('[RL-V5] loaded fm_velocity_policy from checkpoint.')
 
     net_trainable = [p for p in trainer.network.parameters() if p.requires_grad]
     if net_trainable:
@@ -1056,6 +1463,12 @@ def main():
             'lr': mixture_lr,
             'weight_decay': 0.0,
         })
+    if fm_velocity_policy is not None:
+        extra_param_groups.append({
+            'params': list(fm_velocity_policy.parameters()),
+            'lr': fmv_lr,
+            'weight_decay': 0.0,
+        })
     if optimizer is None:
         if not extra_param_groups:
             raise RuntimeError('No trainable parameters for RL-V5.')
@@ -1073,6 +1486,23 @@ def main():
 
     ref_flow = freeze_ref_flow(inner)
     print('[RL-V5] frozen reference flow snapshot created.')
+
+    # RL-specific resume: load model weights + optimizer state from a previous RL checkpoint.
+    # The ref_flow is frozen BEFORE this, so KL is measured against the original pretrained policy.
+    start_step = 0
+    if rl_resume_ckpt:
+        rl_resume_path = _project_path(rl_resume_ckpt)
+        if rl_resume_path.exists():
+            _rl_ckpt = torch.load(str(rl_resume_path), map_location='cpu')
+            _sd = _rl_ckpt.get('state_dict', _rl_ckpt)
+            if isinstance(_sd, dict):
+                net_for_load.load_state_dict(_sd, strict=True)
+            if 'optimizer' in _rl_ckpt and isinstance(_rl_ckpt['optimizer'], dict):
+                optimizer.load_state_dict(_rl_ckpt['optimizer'])
+            start_step = int(_rl_ckpt.get('step', 0))
+            print(f'[RL-V5] RL resume: loaded {rl_resume_path}, continuing from step={start_step}')
+        else:
+            print(f'[RL-V5] WARNING: rl_v4_resume_ckpt not found: {rl_resume_path}, starting from step=0')
 
     def _make_difficulty_train_loader():
         if not difficulty_index_path:
@@ -1221,7 +1651,6 @@ def main():
                 'init_std_px': point_explorer_init_std_px,
                 'logstd_min': point_explorer_logstd_min,
                 'logstd_max': point_explorer_logstd_max,
-                'gate_max': point_explorer_gate_max,
                 'lr': point_explorer_lr,
                 'freeze_flow': point_explorer_freeze_flow,
             },
@@ -1236,7 +1665,6 @@ def main():
                 'init_scale_px': mixture_init_scale_px,
                 'logscale_min': mixture_logscale_min,
                 'logscale_max': mixture_logscale_max,
-                'gate_max': mixture_gate_max,
                 'lr': mixture_lr,
                 'freeze_flow': mixture_freeze_flow,
             },
@@ -1250,7 +1678,6 @@ def main():
             'ppo_clip': ppo_clip,
             'ppo_kl_target': ppo_kl_target,
             'kl_beta': kl_beta,
-            'gate_margin': gate_margin,
             'reward_weights': {
                 'region': reward_w_region,
                 'dice': reward_w_dice,
@@ -1433,6 +1860,17 @@ def main():
             polys.append(current.detach())
         return {'disp': total_disp, 'py': output['i_it_py'] + total_disp, 'polys': polys}
 
+    def _pick_sde_window(ode_steps: int, window_size: int, range_start: int, range_end: int):
+        """Return (win_start, win_end) inclusive-exclusive. window_size<=0 means all steps."""
+        if window_size <= 0:
+            return (0, ode_steps)
+        r_end = range_end if range_end > 0 else ode_steps
+        r_end = min(r_end, ode_steps)
+        r_start = max(range_start, 0)
+        max_start = max(r_end - window_size, r_start)
+        win_start = random.randint(r_start, max_start)
+        return (win_start, win_start + window_size)
+
     @torch.no_grad()
     def _sample_rollout(output, sigma_multiplier: float = 1.0):
         current = output['i_it_py'].detach()
@@ -1451,6 +1889,7 @@ def main():
             'point_sampled_feats': [],
             'mixture_sampled_feats': [],
             'mixture_mode_indices': [],
+            'fm_velocity_scales': [],
             'prefix_states': [],
             'prefix_c_states': [],
             'prefix_fractions': [],
@@ -1469,6 +1908,13 @@ def main():
                 'contour_scales': [],
                 'total_steps': [],
             })
+            sde_win = _pick_sde_window(
+                max(int(ode_steps), 1),
+                df_sde_window_size,
+                df_sde_window_range_start,
+                df_sde_window_range_end,
+            )
+            traj['sde_win'] = list(sde_win)
             for frac in fractions:
                 c_cur = snake_gcn_utils.img_poly_to_can_poly(current)
                 ctx = gcn.prepare_sampling_context(output['cnn_feature'], current, output['py_ind'])
@@ -1477,6 +1923,7 @@ def main():
                 dt = 1.0 / float(max(int(ode_steps), 1))
                 for idx in range(max(int(ode_steps), 1)):
                     t_value = idx * dt
+                    cur_action_std = df_action_std if (sde_win[0] <= idx < sde_win[1]) else 0.0
                     x_prev, log_prob, _, _, next_self_cond = gcn.step_with_logprob(
                         output['cnn_feature'],
                         current,
@@ -1486,7 +1933,7 @@ def main():
                         t_value=t_value,
                         step_index=idx,
                         total_steps=ode_steps,
-                        action_std=df_action_std,
+                        action_std=cur_action_std,
                         prev_sample=None,
                         sampled_feat=ctx['sampled_feat'],
                         detail_feat=ctx['detail_feat'],
@@ -1535,7 +1982,7 @@ def main():
                 if si in mixture_steps:
                     ctx = gcn.prepare_sampling_context(output['cnn_feature'], current, output['py_ind'])
                     sampled_feat = ctx['sampled_feat'].detach()
-                    loc, logscale, mode_logits, mode_gate = mixture_explorer(
+                    loc, logscale, mode_logits = mixture_explorer(
                         si, current, c_cur, mean, sampled_feat, float(frac)
                     )
                     mode_dist = torch.distributions.Categorical(logits=mode_logits)
@@ -1544,8 +1991,8 @@ def main():
                     logscale_m = _gather_mode_points(logscale, mode_idx)
                     eps = _sample_laplace_like(loc_m)
                     delta_n = loc_m + torch.exp(logscale_m) * eps
-                    gate_m = _gather_mode_scalar(mode_gate, mode_idx).view(-1, 1, 1)
-                    action = gate_m * mean + _contour_normals(current) * delta_n.unsqueeze(-1)
+                    # gate=1.0: action = mean + normal_perturbation
+                    action = mean + _contour_normals(current) * delta_n.unsqueeze(-1)
                     old_log = _mixture_laplace_logprob(
                         delta_n,
                         loc,
@@ -1573,9 +2020,10 @@ def main():
                 if si in point_explorer_steps:
                     ctx = gcn.prepare_sampling_context(output['cnn_feature'], current, output['py_ind'])
                     sampled_feat = ctx['sampled_feat'].detach()
-                    mu_n, logstd_n, gate = point_explorer(si, current, c_cur, mean, sampled_feat, float(frac))
+                    mu_n, logstd_n = point_explorer(si, current, c_cur, mean, sampled_feat, float(frac))
                     delta_n = mu_n + torch.exp(logstd_n) * torch.randn_like(mu_n)
-                    action = gate * mean + _contour_normals(current) * delta_n.unsqueeze(-1)
+                    # gate=1.0: action = mean + normal_perturbation
+                    action = mean + _contour_normals(current) * delta_n.unsqueeze(-1)
                     old_log = _point_normal_logprob(delta_n, mu_n, logstd_n)
                     traj['states'].append(current.detach())
                     traj['c_states'].append(c_cur.detach())
@@ -1588,6 +2036,89 @@ def main():
                     traj['point_sampled_feats'].append(sampled_feat)
                 else:
                     action = mean
+                current = (current + action).detach()
+                total_disp = total_disp + action.detach()
+                traj['polys'].append(current.detach())
+                continue
+            if fm_velocity_policy is not None and action_policy == 'fm_velocity':
+                ctx = gcn.prepare_sampling_context(output['cnn_feature'], current, output['py_ind'])
+                sampled_feat = ctx['sampled_feat'].detach()
+                mu_s, logstd_s = fm_velocity_policy(si, current, c_cur, mean, sampled_feat, float(frac))
+                scale = mu_s + torch.exp(logstd_s) * torch.randn_like(mu_s)  # (B, 1)
+                sigma_s = float(sigma_feat[si]) * sigma_multiplier
+                normals = _contour_normals(current)  # (B, N, 2)
+                delta = normals * (scale * sigma_s).unsqueeze(-1)  # (B, N, 2)
+                action = mean + delta
+                old_log = _fm_velocity_logprob(action, mean, current, scale, mu_s, logstd_s, sigma_s)
+                traj['states'].append(current.detach())
+                traj['c_states'].append(c_cur.detach())
+                traj['actions'].append(action.detach())
+                traj['old_logs'].append(old_log.detach())
+                traj['fractions'].append(float(frac))
+                traj['sigmas'].append(sigma_s)
+                traj['detail_sigmas'].append(0.0)
+                traj['outer_indices'].append(int(si))
+                traj['geom_sampled_feats'].append(sampled_feat)
+                traj['fm_velocity_scales'].append(scale.detach())
+                current = (current + action).detach()
+                total_disp = total_disp + action.detach()
+                traj['polys'].append(current.detach())
+                continue
+            elif fm_velocity_policy is not None and action_policy == 'per_point_fm_velocity':
+                ctx = gcn.prepare_sampling_context(output['cnn_feature'], current, output['py_ind'])
+                sampled_feat = ctx['sampled_feat'].detach()
+                mu_pp, logstd_g = fm_velocity_policy(si, current, c_cur, mean, sampled_feat, float(frac))
+                eps = torch.randn_like(mu_pp)  # (B, N)
+                scale_raw = mu_pp + torch.exp(logstd_g) * eps  # (B, N) — raw, used for log_prob
+                # Circular spatial smoothing: prevents per-point scale from alternating signs → no burr.
+                # log_prob is on scale_raw (reparameterisation); smoothed scale used for action only.
+                scale_smooth = _circular_smooth_1d(scale_raw, kernel_size=fmv_smooth_k)  # (B, N)
+                sigma_s = float(sigma_feat[si]) * sigma_multiplier
+                # Direction: per-point FM velocity direction (NOT contour normal).
+                fm_dir = mean / mean.norm(dim=-1, keepdim=True).clamp_min(1e-6)  # (B, N, 2)
+                delta = fm_dir * (scale_smooth * sigma_s).unsqueeze(-1)  # (B, N, 2)
+                action = mean + delta
+                old_log = _per_point_fm_velocity_logprob(scale_raw, mu_pp, logstd_g)
+                traj['states'].append(current.detach())
+                traj['c_states'].append(c_cur.detach())
+                traj['actions'].append(action.detach())
+                traj['old_logs'].append(old_log.detach())
+                traj['fractions'].append(float(frac))
+                traj['sigmas'].append(sigma_s)
+                traj['detail_sigmas'].append(0.0)
+                traj['outer_indices'].append(int(si))
+                traj['geom_sampled_feats'].append(sampled_feat)
+                traj['fm_velocity_scales'].append(scale_raw.detach())  # (B, N) — raw for PPO recompute
+                current = (current + action).detach()
+                total_disp = total_disp + action.detach()
+                traj['polys'].append(current.detach())
+                continue
+            elif fm_velocity_policy is not None and action_policy == 'per_point_fm_scale':
+                # Tanh-bounded per-point FM scale (SAC-style squashed Gaussian).
+                # raw_pp ~ N(mu_pp, std_pp)                → unbounded Gaussian
+                # scale_pp = tanh(raw_pp) * max_scale      → bounded (-A, +A)
+                # action   = fm_velocity * (1 + scale_pp)  → multiplier in (1-A, 1+A)
+                # scale=0 (raw=0) → pure FM; no reversal possible; no log_prob bias.
+                ctx = gcn.prepare_sampling_context(output['cnn_feature'], current, output['py_ind'])
+                sampled_feat = ctx['sampled_feat'].detach()
+                mu_pp, logstd_pp = fm_velocity_policy(si, current, c_cur, mean, sampled_feat, float(frac))
+                eps = torch.randn_like(mu_pp)  # (B, N)
+                raw_pp = mu_pp + torch.exp(logstd_pp) * eps   # (B, N) pre-tanh raw sample
+                _max_s = fm_velocity_policy.max_scale
+                scale_pp = torch.tanh(raw_pp) * _max_s        # (B, N) bounded scale
+                # action_i = fm_vel_i * (1 + scale_i)  — scale ∈ (-A,+A) → multiplier ∈ (1-A,1+A)
+                action = mean * (1.0 + scale_pp.unsqueeze(-1))  # (B, N, 2)
+                old_log = _per_point_fm_scale_logprob(raw_pp, mu_pp, logstd_pp, _max_s)
+                traj['states'].append(current.detach())
+                traj['c_states'].append(c_cur.detach())
+                traj['actions'].append(action.detach())
+                traj['old_logs'].append(old_log.detach())
+                traj['fractions'].append(float(frac))
+                traj['sigmas'].append(0.0)  # sigma unused for this scheme
+                traj['detail_sigmas'].append(0.0)
+                traj['outer_indices'].append(int(si))
+                traj['geom_sampled_feats'].append(sampled_feat)
+                traj['fm_velocity_scales'].append(raw_pp.detach())  # (B, N) raw pre-tanh sample for PPO recompute
                 current = (current + action).detach()
                 total_disp = total_disp + action.detach()
                 traj['polys'].append(current.detach())
@@ -1714,6 +2245,7 @@ def main():
             'explorer_state_dict': None if explorer is None else explorer.state_dict(),
             'point_explorer_state_dict': None if point_explorer is None else point_explorer.state_dict(),
             'mixture_explorer_state_dict': None if mixture_explorer is None else mixture_explorer.state_dict(),
+            'fm_velocity_policy_state_dict': None if fm_velocity_policy is None else fm_velocity_policy.state_dict(),
             'optimizer': optimizer.state_dict(),
             'step': int(step),
             'metrics': metrics,
@@ -1962,7 +2494,7 @@ def main():
             json.dump(meta, f, indent=2)
 
     train_iter = iter(train_loader)
-    for step in range(1, train_steps + 1):
+    for step in range(start_step + 1, train_steps + 1):
         freeze_bn_running_stats(inner)
         try:
             batch = next(train_iter)
@@ -1990,6 +2522,13 @@ def main():
         )
         baseline_score = baseline_score.detach()
         baseline_comps = {k: v.detach() for k, v in baseline_comps.items()}
+        # delta-NSD baseline: NSD of the deterministic rollout
+        if use_delta_nsd_reward:
+            baseline_nsd = compute_nsd_score(
+                output['i_it_py'] + det_ret['disp'], i_gt,
+                H=int(output['image_hw'][0]), W=int(output['image_hw'][1]),
+                delta_px=nsd_delta_px, coord_scale=float(snake_config.down_ratio),
+            ).detach()
         if sigma_difficulty_scale > 0.0 and 'iou' not in baseline_comps:
             baseline_comps['iou'] = compute_region_score(
                 output['i_it_py'] + det_ret['disp'],
@@ -2041,14 +2580,145 @@ def main():
                 regression_penalty = torch.zeros_like(score)
             final_scores.append(score)
             final_score_components.append({k: v.detach() for k, v in score_comps.items()})
-            final_scores_reward.append((
-                score - reward_burr_weight * burr_penalty.detach()
-                - reward_regression_weight * regression_penalty
-            ).detach())
+            if use_delta_nsd_reward:
+                final_nsd = compute_nsd_score(
+                    final_poly, i_gt,
+                    H=int(output['image_hw'][0]), W=int(output['image_hw'][1]),
+                    delta_px=nsd_delta_px, coord_scale=float(snake_config.down_ratio),
+                ).detach()
+                # delta NSD: improvement over deterministic baseline (burr penalty preserved)
+                reward_val = (final_nsd - baseline_nsd - reward_burr_weight * burr_penalty.detach())
+            else:
+                reward_val = (
+                    score - reward_burr_weight * burr_penalty.detach()
+                    - reward_regression_weight * regression_penalty
+                )
+            final_scores_reward.append(reward_val.detach())
             burr_penalties.append(burr_penalty.detach())
             burr_raws.append(burr_raw.detach())
             regression_penalties.append(regression_penalty)
             old_log_counts.append(len(ret['old_logs']))
+
+        # ===== CREDIT-ASSIGNMENT DIAGNOSTIC (offline, opt-in) =====
+        # Toggle via env RL_V4_CREDIT_DIAG=1. When active we measure the
+        # "partial score" at every outer-step truncation for every rollout and
+        # the deterministic truncation baselines, then dump JSON and continue
+        # the normal flow (no behaviour change unless RL_V4_CREDIT_DIAG_STOP
+        # is set, in which case we skip the PPO update + checkpoint for this
+        # iteration only). Output: <out_dir>/credit_diag_step{S}.json
+        if _as_bool(os.environ.get('RL_V4_CREDIT_DIAG', '0')):
+            try:
+                _diag_phase = 'pre_update'
+                with torch.no_grad():
+                    det_polys_seq = det_ret.get('polys', [])  # [init, after_s1, ..., after_sN]
+                    n_steps = min(len(fractions), max(len(det_polys_seq) - 1, 0))
+                    # deterministic per-step truncation scores
+                    det_partials = []
+                    for t in range(1, n_steps + 1):
+                        s = _quality_score(det_polys_seq[t], i_gt, output['image_hw'])
+                        det_partials.append(float(s.mean().item()) if s.numel() else 0.0)
+                    det_partial_init = float(_quality_score(
+                        det_polys_seq[0], i_gt, output['image_hw']).mean().item()
+                    ) if det_polys_seq else 0.0
+                    diag_rollouts = []
+                    for ri, ret in enumerate(rollouts):
+                        polys_seq = ret.get('polys', [])  # [init, a1, a2, ...]
+                        partials = []
+                        actions_norm = []
+                        olds_norm = []
+                        m = len(polys_seq) - 1
+                        for t in range(1, m + 1):
+                            s = _quality_score(polys_seq[t], i_gt, output['image_hw'])
+                            partials.append(float(s.mean().item()) if s.numel() else 0.0)
+                        for t in range(min(m, len(ret.get('actions', [])))):
+                            a = ret['actions'][t]
+                            actions_norm.append(float(a.norm(dim=-1).mean().item()) if a.numel() else 0.0)
+                            ol = ret['old_logs'][t]
+                            olds_norm.append(float(ol.mean().item()) if ol.numel() else 0.0)
+                        # per-step advantage proxy vs det truncation
+                        step_q = []
+                        for t in range(min(len(partials), len(det_partials))):
+                            step_q.append(float(partials[t] - det_partials[t]))
+                        diag_rollouts.append({
+                            'partials': partials,
+                            'actions_norm_px': [x * float(snake_config.down_ratio) for x in actions_norm],
+                            'old_logs_mean': olds_norm,
+                            'partial_init': det_partial_init,
+                            'det_partials': det_partials,
+                            'step_delta_vs_det': step_q,  # sampled_truncated - det_truncated
+                        })
+                    diag_payload = {
+                        'phase': _diag_phase,
+                        'step': int(step),
+                        'outer_steps': int(outer_steps),
+                        'fractions': [float(x) for x in fractions],
+                        'geom_sigma_px': [float(x) for x in sigma_px],
+                        'k_rollouts': int(k_rollouts),
+                        'adv_clip_max': float(adv_clip_max),
+                        'det_final_score': float(baseline_score.mean().item()),
+                        'init_score': float(_quality_score(
+                            output['i_it_py'], i_gt, output['image_hw']).mean().item()),
+                        'rollouts': diag_rollouts,
+                        # end-of-trajectory quantities (kept for parity with the
+                        # terminal-only view used by the PPO update below)
+                        'terminal_final_scores': [float(x.mean().item()) for x in final_scores],
+                    }
+                # we re-evaluate the terminal block independently for diag
+                # (mirrors the real computation) so the JSON stands alone.
+                with torch.no_grad():
+                    _term_scores = torch.stack([
+                        _quality_score(output['i_it_py'] + ret['disp'], i_gt, output['image_hw'])
+                        for ret in rollouts
+                    ], dim=0).to(i_init.device)
+                    _term_burr = torch.stack([
+                        _burr_penalty(
+                            output['i_it_py'] + ret['disp'],
+                            output['i_it_py'], i_gt,
+                            coord_scale=float(snake_config.down_ratio),
+                            margin_px=reward_burr_margin_px,
+                            max_px=reward_burr_max_px,
+                            quantile=reward_burr_quantile,
+                        )[0].detach()
+                        for ret in rollouts
+                    ], dim=0).to(i_init.device)
+                    _term_rew = _term_scores - reward_burr_weight * _term_burr
+                    _term_quality = _term_rew - baseline_score_adj.unsqueeze(0)
+                    _term_std = _term_quality.std(dim=0, unbiased=False).clamp_min(0.1)
+                    _term_adv = (_term_quality / _term_std).clamp(-adv_clip_max, adv_clip_max)
+                    # gate mechanism removed; adv_abs_mean is unmasked
+                diag_payload['terminal_recompute'] = {
+                    'final_scores_mean': float(_term_scores.mean().item()),
+                    'burr_mean': float(_term_burr.mean().item()),
+                    'quality_mean': float(_term_quality.mean().item()),
+                    'quality_std_mean': float(_term_std.mean().item()),
+                    'adv_mean': float(_term_adv.mean().item()),
+                    'adv_abs_mean': float(_term_adv.abs().mean().item()),
+                    'all_krollouts_quality_per_contour_mean': [
+                        float(_term_quality[ri].mean().item()) for ri in range(len(rollouts))
+                    ],
+                }
+                _diag_path = out_dir / f'credit_diag_step{int(step)}.json'
+                with open(_diag_path, 'w') as _fh:
+                    json.dump(diag_payload, _fh, indent=2)
+                print(f'[RL-V5][CREDIT_DIAG] wrote {_diag_path} '
+                      f'| init={diag_payload["init_score"]:.4f} '
+                      f'| det_final={diag_payload["det_final_score"]:.4f} '
+                      f'| terminal_q_mean={diag_payload["terminal_recompute"]["quality_mean"]:+.4f} '
+                      f'| adv_abs={diag_payload["terminal_recompute"]["adv_abs_mean"]:.4f}')
+                if _as_bool(os.environ.get('RL_V4_CREDIT_DIAG_STOP', '0')):
+                    # consume the rollout, skip the PPO update + checkpoint.
+                    # (do not del quantities defined later in the loop; rely on
+                    # gc/loop-overwrite)
+                    del _term_scores, _term_burr, _term_rew, _term_quality
+                    del _term_std, _term_adv
+                    gc.collect()
+                    torch.cuda.empty_cache()
+                    continue
+            except Exception as _diag_e:
+                import traceback as _tb
+                print('[RL-V5][CREDIT_DIAG] ERROR:', _diag_e)
+                _tb.print_exc()
+        # ===== END CREDIT-ASSIGNMENT DIAGNOSTIC =====
 
         final_scores_t = torch.stack(final_scores, dim=0).to(i_init.device)
         final_scores_reward_t = torch.stack(final_scores_reward, dim=0).to(i_init.device)
@@ -2056,13 +2726,98 @@ def main():
         burr_raw_t = torch.stack(burr_raws, dim=0).to(i_init.device)
         regression_penalty_t = torch.stack(regression_penalties, dim=0).to(i_init.device)
         regression_active_frac = float(reg_mask.mean().item()) if reg_mask is not None else 0.0
-        quality = final_scores_reward_t - baseline_score_adj.unsqueeze(0)
-        gate = (quality.max(dim=0, keepdim=True).values > gate_margin).float()
+        quality = final_scores_reward_t if use_delta_nsd_reward else (
+            final_scores_reward_t - baseline_score_adj.unsqueeze(0)
+        )
+        # gate mechanism removed; all rollouts contribute to advantage
         adv = quality / quality.std(dim=0, unbiased=False, keepdim=True).clamp_min(0.1)
-        adv = adv.clamp(-adv_clip_max, adv_clip_max) * gate
+        adv = adv.clamp(-adv_clip_max, adv_clip_max)
         reward_mean = float(quality.mean().item())
         ema_reward_val = ema_reward.update(reward_mean)
-        gate_active_frac = float(gate.mean().item())
+
+        # ===== PER-STEP SHAPED REWARD =====
+        # When per_step_reward_weight > 0 we blend the terminal-only advantage
+        # (already in `adv`, anchored on the final 5-step contour so the
+        # optimisation target does NOT degenerate to greedy single-step) with a
+        # per-step advantage that gives each outer-step its own credit signal.
+        #
+        # adv_ps shape: [K, n_steps, N_contours]
+        #   adv_ps[ri, si] = (1-w)*terminal_adv[ri] + w*step_adv[ri, si]
+        #
+        # Two credit-attribution modes (rl_v4_per_step_credit_mode):
+        #   'seq_delta'   : step_quality = q(polys[si+1]) - q(polys[si]) - det_seq_delta
+        #                   -> measures the intermediate contour after walking
+        #                      only frac[si] of the step (mixes step-length scale
+        #                      noise into the signal).
+        #   'full_extrap' : step_quality = q(extrap[si]) - q(det_extrap[si])
+        #                   where extrap[si] = polys[si] + (polys[si+1]-polys[si])/frac[si]
+        #                   -> extrapolates each step's action to the FULL
+        #                      displacement (frac=1) and scores that endpoint, so
+        #                      every step is judged on the same "one-shot to goal"
+        #                      ruler. Attribution only; reward stays terminal.
+        #
+        # If per_step_reward_weight == 0 (default) this entire block is a no-op:
+        # adv_ps is just adv broadcast to [K, n_steps, N_contours].
+        n_outer = len(fractions)
+        if per_step_reward_weight > 0.0 and n_outer > 0:
+            with torch.no_grad():
+                _frac_list = [max(float(fractions[_si]), 1e-3) for _si in range(n_outer)]
+
+                def _step_quality_seq(_polys):
+                    # sequential intermediate-contour deltas: [n_outer, N_contours]
+                    _out = []
+                    for _si in range(n_outer):
+                        _p0 = _polys[_si] if _si < len(_polys) else _polys[-1]
+                        _p1 = _polys[_si + 1] if (_si + 1) < len(_polys) else _polys[-1]
+                        _q0 = _quality_score(_p0, i_gt, output['image_hw']).detach()
+                        _q1 = _quality_score(_p1, i_gt, output['image_hw']).detach()
+                        _out.append(_q1 - _q0)
+                    return torch.stack(_out, dim=0)
+
+                def _step_quality_extrap(_polys):
+                    # full-displacement extrapolation endpoint score: [n_outer, N_contours]
+                    _out = []
+                    for _si in range(n_outer):
+                        _p0 = _polys[_si] if _si < len(_polys) else _polys[-1]
+                        _p1 = _polys[_si + 1] if (_si + 1) < len(_polys) else _polys[-1]
+                        # applied action = p1 - p0 == full_disp * frac  ->  full_disp = (p1-p0)/frac
+                        _extrap = _p0 + (_p1 - _p0) / _frac_list[_si]
+                        _out.append(_quality_score(_extrap, i_gt, output['image_hw']).detach())
+                    return torch.stack(_out, dim=0)
+
+                _step_fn = (
+                    _step_quality_extrap
+                    if per_step_credit_mode == 'full_extrap'
+                    else _step_quality_seq
+                )
+
+                det_polys = det_ret.get('polys', [])
+                det_step_t = _step_fn(det_polys)  # [n_outer, N_contours]
+
+                rollout_step = []
+                for _ret in rollouts:
+                    rollout_step.append(_step_fn(_ret.get('polys', [])))
+                rollout_step_t = torch.stack(rollout_step, dim=0)  # [K, n_outer, N_contours]
+
+                # Centre by deterministic baseline at the same step (same role as
+                # baseline_score_adj for the terminal reward).
+                step_quality = rollout_step_t - det_step_t.unsqueeze(0)
+
+                step_adv = step_quality / step_quality.std(
+                    dim=0, unbiased=False, keepdim=True
+                ).clamp_min(0.1)
+                step_adv = step_adv.clamp(-adv_clip_max, adv_clip_max)
+
+                # Blend: (1-w)*terminal + w*per-step
+                adv_ps = (
+                    (1.0 - per_step_reward_weight) * adv.unsqueeze(1)
+                    + per_step_reward_weight * step_adv
+                )  # [K, n_outer, N_contours]
+        else:
+            # Default: broadcast terminal advantage, no extra compute
+            adv_ps = adv.unsqueeze(1).expand(-1, max(n_outer, 1), -1)
+            # [K, n_outer, N_contours]
+        # ===== END PER-STEP SHAPED REWARD =====
 
         total_actions = sum(len(t['actions']) for t in rollouts)
         total_prefixes = sum(len(t.get('prefix_states', [])) for t in rollouts)
@@ -2075,7 +2830,7 @@ def main():
             epoch_kls = []
             epoch_ratios = []
             for ri, traj in enumerate(rollouts):
-                adv_ri = adv[ri].detach()
+                _n_ps = adv_ps.shape[1]  # n_outer steps
                 for si, action in enumerate(traj['actions']):
                     state = traj['states'][si]
                     c_state = traj['c_states'][si]
@@ -2084,6 +2839,9 @@ def main():
                     sigma = traj['sigmas'][si]
                     if action_policy in ('df', 'df_inner_step', 'diffusion_inner_step', 'flow_inner_step'):
                         step_total = int(traj['total_steps'][si].item())
+                        _sde_win = tuple(traj.get('sde_win', [0, step_total]))
+                        _step_idx = int(traj['step_indices'][si].item())
+                        _cur_action_std = df_action_std if (_sde_win[0] <= _step_idx < _sde_win[1]) else 0.0
                         _, lp_cur, mean_cur, std_cur, _ = gcn.step_with_logprob(
                             output['cnn_feature'],
                             state,
@@ -2091,9 +2849,9 @@ def main():
                             output['py_ind'],
                             x_t=traj['x_ts'][si],
                             t_value=traj['timesteps'][si],
-                            step_index=int(traj['step_indices'][si].item()),
+                            step_index=_step_idx,
                             total_steps=step_total,
-                            action_std=df_action_std,
+                            action_std=_cur_action_std,
                             prev_sample=traj['x_prevs'][si],
                             sampled_feat=traj['sampled_feats'][si],
                             detail_feat=traj['detail_feats'][si],
@@ -2111,7 +2869,7 @@ def main():
                             outer_idx = int(traj.get('outer_indices', [si])[si])
                             sampled_feat = traj['mixture_sampled_feats'][si]
                             mode_idx = traj['mixture_mode_indices'][si]
-                            loc, logscale, mode_logits, mode_gate = mixture_explorer(
+                            loc, logscale, mode_logits = mixture_explorer(
                                 outer_idx,
                                 state,
                                 c_state,
@@ -2126,13 +2884,12 @@ def main():
                                 loc,
                                 logscale,
                                 mode_logits,
-                                mode_gate,
                                 mode_idx,
                             )
                         elif point_explorer is not None:
                             outer_idx = int(traj.get('outer_indices', [si])[si])
                             sampled_feat = traj['point_sampled_feats'][si]
-                            mu_n, logstd_n, gate_cur = point_explorer(
+                            mu_n, logstd_n = point_explorer(
                                 outer_idx,
                                 state,
                                 c_state,
@@ -2146,7 +2903,34 @@ def main():
                                 state,
                                 mu_n,
                                 logstd_n,
-                                gate_cur,
+                            )
+                        elif action_policy == 'fm_velocity' and fm_velocity_policy is not None:
+                            outer_idx = int(traj.get('outer_indices', [si])[si])
+                            sampled_feat = traj['geom_sampled_feats'][si]
+                            scale_old = traj['fm_velocity_scales'][si]  # (B, 1)
+                            mu_s, logstd_s = fm_velocity_policy(
+                                outer_idx, state, c_state, mean_cur, sampled_feat, frac
+                            )
+                            lp_cur = _fm_velocity_logprob(
+                                action, mean_cur, state, scale_old, mu_s, logstd_s, float(sigma)
+                            )
+                        elif action_policy == 'per_point_fm_velocity' and fm_velocity_policy is not None:
+                            outer_idx = int(traj.get('outer_indices', [si])[si])
+                            sampled_feat = traj['geom_sampled_feats'][si]
+                            scale_pp_old = traj['fm_velocity_scales'][si]  # (B, N)
+                            mu_pp, logstd_g = fm_velocity_policy(
+                                outer_idx, state, c_state, mean_cur, sampled_feat, frac
+                            )
+                            lp_cur = _per_point_fm_velocity_logprob(scale_pp_old, mu_pp, logstd_g)
+                        elif action_policy == 'per_point_fm_scale' and fm_velocity_policy is not None:
+                            outer_idx = int(traj.get('outer_indices', [si])[si])
+                            sampled_feat = traj['geom_sampled_feats'][si]
+                            raw_pp_old = traj['fm_velocity_scales'][si]  # (B, N) PRE-TANH raw sample
+                            mu_pp, logstd_pp = fm_velocity_policy(
+                                outer_idx, state, c_state, mean_cur, sampled_feat, frac
+                            )
+                            lp_cur = _per_point_fm_scale_logprob(
+                                raw_pp_old, mu_pp, logstd_pp, fm_velocity_policy.max_scale
                             )
                         elif action_policy in ('band_detail', 'geom_band_detail', 'detail_band'):
                             outer_idx = int(traj.get('outer_indices', [si])[si])
@@ -2211,8 +2995,10 @@ def main():
                             )
                         std_cur = None
                     ratio = torch.exp(lp_cur - old_log)
-                    unclipped = -adv_ri * ratio
-                    clipped = -adv_ri * torch.clamp(ratio, 1.0 - ppo_clip, 1.0 + ppo_clip)
+                    # adv_ps: [K, n_outer, N_contours]; index by (ri, si) for per-step signal
+                    _adv_si = adv_ps[ri, min(si, _n_ps - 1)].detach()
+                    unclipped = -_adv_si * ratio
+                    clipped = -_adv_si * torch.clamp(ratio, 1.0 - ppo_clip, 1.0 + ppo_clip)
                     policy_loss = torch.maximum(unclipped, clipped).mean() / max(total_actions, 1)
                     if kl_beta > 0:
                         if action_policy in ('df', 'df_inner_step', 'diffusion_inner_step', 'flow_inner_step'):
@@ -2224,9 +3010,9 @@ def main():
                                     output['py_ind'],
                                     x_t=traj['x_ts'][si],
                                     t_value=traj['timesteps'][si],
-                                    step_index=int(traj['step_indices'][si].item()),
+                                    step_index=_step_idx,
                                     total_steps=step_total,
-                                    action_std=df_action_std,
+                                    action_std=_cur_action_std,
                                     prev_sample=traj['x_prevs'][si],
                                     sampled_feat=traj['sampled_feats'][si],
                                     detail_feat=traj['detail_feats'][si],
@@ -2243,7 +3029,8 @@ def main():
                                 mean_ref = _outer_action_mean(
                                     ref_flow, output['cnn_feature'], state, c_state, output['py_ind'], frac, ode_steps
                                 )
-                            if mixture_explorer is not None or point_explorer is not None:
+                            if (mixture_explorer is not None or point_explorer is not None
+                                    or action_policy in ('per_point_fm_velocity', 'per_point_fm_scale')):
                                 kl_loss = 0.5 * (mean_cur - mean_ref).pow(2).mean() / max(total_actions, 1)
                             else:
                                 mean_shift_z = _project_geom_z(
@@ -2296,10 +3083,23 @@ def main():
                 trainable_params += [p for p in point_explorer.parameters() if p.requires_grad]
             if mixture_explorer is not None:
                 trainable_params += [p for p in mixture_explorer.parameters() if p.requires_grad]
+            if fm_velocity_policy is not None:
+                trainable_params += [p for p in fm_velocity_policy.parameters() if p.requires_grad]
             grad_norm = torch.nn.utils.clip_grad_norm_(
                 trainable_params,
                 max_norm=grad_clip_norm,
             )
+            # Diagnostic: print fm_velocity_policy grad_norm every 10 PPO steps
+            if fm_velocity_policy is not None and action_policy in ('per_point_fm_scale', 'per_point_fm_velocity') and epoch == 0:
+                with torch.no_grad():
+                    fmv_params = [p for p in fm_velocity_policy.parameters() if p.requires_grad and p.grad is not None]
+                    if fmv_params:
+                        fmv_gn = float(torch.stack([p.grad.norm() for p in fmv_params]).norm().item())
+                    else:
+                        fmv_gn = 0.0
+                if step % 10 == 0:
+                    print(f'[DIAG] step={step} fmv_policy_grad_norm={fmv_gn:.6f} '
+                          f'grad_norm_total={float(grad_norm):.6f}')
             optimizer.step()
             mean_kl = float(np.mean(epoch_kls)) if epoch_kls else 0.0
             approx_kl_hist.append(mean_kl)
@@ -2338,7 +3138,6 @@ def main():
             'regression_active_frac': regression_active_frac,
             'reward_regression_weight': float(reward_regression_weight),
             'reward_regression_init_thresh': float(reward_regression_init_thresh),
-            'gate_active_frac': gate_active_frac,
             'outer_log_count_mean': float(np.mean(old_log_counts)) if old_log_counts else 0.0,
             'prefix_distill_count_mean': float(np.mean([
                 len(t.get('prefix_states', [])) for t in rollouts
@@ -2368,14 +3167,13 @@ def main():
                 p_c_state = snake_gcn_utils.img_poly_to_can_poly(p_state)
                 p_mean = _outer_action_mean(gcn, output['cnn_feature'], p_state, p_c_state, output['py_ind'], p_frac, ode_steps)
                 p_ctx = gcn.prepare_sampling_context(output['cnn_feature'], p_state, output['py_ind'])
-                p_mu, p_logstd, p_gate = point_explorer(
+                p_mu, p_logstd = point_explorer(
                     p_step, p_state, p_c_state, p_mean, p_ctx['sampled_feat'].detach(), p_frac
                 )
                 metrics.update({
                     'point_explorer': True,
                     'point_mu_abs_px': float((p_mu.abs() * float(snake_config.down_ratio)).mean().item()),
                     'point_std_px': float((torch.exp(p_logstd) * float(snake_config.down_ratio)).mean().item()),
-                    'point_gate_mean': float(p_gate.mean().item()),
                     'point_freeze_flow': bool(point_explorer_freeze_flow),
                 })
         if mixture_explorer is not None:
@@ -2386,7 +3184,7 @@ def main():
                 m_c_state = snake_gcn_utils.img_poly_to_can_poly(m_state)
                 m_mean = _outer_action_mean(gcn, output['cnn_feature'], m_state, m_c_state, output['py_ind'], m_frac, ode_steps)
                 m_ctx = gcn.prepare_sampling_context(output['cnn_feature'], m_state, output['py_ind'])
-                m_loc, m_logscale, m_logits, m_gate = mixture_explorer(
+                m_loc, m_logscale, m_logits = mixture_explorer(
                     m_step, m_state, m_c_state, m_mean, m_ctx['sampled_feat'].detach(), m_frac
                 )
                 m_probs = torch.softmax(m_logits, dim=1)
@@ -2396,7 +3194,6 @@ def main():
                     'mixture_modes': int(mixture_modes),
                     'mixture_loc_abs_px': float((m_loc.abs() * float(snake_config.down_ratio)).mean().item()),
                     'mixture_scale_px': float((torch.exp(m_logscale) * float(snake_config.down_ratio)).mean().item()),
-                    'mixture_gate_mean': float(m_gate.mean().item()),
                     'mixture_prob_max_mean': float(m_probs.max(dim=1).values.mean().item()),
                     'mixture_entropy': float(m_entropy.item()),
                     'mixture_freeze_flow': bool(mixture_freeze_flow),
@@ -2425,7 +3222,7 @@ def main():
                 extra = f" eval_iou={eval_metrics['eval_iou']:.4f} mbf={eval_metrics['eval_mboundf']:.4f}"
             print(
                 f"[RL-V5] step={step}/{train_steps} reward={reward_mean:+.5f} "
-                f"best={metrics['quality_best_mean']:+.5f} gate={gate_active_frac:.2f} "
+                f"best={metrics['quality_best_mean']:+.5f} "
                 f"dsig={sigma_multiplier:.2f} "
                 f"burr={metrics['burr_penalty_mean']:.3f} reg={metrics['regression_penalty_mean']:+.3f} "
                 f"detail={metrics.get('final_detail_score_mean', 0.0):+.3f} "
