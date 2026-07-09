@@ -1,34 +1,17 @@
-# V5 per_point_fm_scale action policy — multiplicative gain parameterisation.
-#
-# Root cause of kl=0 failure in old per_point_fm_velocity:
-#   1. init_logstd=-2.5/-3.5 → std≈0.08/0.03, essentially no exploration
-#   2. fm_velocity_lr=4e-8, too small for a freshly initialised policy head
-#   3. action = mean + fm_dir * scale * sigma: scale controls additive perturbation
-#      along unit-normalised velocity direction, gradient path is weak
-#
-# New scheme (B):
-#   action_i = fm_velocity_i * (1 + scale_i)
-#   scale_i ~ N(mu_i, exp(logstd_i))
-#   scale=0 → pure FM prediction (safe initialisation)
-#   Gradient flows directly through multiplicative gate → much cleaner signal
-#
-# Hyper-parameter fixes:
-#   init_logstd: -0.5  (std≈0.6, real exploration from step 1)
-#   fm_velocity_lr: 1.0e-6  (25× larger than old 4e-8)
-#   logstd_max: 2.0
-#   grad_clip_norm: 1.0  (separate from the base network's 0.25)
-#
-# GPU5, fresh RL start, full_extrap per-step credit.
+# V5 geom-action RL with a longer 5-step action trajectory.
+# This isolates the effect of trajectory length against the original V5
+# 3-step run: same base checkpoint, same low-frequency geometric action
+# family, but residual fractions follow 20/40/60/80/100% progress.
 
 model: 'sbd'
 network: 'ro_34'
 task: 'snake'
-model_dir: "data/outputs/1232_final_v5_perpoint_fmscale_bs6_gpu5"
+model_dir: "data/outputs/1232_final_v5_geom8_perstep05_bs6_gpu6"
 
-gpus: [5]
-resume: true
-resume_weights_only: false
-resume_path: "data/outputs/_recovered_checkpoints/gpu5_latest_backup.pt"
+gpus: [6]
+resume: false
+resume_weights_only: true
+resume_path: "data/outputs/1232_final_diffusion_dit_v4_6c_mlp_shared_moe_nodet_continue_gpu3/checkpoints/latest.pt"
 
 train_or_test: train
 
@@ -149,33 +132,21 @@ dataloader_persistent_workers: false
 dataloader_prefetch_factor: 0
 
 rl_v4_train_steps: 1000
-rl_v4_resume_ckpt: "data/outputs/_recovered_checkpoints/gpu5_latest_backup.pt"
 rl_v4_k: 8
 rl_v4_outer_steps: 5
 rl_v4_fractions: [0.2, 0.25, 0.3333, 0.5, 1.0]
 rl_v4_ode_steps: 10
 rl_v4_max_contours: 4
-
-# ── New per-point multiplicative FM scale policy ──
-rl_v4_action_policy: 'per_point_fm_scale'
-rl_v4_fm_velocity_hidden_dim: 64
-rl_v4_fm_velocity_feature_dim: 128     # sampled_feat C-dim = 128
-rl_v4_fm_velocity_feature_embed_dim: 32
-rl_v4_fm_velocity_init_logstd: -1.5    # std≈0.22 → moderate exploration (was -0.5→0.6 too wide)
-rl_v4_fm_velocity_logstd_min: -3.0
-rl_v4_fm_velocity_logstd_max: 1.5
-rl_v4_fm_velocity_offset_scale: 0.5   # tanh limit on per-point mu correction
-rl_v4_fm_velocity_max_scale: 0.1      # tanh bound: scale ∈ (-0.1,+0.1) → multiplier ∈ (0.9, 1.1), 精修任务幅度应小
-rl_v4_fm_velocity_entropy_weight: 0.002  # counteract PPO's natural std-collapse; keeps exploration alive
-rl_v4_fm_velocity_lr: 1.0e-6          # 25× larger than old 4e-8
-
+rl_v4_geom_lowfreq_modes: 8
+rl_v4_geom_sigma_px: [0.8, 0.7, 0.6, 0.5, 0.4]
 rl_v4_ppo_inner_epochs: 2
-rl_v4_ppo_clip: 0.2
-rl_v4_ppo_kl_target: 0.01
-rl_v4_kl_beta: 0.001
+rl_v4_ppo_clip: 0.05
+rl_v4_ppo_kl_target: 0.002
+rl_v4_kl_beta: 0.01
 rl_v4_adv_clip_max: 2.0
 rl_v4_gate_margin: 0.0
-rl_v4_grad_clip_norm: 1.0             # larger clip for policy-head-only updates
+rl_v4_grad_clip_norm: 0.25
+rl_v4_lr: 4.0e-8
 
 rl_v4_reward_w_region: 0.30
 rl_v4_reward_w_dice: 0.10
@@ -184,7 +155,7 @@ rl_v4_reward_w_dist: 0.35
 rl_v4_reward_dist_max_px: 8.0
 rl_v4_reward_dist_quantile: 95.0
 rl_v4_reward_dist_quantile_weight: 0.5
-rl_v4_reward_burr_weight: 0.0     # disabled: scale_pp clamp prevents reversal; burr was drowning signal
+rl_v4_reward_burr_weight: 0.06
 rl_v4_reward_burr_max_px: 1.5
 rl_v4_reward_burr_margin_px: 0.50
 rl_v4_reward_burr_quantile: 95.0
@@ -194,9 +165,8 @@ rl_v4_eval_batches: 8
 rl_v4_eval_every: 50
 rl_v4_save_every: 50
 rl_v4_log_every: 1
-rl_v4_seed: 20260711
+rl_v4_seed: 20260615
 rl_v4_min_load_ratio: 95.0
 
-rl_v4_per_step_reward_weight: 1.0
-rl_v4_per_step_credit_mode: 'full_extrap'
-rl_v4_lr: 4.0e-8
+# per-step shaped reward (blend terminal + per-step sequential-delta advantage)
+rl_v4_per_step_reward_weight: 0.5

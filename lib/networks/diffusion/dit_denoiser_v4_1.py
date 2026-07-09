@@ -5,7 +5,9 @@ zero-init per-point residual head for small local contour corrections.
 """
 
 import torch
+import torch.nn as nn
 
+from .dit_blocks import SinusoidalTimeEmbedding
 from .dit_denoiser_v3_4 import DiTFlowMatchingV3_4
 from .dit_denoiser_v4 import LatentLoopBlock, MoEFinalHead, PerPointDeltaHead, StrongPerPointDeltaHead
 
@@ -39,6 +41,7 @@ class DiTFlowMatchingV4_1(DiTFlowMatchingV3_4):
         moe_expert_hidden_dim: int = 256,
         use_latent_loop: bool = False,
         latent_loop_steps: int = 4,
+        use_s_conditioning: bool = False,
         **kwargs,
     ):
         super().__init__(*args, num_points=num_points, **kwargs)
@@ -49,6 +52,16 @@ class DiTFlowMatchingV4_1(DiTFlowMatchingV3_4):
         self.per_point_delta_head_type = str(per_point_delta_head_type).strip().lower()
         self.use_latent_loop = bool(use_latent_loop)
         self.latent_loop_steps = int(max(1, latent_loop_steps))
+
+        if use_s_conditioning:
+            self.s_emb_net = nn.Sequential(
+                SinusoidalTimeEmbedding(dim=self.state_dim // 4),
+                nn.Linear(self.state_dim // 4, self.state_dim),
+                nn.SiLU(),
+                nn.Linear(self.state_dim, self.state_dim),
+            )
+            nn.init.zeros_(self.s_emb_net[-1].weight)
+            nn.init.zeros_(self.s_emb_net[-1].bias)
 
         if self.use_moe_final_head:
             self.final_layer = MoEFinalHead(
@@ -113,6 +126,7 @@ class DiTFlowMatchingV4_1(DiTFlowMatchingV3_4):
         locate_point_ctx=None,
         locate_global_ctx=None,
         locate_only: bool = False,
+        s: torch.Tensor = None,
     ):
         assert x_t.dim() == 3 and x_t.shape[-1] == 2, \
             f"Expected x_t shape (N, P, 2), got {x_t.shape}"
@@ -129,6 +143,8 @@ class DiTFlowMatchingV4_1(DiTFlowMatchingV3_4):
             x_t = x_t.to(param_dtype)
         if t.dtype != param_dtype:
             t = t.to(param_dtype)
+        if s is not None and s.dtype != param_dtype:
+            s = s.to(param_dtype)
         if detail_feat is not None and detail_feat.dtype != param_dtype:
             detail_feat = detail_feat.to(param_dtype)
         if locate_point_ctx is not None and locate_point_ctx.dtype != param_dtype:
@@ -138,6 +154,11 @@ class DiTFlowMatchingV4_1(DiTFlowMatchingV3_4):
 
         n_contours, _, _ = x_t.shape
         t_emb = self.time_emb_net(t)
+        cond_emb = t_emb
+        if s is not None and hasattr(self, 's_emb_net'):
+            s_scaled = (s * 1000.0).to(device=t.device, dtype=t_emb.dtype)
+            s_emb = self.s_emb_net(s_scaled)
+            cond_emb = t_emb + s_emb
 
         if cnn_feature.dim() == 3:
             cnn_feature = cnn_feature.unsqueeze(0)
@@ -179,13 +200,13 @@ class DiTFlowMatchingV4_1(DiTFlowMatchingV3_4):
 
         for i, dit_layer in enumerate(self.dit_layers):
             context = global_ctx if (i % 2 == 0) else local_ctx
-            x = dit_layer(x, context, t_emb)
+            x = dit_layer(x, context, cond_emb)
 
         if self.use_latent_loop:
             for _ in range(self.latent_loop_steps):
-                x = self.latent_loop(x, t_emb)
+                x = self.latent_loop(x, cond_emb)
 
-        pred = self.final_layer(x, t_emb)
+        pred = self.final_layer(x, cond_emb)
         reg_loss = pred.new_zeros(())
         if hasattr(self.final_layer, 'reg_loss'):
             reg_loss = reg_loss + self.final_layer.reg_loss().to(pred.device, pred.dtype)
@@ -193,6 +214,6 @@ class DiTFlowMatchingV4_1(DiTFlowMatchingV3_4):
             if hasattr(dit_layer, 'reg_loss'):
                 reg_loss = reg_loss + dit_layer.reg_loss().to(pred.device, pred.dtype)
         if self.use_per_point_delta:
-            pred = pred + self.per_point_delta_head(x, t_emb)
+            pred = pred + self.per_point_delta_head(x, cond_emb)
             reg_loss = reg_loss + self.per_point_delta_head.reg_loss().to(pred.device, pred.dtype)
         return pred, reg_loss

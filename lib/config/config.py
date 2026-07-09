@@ -106,6 +106,12 @@ cfg.use_dit_v3_7 = False
 cfg.use_dit_v3_8 = False
 cfg.circular_conv_kernel = 5
 cfg.use_flow_matching = False
+cfg.flow_2d_s_conditioning = False
+cfg.use_curve_inference = False
+cfg.curve_alpha = 2.0
+cfg.curve_steps = 20
+cfg.curve_s_max = 0.97
+cfg.curve_resample_feat = True
 cfg.flow_ode_steps = 10
 cfg.flow_train_noise_scale = 1.0
 cfg.flow_use_disp_gate = False
@@ -342,6 +348,7 @@ cfg.test.dataset = 'SbdMini'
 cfg.test.batch_size = 1
 cfg.test.epoch = -1
 cfg.test.img_path = '/mnt/date/zhangrch/EnergeSnake/multiple_segmentdata/setA/'
+cfg.test.visual_save_root = 'data/eval_vis'
 
 # recorder
 cfg.record_dir = 'data/record'

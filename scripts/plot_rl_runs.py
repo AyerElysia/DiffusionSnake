@@ -8,12 +8,13 @@ import matplotlib.pyplot as plt
 LOGS = {
     # GPU6 resumed from step600 checkpoint: pre-600 steps live in the old log,
     # 600+ steps live in the new "_10k" log. Concatenate both (comma-separated).
-    'extrap_w1.0 (GPU6, baseline)': (
+    'extrap_w1.0 (GPU6, burr=0.06)': (
         'NOHUP_LOGS/geom8_extrap1p0_gpu6.log,NOHUP_LOGS/geom8_extrap1p0_gpu6_10k.log'
     ),
+    'extrap_w1.0 noburr (GPU0)': 'NOHUP_LOGS/geom8_extrap1p0_noburr_gpu0.log',
     'delta_nsd (GPU7)': 'NOHUP_LOGS/geom8_delta_nsd_gpu7.log',
     'seq_delta (GPU1)': 'NOHUP_LOGS/geom8_seqdelta_gpu1.log',
-    'perpoint_fmscale tanh01 (GPU5)': 'NOHUP_LOGS/perpoint_fmscale_tanh01_gpu5.log',
+    'perpoint_fmscale entropy+diag (GPU5)': 'NOHUP_LOGS/perpoint_fmscale_entropy_diag_gpu5.log',
 }
 
 STEP_RE = re.compile(

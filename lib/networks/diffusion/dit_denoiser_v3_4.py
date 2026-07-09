@@ -105,3 +105,5 @@ class DiTFlowMatchingV3_4(DiTDenoiserV3):
         pred = self.final_layer(x, t_emb)
         reg_loss = torch.zeros(1, device=x_t.device, dtype=x_t.dtype)
         return pred, reg_loss
+
+

@@ -45,6 +45,7 @@ from lib.train import make_optimizer
 from lib.train.grpo_v2_utils import EMA, freeze_bn_running_stats, freeze_ref_flow, percentiles
 from lib.train.rewards.curvature_detail_reward import compute_curvature_detail_score
 from lib.train.rewards.region_reward import compute_region_score, compute_nsd_score
+from lib.train.rewards.region_reward import _poly_to_mask_np, _extract_contour
 from lib.train.trainers import make_trainer
 from lib.utils.snake import snake_config, snake_gcn_utils
 
@@ -378,215 +379,6 @@ class FourierExplorer(nn.Module):
         return low_mu, low_logstd, detail_mu, detail_logstd
 
 
-class PointExplorerPolicy(nn.Module):
-    """Image-conditioned per-point normal-direction exploration policy."""
-
-    def __init__(
-        self,
-        outer_steps: int,
-        feature_dim: int,
-        feature_embed_dim: int = 32,
-        hidden_dim: int = 96,
-        mu_scale: float = 0.10,
-        init_std: float = 0.08,
-        logstd_min: float = -4.0,
-        logstd_max: float = -0.3,
-        gate_max: float = 1.2,  # kept for checkpoint-compat; unused
-    ):
-        super().__init__()
-        outer_steps = max(int(outer_steps), 1)
-        feature_dim = max(int(feature_dim), 1)
-        feature_embed_dim = max(int(feature_embed_dim), 4)
-        hidden_dim = max(int(hidden_dim), 16)
-        self.feature_proj = nn.Sequential(
-            nn.Linear(feature_dim, feature_embed_dim),
-            nn.SiLU(),
-            nn.Linear(feature_embed_dim, feature_embed_dim),
-            nn.SiLU(),
-        )
-        self.step_embed = nn.Embedding(outer_steps, feature_embed_dim)
-        # state_rel(2), c_state(2), normal(2), mean_rel(2), curvature(1),
-        # contour scale(1), fraction(1), sampled feature embedding, step embedding.
-        in_dim = 2 + 2 + 2 + 2 + 1 + 1 + 1 + feature_embed_dim + feature_embed_dim
-        self.net = nn.Sequential(
-            nn.Linear(in_dim, hidden_dim),
-            nn.SiLU(),
-            nn.Linear(hidden_dim, hidden_dim),
-            nn.SiLU(),
-            nn.Linear(hidden_dim, 3),
-        )
-        self.mu_scale = float(mu_scale)
-        self.init_logstd = math.log(max(float(init_std), 1e-6))
-        self.logstd_min = float(logstd_min)
-        self.logstd_max = float(logstd_max)
-        nn.init.zeros_(self.net[-1].weight)
-        nn.init.zeros_(self.net[-1].bias)
-
-    def forward(
-        self,
-        step_index: int,
-        state: torch.Tensor,
-        c_state: torch.Tensor,
-        mean_action: torch.Tensor,
-        sampled_feat: torch.Tensor,
-        frac: float,
-    ):
-        idx = max(0, min(int(step_index), self.step_embed.num_embeddings - 1))
-        center = state.mean(dim=1, keepdim=True)
-        scale = (state - center).norm(dim=-1, keepdim=True).mean(dim=1, keepdim=True).clamp_min(1.0)
-        state_rel = (state - center) / scale
-        mean_rel = mean_action / scale
-        normal = _contour_normals(state)
-        lap = torch.roll(state, 1, dims=1) - 2.0 * state + torch.roll(state, -1, dims=1)
-        curvature = (lap.norm(dim=-1, keepdim=True) / scale).clamp(max=4.0)
-        scale_feat = torch.log(scale).expand(-1, state.size(1), 1) / math.log(256.0)
-        frac_feat = torch.full(
-            (state.size(0), state.size(1), 1),
-            float(frac),
-            device=state.device,
-            dtype=state.dtype,
-        )
-        local_feat = sampled_feat.transpose(1, 2).to(device=state.device, dtype=state.dtype)
-        local_feat = self.feature_proj(local_feat)
-        step_id = torch.full((state.size(0), state.size(1)), idx, device=state.device, dtype=torch.long)
-        step_feat = self.step_embed(step_id).to(dtype=state.dtype)
-        inp = torch.cat([
-            state_rel,
-            c_state.to(dtype=state.dtype),
-            normal,
-            mean_rel,
-            curvature,
-            scale_feat,
-            frac_feat,
-            local_feat,
-            step_feat,
-        ], dim=-1)
-        raw = self.net(inp)
-        mu = torch.tanh(raw[..., 0]) * self.mu_scale
-        logstd = (raw[..., 1] + self.init_logstd).clamp(self.logstd_min, self.logstd_max)
-        # gate output (raw[..., 2]) is ignored; effective gate=1.0
-        return mu, logstd
-
-
-class StructuredMixtureExplorer(nn.Module):
-    """Mixture of per-contour structured Laplace residual policies.
-
-    Each component predicts a full per-point normal-direction residual field.
-    A contour-level categorical variable selects the component, so one rollout
-    keeps a coherent hypothesis instead of independently switching modes per
-    point.
-    """
-
-    def __init__(
-        self,
-        outer_steps: int,
-        feature_dim: int,
-        num_modes: int = 4,
-        feature_embed_dim: int = 32,
-        hidden_dim: int = 128,
-        loc_scale: float = 0.12,
-        init_scale: float = 0.08,
-        logscale_min: float = -5.0,
-        logscale_max: float = -0.2,
-        gate_max: float = 1.2,  # kept for checkpoint-compat; unused
-    ):
-        super().__init__()
-        outer_steps = max(int(outer_steps), 1)
-        feature_dim = max(int(feature_dim), 1)
-        num_modes = max(int(num_modes), 1)
-        feature_embed_dim = max(int(feature_embed_dim), 4)
-        hidden_dim = max(int(hidden_dim), 16)
-        self.num_modes = num_modes
-        self.loc_scale = float(loc_scale)
-        self.init_logscale = math.log(max(float(init_scale), 1e-6))
-        self.logscale_min = float(logscale_min)
-        self.logscale_max = float(logscale_max)
-
-        self.feature_proj = nn.Sequential(
-            nn.Linear(feature_dim, feature_embed_dim),
-            nn.SiLU(),
-            nn.Linear(feature_embed_dim, feature_embed_dim),
-            nn.SiLU(),
-        )
-        self.step_embed = nn.Embedding(outer_steps, feature_embed_dim)
-        # Same geometry features as the point policy, plus local image embedding.
-        point_in_dim = 2 + 2 + 2 + 2 + 1 + 1 + 1 + feature_embed_dim + feature_embed_dim
-        self.point_net = nn.Sequential(
-            nn.Linear(point_in_dim, hidden_dim),
-            nn.SiLU(),
-            nn.Linear(hidden_dim, hidden_dim),
-            nn.SiLU(),
-            nn.Linear(hidden_dim, 2 * num_modes),
-        )
-        # _poly_explorer_features gives 14 global geometry values.
-        mode_in_dim = 14 + feature_embed_dim + feature_embed_dim
-        self.mode_net = nn.Sequential(
-            nn.Linear(mode_in_dim, hidden_dim),
-            nn.SiLU(),
-            nn.Linear(hidden_dim, hidden_dim),
-            nn.SiLU(),
-            nn.Linear(hidden_dim, 2 * num_modes),
-        )
-        nn.init.zeros_(self.point_net[-1].weight)
-        nn.init.zeros_(self.point_net[-1].bias)
-        nn.init.zeros_(self.mode_net[-1].weight)
-        nn.init.zeros_(self.mode_net[-1].bias)
-
-    def forward(
-        self,
-        step_index: int,
-        state: torch.Tensor,
-        c_state: torch.Tensor,
-        mean_action: torch.Tensor,
-        sampled_feat: torch.Tensor,
-        frac: float,
-    ):
-        idx = max(0, min(int(step_index), self.step_embed.num_embeddings - 1))
-        center = state.mean(dim=1, keepdim=True)
-        scale = (state - center).norm(dim=-1, keepdim=True).mean(dim=1, keepdim=True).clamp_min(1.0)
-        state_rel = (state - center) / scale
-        mean_rel = mean_action / scale
-        normal = _contour_normals(state)
-        lap = torch.roll(state, 1, dims=1) - 2.0 * state + torch.roll(state, -1, dims=1)
-        curvature = (lap.norm(dim=-1, keepdim=True) / scale).clamp(max=4.0)
-        scale_feat = torch.log(scale).expand(-1, state.size(1), 1) / math.log(256.0)
-        frac_feat = torch.full(
-            (state.size(0), state.size(1), 1),
-            float(frac),
-            device=state.device,
-            dtype=state.dtype,
-        )
-        local_feat = sampled_feat.transpose(1, 2).to(device=state.device, dtype=state.dtype)
-        local_feat = self.feature_proj(local_feat)
-        step_id = torch.full((state.size(0), state.size(1)), idx, device=state.device, dtype=torch.long)
-        step_feat = self.step_embed(step_id).to(dtype=state.dtype)
-        point_inp = torch.cat([
-            state_rel,
-            c_state.to(dtype=state.dtype),
-            normal,
-            mean_rel,
-            curvature,
-            scale_feat,
-            frac_feat,
-            local_feat,
-            step_feat,
-        ], dim=-1)
-        point_raw = self.point_net(point_inp)
-        loc_raw, logscale_raw = torch.chunk(point_raw, 2, dim=-1)
-        loc = torch.tanh(loc_raw) * self.loc_scale
-        logscale = (logscale_raw + self.init_logscale).clamp(self.logscale_min, self.logscale_max)
-
-        global_feat = _poly_explorer_features(state, frac, coord_scale=128.0)
-        pooled_feat = local_feat.mean(dim=1)
-        step_global = self.step_embed(
-            torch.full((state.size(0),), idx, device=state.device, dtype=torch.long)
-        ).to(dtype=state.dtype)
-        mode_raw = self.mode_net(torch.cat([global_feat, pooled_feat, step_global], dim=1))
-        mode_logits = mode_raw[:, :self.num_modes]
-        # gate output (mode_raw[:, num_modes:]) is ignored; effective gate=1.0
-        return loc, logscale, mode_logits
-
-
 class FMVelocityPolicy(nn.Module):
     """
     Per-outer-step scalar policy aligned with FM velocity direction.
@@ -700,11 +492,12 @@ class PerPointFMVelocityPolicy(nn.Module):
         B = poly.size(0)
         N_poly = mean_action.size(1)
 
-        # ── normalise sampled_feat to (B, N_samp, C)
-        if sampled_feat.dim() == 3 and sampled_feat.size(1) != sampled_feat.size(2):
-            if sampled_feat.size(1) > sampled_feat.size(2):
-                # (B, C, N_samp) → (B, N_samp, C)
-                sampled_feat = sampled_feat.transpose(1, 2)
+        # ── normalise sampled_feat to (B, N_samp, C).
+        # NOTE: cnn_feature has 64 channels while N_poly=128, so "size(1) > size(2)"
+        # is NOT a reliable way to detect (B, C, N) layout — use N_poly (a known
+        # ground truth) to decide which axis is the point axis instead.
+        if sampled_feat.dim() == 3 and sampled_feat.size(1) != N_poly and sampled_feat.size(2) == N_poly:
+            sampled_feat = sampled_feat.transpose(1, 2)  # (B, C, N_poly) → (B, N_poly, C)
         sf = sampled_feat.to(device=poly.device, dtype=poly.dtype)  # (B, N_samp, C)
 
         idx = max(0, min(int(step_idx), self.step_embed.num_embeddings - 1))
@@ -828,10 +621,11 @@ class PerPointFMScalePolicy(nn.Module):
         B = poly.size(0)
         N_poly = mean_action.size(1)
 
-        # Normalise sampled_feat to (B, N_samp, C)
-        if sampled_feat.dim() == 3 and sampled_feat.size(1) != sampled_feat.size(2):
-            if sampled_feat.size(1) > sampled_feat.size(2):
-                sampled_feat = sampled_feat.transpose(1, 2)
+        # Normalise sampled_feat to (B, N_samp, C). Use N_poly (known ground truth)
+        # to pick the point axis — channel count (64) can be smaller OR larger than
+        # N_poly (128) depending on config, so a size-comparison heuristic is unsafe.
+        if sampled_feat.dim() == 3 and sampled_feat.size(1) != N_poly and sampled_feat.size(2) == N_poly:
+            sampled_feat = sampled_feat.transpose(1, 2)
         sf = sampled_feat.to(device=poly.device, dtype=poly.dtype)
 
         idx = max(0, min(int(step_idx), self.step_embed.num_embeddings - 1))
@@ -850,10 +644,13 @@ class PerPointFMScalePolicy(nn.Module):
         vel_mag = mean_action.norm(dim=-1, keepdim=True)       # (B, N_poly, 1)
         vel_mag_norm = vel_mag / (vel_mag.mean(dim=1, keepdim=True).clamp_min(1e-6))
 
-        # Per-point mu offset
-        gf_exp = global_feat.unsqueeze(1).expand(-1, N_poly, -1)   # (B, N_poly, C)
+        # Per-point mu offset -- use the UN-pooled per-point feature (sf) so the
+        # point_net actually sees each point's local image content, instead of
+        # a copy-pasted global-pooled feature (which erased all spatial signal).
+        # sf is sampled at the N_poly contour-point locations (get_gcn_feature
+        # on i_it_py), so N_samp == N_poly here and no re-alignment is needed.
         s_emb_exp = s_emb.unsqueeze(1).expand(-1, N_poly, -1)      # (B, N_poly, E)
-        p_in = torch.cat([gf_exp, s_emb_exp, vel_mag_norm], dim=-1)
+        p_in = torch.cat([sf, s_emb_exp, vel_mag_norm], dim=-1)
         mu_offset_raw = self.point_net(p_in).squeeze(-1)  # (B, N_poly)
 
         mu_pp = mu_g + torch.tanh(mu_offset_raw) * self.offset_scale  # (B, N_poly)
@@ -899,70 +696,6 @@ def _normal_z_logprob(z: torch.Tensor, mu: torch.Tensor, logstd: torch.Tensor) -
     lp = -0.5 * (((z - mu) ** 2) / var + 2.0 * logstd + math.log(2.0 * math.pi))
     return lp.mean(dim=1)
 
-
-def _point_normal_logprob(delta_n: torch.Tensor, mu: torch.Tensor, logstd: torch.Tensor) -> torch.Tensor:
-    var = torch.exp(2.0 * logstd).clamp_min(1e-12)
-    lp = -0.5 * (((delta_n - mu) ** 2) / var + 2.0 * logstd + math.log(2.0 * math.pi))
-    return lp.mean(dim=1)
-
-
-def _point_action_logprob(
-    action: torch.Tensor,
-    mean_action: torch.Tensor,
-    state: torch.Tensor,
-    mu: torch.Tensor,
-    logstd: torch.Tensor,
-) -> torch.Tensor:
-    # gate=1.0: residual = action - mean_action
-    residual = action.detach() - mean_action
-    delta_n = (residual * _contour_normals(state)).sum(dim=-1)
-    return _point_normal_logprob(delta_n, mu, logstd)
-
-
-def _sample_laplace_like(x: torch.Tensor) -> torch.Tensor:
-    u = torch.rand_like(x).clamp(1e-6, 1.0 - 1e-6) - 0.5
-    return -torch.sign(u) * torch.log1p(-2.0 * u.abs())
-
-
-def _gather_mode_points(x: torch.Tensor, mode_idx: torch.Tensor) -> torch.Tensor:
-    # x: [N, P, M], mode_idx: [N] -> [N, P]
-    idx = mode_idx.view(-1, 1, 1).expand(-1, x.size(1), 1)
-    return x.gather(dim=2, index=idx).squeeze(2)
-
-
-def _gather_mode_scalar(x: torch.Tensor, mode_idx: torch.Tensor) -> torch.Tensor:
-    # x: [N, M], mode_idx: [N] -> [N]
-    return x.gather(dim=1, index=mode_idx.view(-1, 1)).squeeze(1)
-
-
-def _mixture_laplace_logprob(
-    delta_n: torch.Tensor,
-    loc: torch.Tensor,
-    logscale: torch.Tensor,
-    mode_logits: torch.Tensor,
-    mode_idx: torch.Tensor,
-) -> torch.Tensor:
-    loc_m = _gather_mode_points(loc, mode_idx)
-    logscale_m = _gather_mode_points(logscale, mode_idx)
-    inv_scale = torch.exp(-logscale_m).clamp_max(1e6)
-    lp_point = -torch.abs(delta_n - loc_m) * inv_scale - logscale_m - math.log(2.0)
-    lp_mode = _gather_mode_scalar(torch.log_softmax(mode_logits, dim=1), mode_idx)
-    return lp_point.mean(dim=1) + lp_mode
-
-
-def _structured_mixture_action_logprob(
-    action: torch.Tensor,
-    mean_action: torch.Tensor,
-    state: torch.Tensor,
-    loc: torch.Tensor,
-    logscale: torch.Tensor,
-    mode_logits: torch.Tensor,
-    mode_idx: torch.Tensor,
-) -> torch.Tensor:
-    # gate=1.0: residual = action - mean_action
-    residual = action.detach() - mean_action
-    delta_n = (residual * _contour_normals(state)).sum(dim=-1)
-    return _mixture_laplace_logprob(delta_n, loc, logscale, mode_logits, mode_idx)
 
 
 def _fm_velocity_logprob(action: torch.Tensor, mean: torch.Tensor,
@@ -1173,43 +906,6 @@ def main():
     explorer_logstd_min = float(cv('explorer_logstd_min', -1.50))
     explorer_logstd_max = float(cv('explorer_logstd_max', 0.70))
     geom_lowfreq_damp_highfreq = _as_bool(cv('geom_lowfreq_damp_highfreq', False))
-    point_policy_active = action_policy in (
-        'point_explorer', 'per_point_explorer', 'image_point_explorer', 'point_normal'
-    )
-    structured_mixture_active = action_policy in (
-        'structured_mixture', 'mixture_laplace', 'structured_laplace', 'contour_mixture'
-    )
-    point_steps_cfg = cv('point_explorer_steps', [outer_steps - 1])
-    if isinstance(point_steps_cfg, (int, float)):
-        point_explorer_steps = {int(point_steps_cfg)}
-    else:
-        point_explorer_steps = {int(x) for x in list(point_steps_cfg)}
-    point_explorer_steps = {x for x in point_explorer_steps if 0 <= x < outer_steps}
-    point_explorer_feature_dim = int(cv('point_explorer_feature_dim', 64))
-    point_explorer_feature_embed_dim = int(cv('point_explorer_feature_embed_dim', 32))
-    point_explorer_hidden_dim = int(cv('point_explorer_hidden_dim', 96))
-    point_explorer_mu_scale_px = float(cv('point_explorer_mu_scale_px', 0.40))
-    point_explorer_init_std_px = float(cv('point_explorer_init_std_px', 0.25))
-    point_explorer_logstd_min = float(cv('point_explorer_logstd_min', -4.0))
-    point_explorer_logstd_max = float(cv('point_explorer_logstd_max', -0.3))
-    point_explorer_lr = float(cv('point_explorer_lr', cv('explorer_lr', getattr(cfg.train, 'lr', 5e-8))))
-    point_explorer_freeze_flow = _as_bool(cv('point_explorer_freeze_flow', True))
-    mixture_steps_cfg = cv('mixture_steps', [outer_steps - 1])
-    if isinstance(mixture_steps_cfg, (int, float)):
-        mixture_steps = {int(mixture_steps_cfg)}
-    else:
-        mixture_steps = {int(x) for x in list(mixture_steps_cfg)}
-    mixture_steps = {x for x in mixture_steps if 0 <= x < outer_steps}
-    mixture_modes = int(cv('mixture_modes', 4))
-    mixture_feature_dim = int(cv('mixture_feature_dim', 64))
-    mixture_feature_embed_dim = int(cv('mixture_feature_embed_dim', 32))
-    mixture_hidden_dim = int(cv('mixture_hidden_dim', 128))
-    mixture_loc_scale_px = float(cv('mixture_loc_scale_px', 0.50))
-    mixture_init_scale_px = float(cv('mixture_init_scale_px', 0.30))
-    mixture_logscale_min = float(cv('mixture_logscale_min', -5.0))
-    mixture_logscale_max = float(cv('mixture_logscale_max', -0.2))
-    mixture_lr = float(cv('mixture_lr', cv('explorer_lr', getattr(cfg.train, 'lr', 5e-8))))
-    mixture_freeze_flow = _as_bool(cv('mixture_freeze_flow', True))
     df_step_mode = str(cv('df_step_mode', 'flow_grpo')).strip().lower()
     df_sde_type = str(cv('df_sde_type', 'sde')).strip().lower()
     df_noise_level = float(cv('df_noise_level', 0.05))
@@ -1300,11 +996,7 @@ def main():
         for name in ('yolo', 'cnn_proj', 'cnn_proj_p3', 'swin_snake_feature'):
             _set_requires_grad(getattr(inner, name, None), False)
         print('[RL-V5] froze detector/feature projection parameters.')
-    freeze_gcn_for_external_policy = (
-        (point_policy_active and point_explorer_freeze_flow)
-        or (structured_mixture_active and mixture_freeze_flow)
-    )
-    _set_requires_grad(inner.gcn, not freeze_gcn_for_external_policy)
+    _set_requires_grad(inner.gcn, True)
     inner.train()
     nbn = freeze_bn_running_stats(inner)
     print(f'[RL-V5] froze BN running stats on {nbn} layers.')
@@ -1331,51 +1023,6 @@ def main():
             f'feature_dim={explorer_feature_dim}, feature_embed={explorer_feature_embed_dim}).'
         )
 
-    point_explorer = None
-    if point_policy_active:
-        point_explorer = PointExplorerPolicy(
-            outer_steps=outer_steps,
-            feature_dim=point_explorer_feature_dim,
-            feature_embed_dim=point_explorer_feature_embed_dim,
-            hidden_dim=point_explorer_hidden_dim,
-            mu_scale=point_explorer_mu_scale_px / max(float(snake_config.down_ratio), 1.0),
-            init_std=point_explorer_init_std_px / max(float(snake_config.down_ratio), 1.0),
-            logstd_min=point_explorer_logstd_min,
-            logstd_max=point_explorer_logstd_max,
-        ).to(next(net_for_load.parameters()).device)
-        print(
-            '[RL-V5] point explorer enabled '
-            f'(steps={sorted(point_explorer_steps)}, hidden={point_explorer_hidden_dim}, '
-            f'mu_scale_px={point_explorer_mu_scale_px}, init_std_px={point_explorer_init_std_px}, '
-            f'freeze_flow={point_explorer_freeze_flow}).'
-        )
-        if isinstance(raw_ckpt, dict) and isinstance(raw_ckpt.get('point_explorer_state_dict'), dict):
-            point_explorer.load_state_dict(raw_ckpt['point_explorer_state_dict'], strict=False)
-            print('[RL-V5] loaded point explorer from checkpoint.')
-
-    mixture_explorer = None
-    if structured_mixture_active:
-        mixture_explorer = StructuredMixtureExplorer(
-            outer_steps=outer_steps,
-            feature_dim=mixture_feature_dim,
-            num_modes=mixture_modes,
-            feature_embed_dim=mixture_feature_embed_dim,
-            hidden_dim=mixture_hidden_dim,
-            loc_scale=mixture_loc_scale_px / max(float(snake_config.down_ratio), 1.0),
-            init_scale=mixture_init_scale_px / max(float(snake_config.down_ratio), 1.0),
-            logscale_min=mixture_logscale_min,
-            logscale_max=mixture_logscale_max,
-        ).to(next(net_for_load.parameters()).device)
-        print(
-            '[RL-V5] structured mixture explorer enabled '
-            f'(steps={sorted(mixture_steps)}, modes={mixture_modes}, hidden={mixture_hidden_dim}, '
-            f'loc_scale_px={mixture_loc_scale_px}, init_scale_px={mixture_init_scale_px}, '
-            f'freeze_flow={mixture_freeze_flow}).'
-        )
-        if isinstance(raw_ckpt, dict) and isinstance(raw_ckpt.get('mixture_explorer_state_dict'), dict):
-            mixture_explorer.load_state_dict(raw_ckpt['mixture_explorer_state_dict'], strict=False)
-            print('[RL-V5] loaded structured mixture explorer from checkpoint.')
-
     fm_velocity_policy = None
     if action_policy in ('fm_velocity', 'per_point_fm_velocity', 'per_point_fm_scale'):
         fmv_hidden_dim = int(cv('fm_velocity_hidden_dim', 64))
@@ -1386,6 +1033,7 @@ def main():
         fmv_logstd_max = float(cv('fm_velocity_logstd_max', 1.0))
         fmv_lr = float(cv('fm_velocity_lr', cv('explorer_lr', getattr(cfg.train, 'lr', 4e-8))))
         fmv_smooth_k = int(cv('fm_velocity_smooth_k', 9))
+        fmv_entropy_weight = float(cv('fm_velocity_entropy_weight', 0.0))
         _dev = next(iter(trainer.network.parameters())).device
         if action_policy == 'per_point_fm_scale':
             # Tanh-bounded per-point FM scale: multiplier in (1-A, 1+A), no reversal
@@ -1405,7 +1053,8 @@ def main():
             print(f'[RL-V5] per_point_fm_scale_policy: outer_steps={outer_steps}, '
                   f'hidden={fmv_hidden_dim}, feature_dim={fmv_feature_dim}, '
                   f'init_logstd={fmv_init_logstd}, offset_scale={fmv_offset_scale}, '
-                  f'max_scale={fmv_max_scale}, fmv_lr={fmv_lr}')
+                  f'max_scale={fmv_max_scale}, fmv_lr={fmv_lr}, '
+                  f'entropy_weight={fmv_entropy_weight}')
         elif action_policy == 'per_point_fm_velocity':
             fmv_offset_scale = float(cv('fm_velocity_offset_scale', 0.3))
             fm_velocity_policy = PerPointFMVelocityPolicy(
@@ -1434,8 +1083,14 @@ def main():
             print(f'[RL-V5] fm_velocity_policy: outer_steps={outer_steps}, hidden={fmv_hidden_dim}, '
                   f'sigma_px={sigma_px}, fmv_lr={fmv_lr}')
         if isinstance(raw_ckpt, dict) and isinstance(raw_ckpt.get('fm_velocity_policy_state_dict'), dict):
-            fm_velocity_policy.load_state_dict(raw_ckpt['fm_velocity_policy_state_dict'], strict=False)
-            print('[RL-V5] loaded fm_velocity_policy from checkpoint.')
+            try:
+                fm_velocity_policy.load_state_dict(raw_ckpt['fm_velocity_policy_state_dict'], strict=False)
+                print('[RL-V5] loaded fm_velocity_policy from checkpoint.')
+            except RuntimeError as e:
+                print(f'[RL-V5] WARNING: fm_velocity_policy shape mismatch vs checkpoint '
+                      f'(architecture changed, e.g. feature_dim), keeping freshly-initialised '
+                      f'policy weights. Error: {e}')
+                _fmv_policy_shape_mismatch = True
 
     net_trainable = [p for p in trainer.network.parameters() if p.requires_grad]
     if net_trainable:
@@ -1449,18 +1104,6 @@ def main():
         extra_param_groups.append({
             'params': list(explorer.parameters()),
             'lr': explorer_lr,
-            'weight_decay': 0.0,
-        })
-    if point_explorer is not None:
-        extra_param_groups.append({
-            'params': list(point_explorer.parameters()),
-            'lr': point_explorer_lr,
-            'weight_decay': 0.0,
-        })
-    if mixture_explorer is not None:
-        extra_param_groups.append({
-            'params': list(mixture_explorer.parameters()),
-            'lr': mixture_lr,
             'weight_decay': 0.0,
         })
     if fm_velocity_policy is not None:
@@ -1479,11 +1122,6 @@ def main():
     print(f'[RL-V5] optimizer LR set to {lr}')
     if explorer is not None:
         print(f'[RL-V5] explorer LR set to {explorer_lr}')
-    if point_explorer is not None:
-        print(f'[RL-V5] point explorer LR set to {point_explorer_lr}')
-    if mixture_explorer is not None:
-        print(f'[RL-V5] structured mixture explorer LR set to {mixture_lr}')
-
     ref_flow = freeze_ref_flow(inner)
     print('[RL-V5] frozen reference flow snapshot created.')
 
@@ -1498,7 +1136,33 @@ def main():
             if isinstance(_sd, dict):
                 net_for_load.load_state_dict(_sd, strict=True)
             if 'optimizer' in _rl_ckpt and isinstance(_rl_ckpt['optimizer'], dict):
-                optimizer.load_state_dict(_rl_ckpt['optimizer'])
+                try:
+                    optimizer.load_state_dict(_rl_ckpt['optimizer'])
+                except (RuntimeError, ValueError) as e:
+                    print(f'[RL-V5] WARNING: optimizer state shape mismatch vs checkpoint '
+                          f'(architecture changed), skipping optimizer state restore and '
+                          f'starting fresh optimizer momentum. Error: {e}')
+                # optimizer.load_state_dict does not validate tensor shapes at load time
+                # (the mismatch only surfaces later inside optimizer.step()). After a
+                # successful load, scrub any per-param state whose momentum-buffer shape
+                # no longer matches the live parameter (e.g. fm_velocity_policy resized
+                # after a feature_dim fix) so step() does not crash on a stale buffer.
+                _mismatch_count = 0
+                for _group in optimizer.param_groups:
+                    for _p in _group['params']:
+                        _st = optimizer.state.get(_p)
+                        if not _st:
+                            continue
+                        _bad = any(
+                            torch.is_tensor(_v) and _v.shape != _p.shape
+                            for _v in _st.values()
+                        )
+                        if _bad:
+                            optimizer.state[_p] = {}
+                            _mismatch_count += 1
+                if _mismatch_count:
+                    print(f'[RL-V5] WARNING: reset optimizer momentum for {_mismatch_count} '
+                          f'parameter(s) with shape mismatch vs checkpoint (fresh start for those).')
             start_step = int(_rl_ckpt.get('step', 0))
             print(f'[RL-V5] RL resume: loaded {rl_resume_path}, continuing from step={start_step}')
         else:
@@ -1640,33 +1304,6 @@ def main():
                 'logstd_min': explorer_logstd_min,
                 'logstd_max': explorer_logstd_max,
                 'lr': explorer_lr,
-            },
-            'point_explorer': {
-                'enabled': bool(point_explorer is not None),
-                'steps': sorted(point_explorer_steps),
-                'feature_dim': point_explorer_feature_dim,
-                'feature_embed_dim': point_explorer_feature_embed_dim,
-                'hidden_dim': point_explorer_hidden_dim,
-                'mu_scale_px': point_explorer_mu_scale_px,
-                'init_std_px': point_explorer_init_std_px,
-                'logstd_min': point_explorer_logstd_min,
-                'logstd_max': point_explorer_logstd_max,
-                'lr': point_explorer_lr,
-                'freeze_flow': point_explorer_freeze_flow,
-            },
-            'structured_mixture': {
-                'enabled': bool(mixture_explorer is not None),
-                'steps': sorted(mixture_steps),
-                'modes': mixture_modes,
-                'feature_dim': mixture_feature_dim,
-                'feature_embed_dim': mixture_feature_embed_dim,
-                'hidden_dim': mixture_hidden_dim,
-                'loc_scale_px': mixture_loc_scale_px,
-                'init_scale_px': mixture_init_scale_px,
-                'logscale_min': mixture_logscale_min,
-                'logscale_max': mixture_logscale_max,
-                'lr': mixture_lr,
-                'freeze_flow': mixture_freeze_flow,
             },
             'df_inner_step': {
                 'step_mode': df_step_mode,
@@ -1886,9 +1523,6 @@ def main():
             'detail_sigmas': [],
             'outer_indices': [],
             'geom_sampled_feats': [],
-            'point_sampled_feats': [],
-            'mixture_sampled_feats': [],
-            'mixture_mode_indices': [],
             'fm_velocity_scales': [],
             'prefix_states': [],
             'prefix_c_states': [],
@@ -1978,68 +1612,6 @@ def main():
                 traj['prefix_c_states'].append(c_cur.detach())
                 traj['prefix_fractions'].append(float(frac))
                 traj['prefix_indices'].append(int(si))
-            if mixture_explorer is not None:
-                if si in mixture_steps:
-                    ctx = gcn.prepare_sampling_context(output['cnn_feature'], current, output['py_ind'])
-                    sampled_feat = ctx['sampled_feat'].detach()
-                    loc, logscale, mode_logits = mixture_explorer(
-                        si, current, c_cur, mean, sampled_feat, float(frac)
-                    )
-                    mode_dist = torch.distributions.Categorical(logits=mode_logits)
-                    mode_idx = mode_dist.sample()
-                    loc_m = _gather_mode_points(loc, mode_idx)
-                    logscale_m = _gather_mode_points(logscale, mode_idx)
-                    eps = _sample_laplace_like(loc_m)
-                    delta_n = loc_m + torch.exp(logscale_m) * eps
-                    # gate=1.0: action = mean + normal_perturbation
-                    action = mean + _contour_normals(current) * delta_n.unsqueeze(-1)
-                    old_log = _mixture_laplace_logprob(
-                        delta_n,
-                        loc,
-                        logscale,
-                        mode_logits,
-                        mode_idx,
-                    )
-                    traj['states'].append(current.detach())
-                    traj['c_states'].append(c_cur.detach())
-                    traj['actions'].append(action.detach())
-                    traj['old_logs'].append(old_log.detach())
-                    traj['fractions'].append(float(frac))
-                    traj['sigmas'].append(float(mixture_init_scale_px / max(float(snake_config.down_ratio), 1.0)))
-                    traj['detail_sigmas'].append(0.0)
-                    traj['outer_indices'].append(int(si))
-                    traj['mixture_sampled_feats'].append(sampled_feat)
-                    traj['mixture_mode_indices'].append(mode_idx.detach())
-                else:
-                    action = mean
-                current = (current + action).detach()
-                total_disp = total_disp + action.detach()
-                traj['polys'].append(current.detach())
-                continue
-            if point_explorer is not None:
-                if si in point_explorer_steps:
-                    ctx = gcn.prepare_sampling_context(output['cnn_feature'], current, output['py_ind'])
-                    sampled_feat = ctx['sampled_feat'].detach()
-                    mu_n, logstd_n = point_explorer(si, current, c_cur, mean, sampled_feat, float(frac))
-                    delta_n = mu_n + torch.exp(logstd_n) * torch.randn_like(mu_n)
-                    # gate=1.0: action = mean + normal_perturbation
-                    action = mean + _contour_normals(current) * delta_n.unsqueeze(-1)
-                    old_log = _point_normal_logprob(delta_n, mu_n, logstd_n)
-                    traj['states'].append(current.detach())
-                    traj['c_states'].append(c_cur.detach())
-                    traj['actions'].append(action.detach())
-                    traj['old_logs'].append(old_log.detach())
-                    traj['fractions'].append(float(frac))
-                    traj['sigmas'].append(float(point_explorer_init_std_px / max(float(snake_config.down_ratio), 1.0)))
-                    traj['detail_sigmas'].append(0.0)
-                    traj['outer_indices'].append(int(si))
-                    traj['point_sampled_feats'].append(sampled_feat)
-                else:
-                    action = mean
-                current = (current + action).detach()
-                total_disp = total_disp + action.detach()
-                traj['polys'].append(current.detach())
-                continue
             if fm_velocity_policy is not None and action_policy == 'fm_velocity':
                 ctx = gcn.prepare_sampling_context(output['cnn_feature'], current, output['py_ind'])
                 sampled_feat = ctx['sampled_feat'].detach()
@@ -2239,12 +1811,77 @@ def main():
                 ret[f'eval_{key}'] = float(torch.cat(values).mean().item())
         return ret
 
+    @torch.no_grad()
+    def _diag_mu_error_correlation():
+        """
+        Diagnostic (per_point_fm_scale only): measure whether the policy's
+        per-point mu_pp correction has learned to be informative about where
+        the deterministic FM rollout actually deviates from GT.
+
+        For each outer step, on the fixed eval set:
+          1. Run the deterministic 5-step FM rollout (no policy).
+          2. At each outer step, query fm_velocity_policy for mu_pp
+             (the per-point offset that WOULD be applied if this step were
+             sampled with the current policy).
+          3. Compute each point's true per-step error: the residual between
+             the deterministic FM prediction and where the point "should"
+             have gone in the extrapolated full-displacement sense
+             (same full_extrap definition used for per-step credit).
+          4. Correlate |mu_pp| (magnitude of intended correction) against
+             the true residual error magnitude, per point, pooled over the
+             eval set. A rising positive correlation over training steps is
+             evidence the small network is learning *where* to correct, not
+             just producing noise.
+
+        Returns a dict with 'diag_corr' (Pearson r) and 'diag_n' (#points).
+        Returns {} if fm_velocity_policy is None or eval_batches is empty.
+        """
+        if fm_velocity_policy is None or not eval_batches or action_policy != 'per_point_fm_scale':
+            return {}
+        mu_abs_all = []
+        err_abs_all = []
+        for eb in eval_batches:
+            out = _manual_context(eb)
+            if out['i_it_py'].numel() == 0:
+                continue
+            current = out['i_it_py'].detach()
+            gt = out['i_gt_py']
+            for si, frac in enumerate(fractions):
+                c_cur = snake_gcn_utils.img_poly_to_can_poly(current)
+                mean = _outer_action_mean(
+                    gcn, out['cnn_feature'], current, c_cur, out['py_ind'], float(frac), ode_steps
+                )
+                ctx = gcn.prepare_sampling_context(out['cnn_feature'], current, out['py_ind'])
+                sampled_feat = ctx['sampled_feat'].detach()
+                mu_pp, _ = fm_velocity_policy(si, current, c_cur, mean, sampled_feat, float(frac))
+                nxt = (current + mean).detach()
+                # Full-extrap true target for this step: where the point would
+                # land if the deterministic residual (nxt - current) were the
+                # complete remaining displacement, compared against GT nearest
+                # point distance at nxt (per-point boundary error in px).
+                gt_np = gt.detach().cpu().numpy()
+                nxt_np = nxt.detach().cpu().numpy()
+                for b in range(nxt_np.shape[0]):
+                    diffs = nxt_np[b][:, None, :] - gt_np[b][None, :, :]
+                    d = np.sqrt((diffs ** 2).sum(-1)).min(axis=1)  # (N,) nearest-GT-point dist, in feature units
+                    err_abs_all.append(d * float(snake_config.down_ratio))
+                mu_abs_all.append(mu_pp.detach().abs().cpu().numpy().reshape(-1))
+                current = nxt
+        if not mu_abs_all:
+            return {}
+        mu_flat = np.concatenate(mu_abs_all)
+        err_flat = np.concatenate(err_abs_all)
+        n = min(mu_flat.shape[0], err_flat.shape[0])
+        mu_flat, err_flat = mu_flat[:n], err_flat[:n]
+        if n < 2 or mu_flat.std() < 1e-9 or err_flat.std() < 1e-9:
+            return {'diag_mu_err_corr': 0.0, 'diag_mu_err_n': int(n)}
+        corr = float(np.corrcoef(mu_flat, err_flat)[0, 1])
+        return {'diag_mu_err_corr': corr, 'diag_mu_err_n': int(n)}
+
     def _save_checkpoint(path: Path, step: int, metrics: Dict):
         _safe_torch_save({
             'state_dict': net_for_load.state_dict(),
             'explorer_state_dict': None if explorer is None else explorer.state_dict(),
-            'point_explorer_state_dict': None if point_explorer is None else point_explorer.state_dict(),
-            'mixture_explorer_state_dict': None if mixture_explorer is None else mixture_explorer.state_dict(),
             'fm_velocity_policy_state_dict': None if fm_velocity_policy is None else fm_velocity_policy.state_dict(),
             'optimizer': optimizer.state_dict(),
             'step': int(step),
@@ -2837,6 +2474,7 @@ def main():
                     frac = traj['fractions'][si]
                     old_log = traj['old_logs'][si]
                     sigma = traj['sigmas'][si]
+                    entropy_bonus = None
                     if action_policy in ('df', 'df_inner_step', 'diffusion_inner_step', 'flow_inner_step'):
                         step_total = int(traj['total_steps'][si].item())
                         _sde_win = tuple(traj.get('sde_win', [0, step_total]))
@@ -2865,46 +2503,7 @@ def main():
                         mean_cur = _outer_action_mean(
                             gcn, output['cnn_feature'], state, c_state, output['py_ind'], frac, ode_steps
                         )
-                        if mixture_explorer is not None:
-                            outer_idx = int(traj.get('outer_indices', [si])[si])
-                            sampled_feat = traj['mixture_sampled_feats'][si]
-                            mode_idx = traj['mixture_mode_indices'][si]
-                            loc, logscale, mode_logits = mixture_explorer(
-                                outer_idx,
-                                state,
-                                c_state,
-                                mean_cur,
-                                sampled_feat,
-                                frac,
-                            )
-                            lp_cur = _structured_mixture_action_logprob(
-                                action,
-                                mean_cur,
-                                state,
-                                loc,
-                                logscale,
-                                mode_logits,
-                                mode_idx,
-                            )
-                        elif point_explorer is not None:
-                            outer_idx = int(traj.get('outer_indices', [si])[si])
-                            sampled_feat = traj['point_sampled_feats'][si]
-                            mu_n, logstd_n = point_explorer(
-                                outer_idx,
-                                state,
-                                c_state,
-                                mean_cur,
-                                sampled_feat,
-                                frac,
-                            )
-                            lp_cur = _point_action_logprob(
-                                action,
-                                mean_cur,
-                                state,
-                                mu_n,
-                                logstd_n,
-                            )
-                        elif action_policy == 'fm_velocity' and fm_velocity_policy is not None:
+                        if action_policy == 'fm_velocity' and fm_velocity_policy is not None:
                             outer_idx = int(traj.get('outer_indices', [si])[si])
                             sampled_feat = traj['geom_sampled_feats'][si]
                             scale_old = traj['fm_velocity_scales'][si]  # (B, 1)
@@ -2932,6 +2531,13 @@ def main():
                             lp_cur = _per_point_fm_scale_logprob(
                                 raw_pp_old, mu_pp, logstd_pp, fm_velocity_policy.max_scale
                             )
+                            # Entropy of the underlying (pre-tanh) Gaussian, as a proxy for
+                            # exploration entropy. Differentiable w.r.t. logstd_pp (network
+                            # output) -> subtracting it from the loss (i.e. rewarding higher
+                            # entropy) counteracts PPO's natural tendency to collapse std to 0.
+                            entropy_bonus = (
+                                0.5 * math.log(2.0 * math.pi * math.e) + logstd_pp
+                            ).mean()
                         elif action_policy in ('band_detail', 'geom_band_detail', 'detail_band'):
                             outer_idx = int(traj.get('outer_indices', [si])[si])
                             d_idx = min(max(outer_idx, 0), len(detail_sigma_feat) - 1)
@@ -3029,8 +2635,7 @@ def main():
                                 mean_ref = _outer_action_mean(
                                     ref_flow, output['cnn_feature'], state, c_state, output['py_ind'], frac, ode_steps
                                 )
-                            if (mixture_explorer is not None or point_explorer is not None
-                                    or action_policy in ('per_point_fm_velocity', 'per_point_fm_scale')):
+                            if action_policy in ('per_point_fm_velocity', 'per_point_fm_scale'):
                                 kl_loss = 0.5 * (mean_cur - mean_ref).pow(2).mean() / max(total_actions, 1)
                             else:
                                 mean_shift_z = _project_geom_z(
@@ -3044,6 +2649,10 @@ def main():
                         loss = policy_loss + kl_beta * kl_loss
                     else:
                         loss = policy_loss
+                    if entropy_bonus is not None and fmv_entropy_weight > 0.0:
+                        # Encourage logstd to stay wide: subtract entropy (maximize it).
+                        # entropy_bonus is already divided by total_actions at its computation site.
+                        loss = loss - fmv_entropy_weight * entropy_bonus
                     if loss.requires_grad:
                         loss.backward()
                     with torch.no_grad():
@@ -3079,10 +2688,6 @@ def main():
             trainable_params = [p for p in net_for_load.parameters() if p.requires_grad]
             if explorer is not None:
                 trainable_params += [p for p in explorer.parameters() if p.requires_grad]
-            if point_explorer is not None:
-                trainable_params += [p for p in point_explorer.parameters() if p.requires_grad]
-            if mixture_explorer is not None:
-                trainable_params += [p for p in mixture_explorer.parameters() if p.requires_grad]
             if fm_velocity_policy is not None:
                 trainable_params += [p for p in fm_velocity_policy.parameters() if p.requires_grad]
             grad_norm = torch.nn.utils.clip_grad_norm_(
@@ -3116,6 +2721,12 @@ def main():
             if eval_metrics and eval_metrics['eval_iou'] > best_eval_iou:
                 best_eval_iou = float(eval_metrics['eval_iou'])
                 _save_checkpoint(ckpt_dir / 'best_iou.pt', step, eval_metrics)
+            if action_policy == 'per_point_fm_scale' and fm_velocity_policy is not None:
+                diag_corr = _diag_mu_error_correlation()
+                if diag_corr:
+                    eval_metrics.update(diag_corr)
+                    print(f"[DIAG-SMART] step={step} mu_err_corr={diag_corr['diag_mu_err_corr']:+.4f} "
+                          f"n={diag_corr['diag_mu_err_n']}", flush=True)
 
         metrics = {
             'step': step,
@@ -3159,45 +2770,6 @@ def main():
             'sigma_difficulty_multiplier': float(sigma_multiplier),
             'lr': lr,
         }
-        if point_explorer is not None:
-            with torch.no_grad():
-                p_step = min(sorted(point_explorer_steps)[0], len(fractions) - 1) if point_explorer_steps else 0
-                p_frac = float(fractions[p_step])
-                p_state = output['i_it_py'].detach()
-                p_c_state = snake_gcn_utils.img_poly_to_can_poly(p_state)
-                p_mean = _outer_action_mean(gcn, output['cnn_feature'], p_state, p_c_state, output['py_ind'], p_frac, ode_steps)
-                p_ctx = gcn.prepare_sampling_context(output['cnn_feature'], p_state, output['py_ind'])
-                p_mu, p_logstd = point_explorer(
-                    p_step, p_state, p_c_state, p_mean, p_ctx['sampled_feat'].detach(), p_frac
-                )
-                metrics.update({
-                    'point_explorer': True,
-                    'point_mu_abs_px': float((p_mu.abs() * float(snake_config.down_ratio)).mean().item()),
-                    'point_std_px': float((torch.exp(p_logstd) * float(snake_config.down_ratio)).mean().item()),
-                    'point_freeze_flow': bool(point_explorer_freeze_flow),
-                })
-        if mixture_explorer is not None:
-            with torch.no_grad():
-                m_step = min(sorted(mixture_steps)[0], len(fractions) - 1) if mixture_steps else 0
-                m_frac = float(fractions[m_step])
-                m_state = output['i_it_py'].detach()
-                m_c_state = snake_gcn_utils.img_poly_to_can_poly(m_state)
-                m_mean = _outer_action_mean(gcn, output['cnn_feature'], m_state, m_c_state, output['py_ind'], m_frac, ode_steps)
-                m_ctx = gcn.prepare_sampling_context(output['cnn_feature'], m_state, output['py_ind'])
-                m_loc, m_logscale, m_logits = mixture_explorer(
-                    m_step, m_state, m_c_state, m_mean, m_ctx['sampled_feat'].detach(), m_frac
-                )
-                m_probs = torch.softmax(m_logits, dim=1)
-                m_entropy = -(m_probs * torch.log(m_probs.clamp_min(1e-8))).sum(dim=1).mean()
-                metrics.update({
-                    'structured_mixture': True,
-                    'mixture_modes': int(mixture_modes),
-                    'mixture_loc_abs_px': float((m_loc.abs() * float(snake_config.down_ratio)).mean().item()),
-                    'mixture_scale_px': float((torch.exp(m_logscale) * float(snake_config.down_ratio)).mean().item()),
-                    'mixture_prob_max_mean': float(m_probs.max(dim=1).values.mean().item()),
-                    'mixture_entropy': float(m_entropy.item()),
-                    'mixture_freeze_flow': bool(mixture_freeze_flow),
-                })
         for key, value in baseline_comps.items():
             metrics[f'baseline_{key}_mean'] = float(value.mean().item())
         if final_score_components:

@@ -403,6 +403,147 @@ def crop_poly_view(img, polys, margin=28):
     return img[y1:y2, x1:x2].copy()
 
 
+# High-contrast role colors for the "clear" visualization style. GT is a solid
+# pure-green, thick line; Pred is a pure-red/magenta thick dashed line with a
+# large dash/gap so the dash pattern survives thumbnail/montage downscaling.
+_CLEAR_GT_COLOR_BGR = (40, 220, 40)      # pure green
+_CLEAR_PRED_COLOR_BGR = (40, 40, 235)    # pure red
+_CLEAR_GT_FILL_BGR = (60, 220, 60)
+_CLEAR_PRED_FILL_BGR = (60, 60, 230)
+
+
+def _draw_legend_box(img, lines_with_colors, x=10, y=10):
+    """Draw a legend with a semi-transparent background box for readability."""
+    pad = 6
+    line_h = 20
+    font_scale = 0.5
+    thickness = 1
+    max_w = 0
+    for text, _ in lines_with_colors:
+        (tw, _th), _ = cv2.getTextSize(text, cv2.FONT_HERSHEY_SIMPLEX, font_scale, thickness)
+        max_w = max(max_w, tw)
+    box_w = max_w + 3 * pad + 24
+    box_h = pad * 2 + line_h * len(lines_with_colors)
+    overlay = img.copy()
+    cv2.rectangle(overlay, (x, y), (x + box_w, y + box_h), (0, 0, 0), thickness=-1)
+    cv2.addWeighted(overlay, 0.55, img, 0.45, 0, dst=img)
+    for i, (text, color) in enumerate(lines_with_colors):
+        cy = y + pad + line_h * i + line_h // 2
+        cv2.line(img, (x + pad, cy), (x + pad + 20, cy), color, 3, lineType=cv2.LINE_AA)
+        draw_text_with_outline(img, text, (x + pad + 26, cy + 5), font_scale=font_scale, thickness=thickness)
+
+
+def _save_visual_clear(sample_dir, img, gt_polys, pred_polys, per_contour_iou, matched_pred=None):
+    """Paper-style overlay: GT solid green vs Pred dashed red, plus a
+    translucent fill version where overlap reads as a blended color."""
+    if matched_pred is None:
+        matched_pred = list(range(min(len(gt_polys), len(pred_polys))))
+
+    # 1) Line overlay: thick solid green GT, thick dashed red Pred with a
+    # large dash/gap so it stays legible after resize.
+    line_vis = img.copy()
+    for poly in gt_polys:
+        pts = np.round(poly).astype(np.int32)
+        if len(pts) >= 2:
+            cv2.polylines(line_vis, [pts], True, _CLEAR_GT_COLOR_BGR, 3, lineType=cv2.LINE_AA)
+    for poly in pred_polys:
+        pts = np.round(poly).astype(np.int32)
+        if len(pts) >= 2:
+            draw_dashed_line_poly(line_vis, pts, _CLEAR_PRED_COLOR_BGR, thickness=3, dash_len=14, gap_len=10)
+
+    for gt_idx, iou in enumerate(per_contour_iou):
+        pred_idx = int(matched_pred[gt_idx]) if gt_idx < len(matched_pred) else -1
+        if pred_idx < 0 or pred_idx >= len(pred_polys):
+            continue
+        poly = np.asarray(pred_polys[pred_idx], dtype=np.float32)
+        if poly.ndim != 2 or poly.shape[0] == 0:
+            continue
+        cx, cy = int(poly[:, 0].mean()), int(poly[:, 1].mean())
+        draw_text_with_outline(line_vis, f'{iou * 100:.1f}%', (cx - 22, cy), font_scale=0.42, thickness=1)
+
+    _draw_legend_box(
+        line_vis,
+        [('GT (solid)', _CLEAR_GT_COLOR_BGR), ('Pred (dashed)', _CLEAR_PRED_COLOR_BGR)],
+    )
+    cv2.imwrite(os.path.join(sample_dir, 'overlay.png'), line_vis)
+
+    # 2) Translucent fill version: GT filled green, Pred filled red, overlap
+    # blends to yellow/olive so the match region is visible at a glance.
+    fill_base = img.copy()
+    gt_mask = np.zeros(img.shape[:2], dtype=np.uint8)
+    pred_mask = np.zeros(img.shape[:2], dtype=np.uint8)
+    for poly in gt_polys:
+        pts = np.round(poly).astype(np.int32)
+        if len(pts) >= 3:
+            cv2.fillPoly(gt_mask, [pts], 255)
+    for poly in pred_polys:
+        pts = np.round(poly).astype(np.int32)
+        if len(pts) >= 3:
+            cv2.fillPoly(pred_mask, [pts], 255)
+
+    fill_vis = fill_base.astype(np.float32)
+    alpha = 0.42
+    gt_only = (gt_mask > 0) & (pred_mask == 0)
+    pred_only = (pred_mask > 0) & (gt_mask == 0)
+    overlap = (gt_mask > 0) & (pred_mask > 0)
+    color_arr = np.array(_CLEAR_GT_FILL_BGR, dtype=np.float32)
+    fill_vis[gt_only] = fill_vis[gt_only] * (1 - alpha) + color_arr * alpha
+    color_arr = np.array(_CLEAR_PRED_FILL_BGR, dtype=np.float32)
+    fill_vis[pred_only] = fill_vis[pred_only] * (1 - alpha) + color_arr * alpha
+    overlap_color = np.array((45, 215, 225), dtype=np.float32)  # yellow-ish blend
+    fill_vis[overlap] = fill_vis[overlap] * (1 - alpha) + overlap_color * alpha
+    fill_vis = np.clip(fill_vis, 0, 255).astype(np.uint8)
+
+    for poly in gt_polys:
+        pts = np.round(poly).astype(np.int32)
+        if len(pts) >= 2:
+            cv2.polylines(fill_vis, [pts], True, _CLEAR_GT_COLOR_BGR, 2, lineType=cv2.LINE_AA)
+    for poly in pred_polys:
+        pts = np.round(poly).astype(np.int32)
+        if len(pts) >= 2:
+            draw_dashed_line_poly(fill_vis, pts, _CLEAR_PRED_COLOR_BGR, thickness=2, dash_len=14, gap_len=10)
+
+    _draw_legend_box(
+        fill_vis,
+        [
+            ('GT only', tuple(int(c) for c in _CLEAR_GT_FILL_BGR)),
+            ('Pred only', tuple(int(c) for c in _CLEAR_PRED_FILL_BGR)),
+            ('Overlap', (45, 215, 225)),
+        ],
+    )
+    cv2.imwrite(os.path.join(sample_dir, 'overlay_fill.png'), fill_vis)
+
+    # Cropped tight views per matched GT/Pred pair, useful for zooming into
+    # small structures in a montage.
+    pair_dir = os.path.join(sample_dir, 'pairs')
+    os.makedirs(pair_dir, exist_ok=True)
+    for gt_idx, gt_poly in enumerate(gt_polys):
+        pred_idx = int(matched_pred[gt_idx]) if gt_idx < len(matched_pred) else -1
+        if pred_idx < 0 or pred_idx >= len(pred_polys):
+            continue
+        pair_vis = img.copy()
+        gt_pts = np.round(gt_poly).astype(np.int32)
+        pred_pts = np.round(pred_polys[pred_idx]).astype(np.int32)
+        if len(gt_pts) >= 2:
+            cv2.polylines(pair_vis, [gt_pts], True, _CLEAR_GT_COLOR_BGR, 2, lineType=cv2.LINE_AA)
+        if len(pred_pts) >= 2:
+            draw_dashed_line_poly(pair_vis, pred_pts, _CLEAR_PRED_COLOR_BGR, thickness=2, dash_len=12, gap_len=8)
+        crop = crop_poly_view(pair_vis, [gt_poly, pred_polys[pred_idx]])
+        iou = float(per_contour_iou[gt_idx]) if gt_idx < len(per_contour_iou) else 0.0
+        out_name = f'gt_{gt_idx:03d}_iou_{iou:.3f}.png'
+        cv2.imwrite(os.path.join(pair_dir, out_name), crop)
+
+
+def draw_dashed_line_poly(img, pts, color, thickness=2, dash_len=14, gap_len=10):
+    n = len(pts)
+    if n < 2:
+        return
+    for i in range(n):
+        p1 = pts[i]
+        p2 = pts[(i + 1) % n]
+        draw_dashed_line(img, p1, p2, color, thickness=thickness, dash_len=dash_len, gap_len=gap_len)
+
+
 def save_visual(
     sample_dir,
     img,
@@ -416,6 +557,9 @@ def save_visual(
 ):
     os.makedirs(sample_dir, exist_ok=True)
     vis_style = os.environ.get('VIS_STYLE', '').strip().lower()
+    if vis_style in ('clear', 'clear_gt_pred', 'paper'):
+        _save_visual_clear(sample_dir, img, gt_polys, pred_polys, per_contour_iou, matched_pred)
+        return
     if vis_style in ('old', 'old_iou', 'legacy', 'very_old', 'old_blue_gt', 'legacy_blue_gt'):
         gt_color = (255, 0, 0) if vis_style in ('very_old', 'old_blue_gt', 'legacy_blue_gt') else (0, 255, 0)
         init_color = (0, 255, 255)
@@ -781,7 +925,25 @@ def eval_sample(model, device, batch, ode_steps=10, save_visuals=False, sample_d
             else:
                 py_ind = torch.cat([torch.full((num_contours,), i, dtype=torch.long, device=device) for i in range(batch_size)])
 
-            if getattr(core.gcn, 'use_iterative_refinement', False):
+            use_curve_path = bool(getattr(cfg, 'use_curve_inference', False))
+            if use_curve_path and hasattr(core.gcn, 'sample_disp_curve'):
+                curve_alpha = float(getattr(cfg, 'curve_alpha', 2.0))
+                curve_steps = int(getattr(cfg, 'curve_steps', 20))
+                curve_s_max = float(getattr(cfg, 'curve_s_max', 0.97))
+                curve_resample = bool(getattr(cfg, 'curve_resample_feat', True))
+                disp = core.gcn.sample_disp_curve(
+                    cnn_feature,
+                    i_it_py,
+                    c_it_py,
+                    py_ind,
+                    alpha=curve_alpha,
+                    steps=curve_steps,
+                    noise_scale=None,
+                    batch=batch,
+                    s_max=curve_s_max,
+                    resample_feat=curve_resample,
+                )
+            elif getattr(core.gcn, 'use_iterative_refinement', False):
                 iter_steps = int(getattr(cfg, 'iterative_num_steps', 3))
                 use_rich_infer_schedule = bool(getattr(cfg, 'v4_9_use_rich_infer_schedule', False))
                 if use_rich_infer_schedule and hasattr(core.gcn, '_progress_targets_to_residual_fractions'):

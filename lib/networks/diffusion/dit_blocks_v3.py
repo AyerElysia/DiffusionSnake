@@ -10,7 +10,7 @@ Key Upgrades:
 import math
 import torch
 import torch.nn as nn
-from typing import Optional, Tuple
+from typing import Optional
 
 from .dit_blocks_v2 import (
     RMSNorm,
@@ -215,6 +215,10 @@ class DiTBlockV3(nn.Module):
         nn.init.constant_(self.adaLN_modulation[-1].weight, 0)
         nn.init.constant_(self.adaLN_modulation[-1].bias, 0)
 
+        # Internal KV cache: set via set_kv_cache(), cleared via clear_kv_cache()
+        self._cached_k: Optional[torch.Tensor] = None
+        self._cached_v: Optional[torch.Tensor] = None
+
     def _self_attention(self, x: torch.Tensor) -> torch.Tensor:
         N, P, D = x.shape
         H = self.num_heads
@@ -233,38 +237,69 @@ class DiTBlockV3(nn.Module):
         return self.sa_out_proj(out)
 
     def _cross_attention(self, x: torch.Tensor, context: torch.Tensor) -> torch.Tensor:
+        """Cross-attention.  Reuses internal KV cache when available."""
         N, P, D = x.shape
-        L = context.shape[1]
-        H = self.num_heads
-        hd = self.head_dim
+        H, hd = self.num_heads, self.head_dim
 
         q = self.cross_q_proj(x).view(N, P, H, hd).transpose(1, 2)
-        k = self.cross_k_proj(context).view(N, L, H, hd).transpose(1, 2)
-        v = self.cross_v_proj(context).view(N, L, H, hd).transpose(1, 2)
-
         q = self.qk_norm(q)
-        k = self.qk_norm(k)
+
+        if self._cached_k is not None and self._cached_v is not None:
+            k = self._cached_k
+            v = self._cached_v
+        else:
+            L = context.shape[1]
+            k = self.cross_k_proj(context).view(N, L, H, hd).transpose(1, 2)
+            v = self.cross_v_proj(context).view(N, L, H, hd).transpose(1, 2)
+            k = self.qk_norm(k)
 
         attn = (q @ k.transpose(-2, -1)) * self.scale
         attn = attn.softmax(dim=-1)
         out = (attn @ v).transpose(1, 2).contiguous().view(N, P, D)
         return self.ca_out_proj(out)
 
-    def forward(self, x: torch.Tensor, image_context: torch.Tensor, t_emb: torch.Tensor) -> torch.Tensor:
+    def set_kv_cache(self, context: torch.Tensor) -> None:
+        """Pre-compute and store K/V from context for subsequent forward calls."""
+        N, L, _ = context.shape
+        H, hd = self.num_heads, self.head_dim
+        k = self.cross_k_proj(context).view(N, L, H, hd).transpose(1, 2)
+        v = self.cross_v_proj(context).view(N, L, H, hd).transpose(1, 2)
+        self._cached_k = self.qk_norm(k)
+        self._cached_v = v
+
+    def clear_kv_cache(self) -> None:
+        """Release the stored KV cache."""
+        self._cached_k = None
+        self._cached_v = None
+
+    def forward(
+        self,
+        x: torch.Tensor,
+        image_context: torch.Tensor,
+        t_emb: torch.Tensor,
+    ) -> torch.Tensor:
+        """Forward pass.
+
+        Args:
+            x: point token sequence (N, P, D).
+            image_context: image context tokens (N, L, D). Ignored when
+                internal KV cache is active (set via :meth:`set_kv_cache`).
+            t_emb: time/condition embedding (N, D).
+        """
         mod = self.adaLN_modulation(t_emb)
         (shift_sa, scale_sa, gate_sa,
          shift_ca, scale_ca, gate_ca,
          shift_ff, scale_ff, gate_ff) = mod.chunk(9, dim=1)
 
-        # 1. Self-Attention (Coordinate internally first - SAME AS V2)
+        # 1. Self-Attention
         x_sa = modulate(self.norm1(x), shift_sa, scale_sa)
         x = x + gate_sa.unsqueeze(1) * self._self_attention(x_sa)
 
-        # 2. Cross-Attention (Interact with Image Context - SAME AS V2)
+        # 2. Cross-Attention — _cross_attention auto-uses internal KV cache
         x_ca = modulate(self.norm2(x), shift_ca, scale_ca)
         x = x + gate_ca.unsqueeze(1) * self._cross_attention(x_ca, image_context)
 
-        # 3. FFN (No local_smooth - SAME AS V2)
+        # 3. FFN
         x_ff = modulate(self.norm3(x), shift_ff, scale_ff)
         ffn_out = self.mlp(x_ff)
         if self.ffn_moe is not None:

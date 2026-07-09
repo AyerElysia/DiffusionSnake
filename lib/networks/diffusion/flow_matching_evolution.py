@@ -58,6 +58,7 @@ class FlowMatchingEvolution(nn.Module):
         self.loss_weight = loss_weight
         self.loss_type = loss_type
         self.ode_steps = ode_steps
+        self._use_s_cond = bool(getattr(global_cfg, 'flow_2d_s_conditioning', False))
         self.use_iterative_refinement = bool(
             getattr(global_cfg, 'use_iterative_refinement', False)
             or getattr(global_cfg, 'use_dit_v3_4', False)
@@ -223,6 +224,7 @@ class FlowMatchingEvolution(nn.Module):
                   f"moe_expert_type={_moe_expert_type}, "
                   f"moe_expert_hidden={_moe_expert_hidden}, "
                   f"latent_loop={_latent_loop}, latent_loop_steps={_latent_loop_steps}, "
+                  f"s_cond={self._use_s_cond}, "
                   f"dit_ffn_moe={_dit_ffn_moe}, dit_ffn_moe_experts={_dit_ffn_moe_experts}, "
                   f"dit_ffn_moe_top_k={_dit_ffn_moe_top_k}, "
                   f"ODE steps={ode_steps})")
@@ -256,6 +258,7 @@ class FlowMatchingEvolution(nn.Module):
                 moe_expert_hidden_dim=_moe_expert_hidden,
                 use_latent_loop=_latent_loop,
                 latent_loop_steps=_latent_loop_steps,
+                use_s_conditioning=self._use_s_cond,
                 use_ffn_moe=_dit_ffn_moe,
                 ffn_moe_num_experts=_dit_ffn_moe_experts,
                 ffn_moe_top_k=_dit_ffn_moe_top_k,
@@ -476,7 +479,10 @@ class FlowMatchingEvolution(nn.Module):
         self._optimal_cyclic_align = bool(getattr(global_cfg, 'v3_7_optimal_cyclic_align', False))
         # V3.7: per-step ODE smoothing
         self._ode_smooth_k = int(getattr(global_cfg, 'v3_7_ode_smooth_k', 0))
-        # V6p: ODE solver selection (euler/heun — Heun's method gives 2nd-order accuracy)
+        # V6p: ODE solver selection
+        # 'euler'  — 1st-order Euler (default)
+        # 'heun'   — 2nd-order Runge-Kutta predictor-corrector (2x NFE per step)
+        # 'ab2'    — 2nd-order Adams-Bashforth (1x NFE per step, same cost as Euler)
         self._ode_solver = str(getattr(global_cfg, 'v3_7_ode_solver', 'euler')).strip().lower()
         # V3.7: spectral loss decomposition
         self._spectral_loss_k = int(getattr(global_cfg, 'v3_7_spectral_loss_k', 0))
@@ -564,6 +570,10 @@ class FlowMatchingEvolution(nn.Module):
         self._geom_infer_resample_per_ode = bool(
             getattr(global_cfg, 'flow_geom_infer_resample_per_ode_step', False)
         )
+        self._geom_position_flow = bool(getattr(global_cfg, 'flow_geom_position_flow', False))
+        self._geom_seg_flow = bool(getattr(global_cfg, 'flow_geom_seg_flow', False))
+        self._geom_t_init = float(getattr(global_cfg, 'flow_geom_t_init', 0.5))
+        self._geom_noise_scale = float(getattr(global_cfg, 'flow_geom_noise_scale', 1.0))
         self._geom_x0_jitter = float(getattr(global_cfg, 'flow_geom_x0_jitter', 0.0))
         self._geom_xt_jitter_rel = float(getattr(global_cfg, 'flow_geom_xt_jitter_rel', 0.0))
 
@@ -652,6 +662,32 @@ class FlowMatchingEvolution(nn.Module):
         span_y = polys[..., 1].amax(dim=1) - polys[..., 1].amin(dim=1)
         contour_scale = torch.maximum(span_x, span_y).clamp_min(1.0)
         return contour_scale.view(-1, 1, 1)
+
+    @staticmethod
+    def compute_centroid(poly: torch.Tensor) -> torch.Tensor:
+        return poly.mean(dim=1, keepdim=True)
+
+    def normalize_position(
+        self,
+        poly: torch.Tensor,
+        centroid: torch.Tensor,
+        contour_scale: torch.Tensor,
+    ) -> torch.Tensor:
+        return (poly - centroid.to(poly.device, poly.dtype)) / contour_scale.to(poly.device, poly.dtype)
+
+    def denormalize_position(
+        self,
+        pos_centered: torch.Tensor,
+        centroid: torch.Tensor,
+        contour_scale: torch.Tensor,
+    ) -> torch.Tensor:
+        return (
+            pos_centered * contour_scale.to(pos_centered.device, pos_centered.dtype)
+            + centroid.to(pos_centered.device, pos_centered.dtype)
+        )
+
+    def _get_geom_t_init(self) -> float:
+        return min(max(float(self._geom_t_init), 1e-4), 1.0 - 1e-4)
 
     def normalize_target_disp(self, disp_raw: torch.Tensor, contour_scale: torch.Tensor) -> torch.Tensor:
         if self._use_contour_norm:
@@ -1068,6 +1104,69 @@ class FlowMatchingEvolution(nn.Module):
         freq[:, ~mask, :] = 0
         return torch.fft.irfft(freq, n=n, dim=1)
 
+    # ------------------------------------------------------------------
+    # Internal KV-cache helpers — store cross-attn K/V inside each
+    # DiTBlockV3 so the normal denoiser.forward() path reuses them.
+    # ------------------------------------------------------------------
+
+    def _set_denoiser_kv_cache(
+        self,
+        cnn_feature: torch.Tensor,
+        sampled_feat: torch.Tensor,
+        py_ind=None,
+        detail_feat=None,
+    ) -> bool:
+        """Pre-compute and store K/V in all DiTBlockV3 layers.
+
+        Returns True if cache was successfully set, False otherwise.
+        """
+        from .dit_blocks_v3 import DiTBlockV3
+
+        if not hasattr(self.denoiser, 'dit_layers'):
+            return False
+        if not any(isinstance(l, DiTBlockV3) for l in self.denoiser.dit_layers):
+            return False
+
+        param_dtype = next(self.denoiser.parameters()).dtype
+        cnn_feature = cnn_feature.to(param_dtype)
+        sampled_feat = sampled_feat.to(param_dtype)
+
+        if cnn_feature.dim() == 3:
+            cnn_feature = cnn_feature.unsqueeze(0)
+
+        n_contours = sampled_feat.shape[0]
+        global_ctx = self.denoiser.global_compressor(cnn_feature)
+        if py_ind is not None:
+            global_ctx = global_ctx[py_ind]
+        elif global_ctx.shape[0] != n_contours:
+            if global_ctx.shape[0] == 1:
+                global_ctx = global_ctx.expand(n_contours, -1, -1)
+
+        local_ctx = self.denoiser.local_proj(sampled_feat.transpose(1, 2))
+
+        if (
+            getattr(self.denoiser, 'use_detail_context', False)
+            and detail_feat is not None
+        ):
+            detail_feat = detail_feat.to(param_dtype)
+            detail_ctx = detail_feat.transpose(1, 2)
+            local_ctx = local_ctx + self.denoiser.detail_local_proj(detail_ctx)
+
+        for i, layer in enumerate(self.denoiser.dit_layers):
+            if isinstance(layer, DiTBlockV3):
+                context = global_ctx if (i % 2 == 0) else local_ctx
+                layer.set_kv_cache(context)
+        return True
+
+    def _clear_denoiser_kv_cache(self) -> None:
+        """Release KV cache from all DiTBlockV3 layers."""
+        from .dit_blocks_v3 import DiTBlockV3
+
+        if hasattr(self.denoiser, 'dit_layers'):
+            for layer in self.denoiser.dit_layers:
+                if isinstance(layer, DiTBlockV3):
+                    layer.clear_kv_cache()
+
     def predict_velocity(
         self,
         cnn_feature,
@@ -1081,17 +1180,19 @@ class FlowMatchingEvolution(nn.Module):
         contour_scale: Optional[torch.Tensor] = None,
         x_self_cond: Optional[torch.Tensor] = None,
         locate_context: Optional[Dict[str, torch.Tensor]] = None,
+        s: Optional[torch.Tensor] = None,
     ):
+        """预测速度场 V_t。
+
+        KV cache is now managed internally by DiTBlockV3 (set_kv_cache /
+        clear_kv_cache).  The normal denoiser.forward() path is always taken;
+        cached K/V tensors in each block are reused automatically.
         """
-        包装接口：预测速度场 V_t
-        """
-        N = x_t.size(0)
         adj = snake_gcn_utils.get_adj_ind(snake_config.adj_num, i_it_py.size(1), i_it_py.device)
-        
-        # 将 t_[0,1] 转换到类似于 1~1000 以供 time_embedder 分辨
+
+        # t ∈ [0,1] → [0,1000] for the time embedder
         t_scaled = t_continuous * 1000.0
-        
-        # Flow denoiser 核心调用，务必传入 sampled_feat
+
         denoiser_kwargs = {}
         if locate_context:
             denoiser_kwargs.update({
@@ -1099,6 +1200,8 @@ class FlowMatchingEvolution(nn.Module):
                 'locate_global_ctx': locate_context.get('locate_global_ctx', None),
                 'locate_only': bool(locate_context.get('locate_only', False)),
             })
+        if self._use_s_cond and s is not None:
+            denoiser_kwargs['s'] = s
 
         v_pred, L = self.denoiser(
             cnn_feature,
@@ -1365,6 +1468,7 @@ class FlowMatchingEvolution(nn.Module):
         step_mode: Optional[str] = None,
         noise_level: Optional[float] = None,
         sde_type: Optional[str] = None,
+        s: Optional[torch.Tensor] = None,
     ):
         if sampled_feat is None or contour_scale is None or (self._use_detail_context and detail_feat is None):
             ctx = self.prepare_sampling_context(cnn_feature, i_it_py, py_ind)
@@ -1390,6 +1494,7 @@ class FlowMatchingEvolution(nn.Module):
             contour_scale=contour_scale_flat,
             x_self_cond=x_self_cond,
             locate_context=locate_context,
+            s=s,
         )
 
         next_self_cond = None
@@ -1412,6 +1517,7 @@ class FlowMatchingEvolution(nn.Module):
                 contour_scale=contour_scale_flat,
                 x_self_cond=next_self_cond,
                 locate_context=locate_context,
+                s=s,
             )
             step_velocity = (v_pred + v_pred2) * 0.5
             step_mean = x_t + step_velocity * dt
@@ -1436,25 +1542,19 @@ class FlowMatchingEvolution(nn.Module):
                 generator=generator,
             )
         elif step_mode in ('flow_grpo', 'flowgrpo'):
-            if action_std <= 0:
-                prev_sample, log_prob, step_mean, std = self._gaussian_step_with_logprob(
-                    step_mean,
-                    action_std=0.0,
-                    dt=dt,
-                    prev_sample=prev_sample,
-                    generator=generator,
-                )
-            else:
-                prev_sample, log_prob, step_mean, std = self._flow_grpo_step_with_logprob(
-                    sample=x_t,
-                    model_output=step_velocity,
-                    t_value=t_float,
-                    total_steps=total_steps,
-                    noise_level=self._step_noise_level if noise_level is None else float(noise_level),
-                    sde_type=self._step_sde_type if sde_type is None else str(sde_type),
-                    prev_sample=prev_sample,
-                    generator=generator,
-                )
+            # flow_grpo noise is controlled by noise_level (not action_std).
+            # Always call _flow_grpo_step_with_logprob so log_prob actually
+            # depends on v_theta and KL can be non-zero.
+            prev_sample, log_prob, step_mean, std = self._flow_grpo_step_with_logprob(
+                sample=x_t,
+                model_output=step_velocity,
+                t_value=t_float,
+                total_steps=total_steps,
+                noise_level=self._step_noise_level if noise_level is None else float(noise_level),
+                sde_type=self._step_sde_type if sde_type is None else str(sde_type),
+                prev_sample=prev_sample,
+                generator=generator,
+            )
         else:
             raise ValueError(f'Unsupported step_with_logprob mode: {step_mode}')
         return prev_sample, log_prob, step_mean, std, next_self_cond
@@ -1475,6 +1575,7 @@ class FlowMatchingEvolution(nn.Module):
         step_mode: Optional[str] = None,
         noise_level: Optional[float] = None,
         sde_type: Optional[str] = None,
+        s: Optional[torch.Tensor] = None,
     ) -> Dict[str, Any]:
         if steps is None:
             steps = self.ode_steps
@@ -1503,13 +1604,13 @@ class FlowMatchingEvolution(nn.Module):
             end_max = int(window_range[1]) if isinstance(window_range, (tuple, list)) and len(window_range) > 1 else steps
             end_max = max(end_max, window_size)
             if end_max <= start_min + window_size:
-                s = max(0, min(start_min, max(steps - window_size, 0)))
+                window_start = max(0, min(start_min, max(steps - window_size, 0)))
             else:
-                s = np.random.randint(start_min, end_max - window_size + 1)
-            e = min(s + window_size, steps)
+                window_start = np.random.randint(start_min, end_max - window_size + 1)
+            window_end = min(window_start + window_size, steps)
         else:
-            s = 0
-            e = steps
+            window_start = 0
+            window_end = steps
 
         latents_seq = []
         log_probs = []
@@ -1524,9 +1625,9 @@ class FlowMatchingEvolution(nn.Module):
 
         for idx in range(steps):
             t_value = idx * dt
-            if idx == s:
+            if idx == window_start:
                 latents_seq.append(x.detach())
-            in_policy_window = idx >= s and idx < e
+            in_policy_window = idx >= window_start and idx < window_end
 
             x_prev, log_prob, _, _, next_self_cond = self.step_with_logprob(
                 cnn_feature,
@@ -1547,6 +1648,7 @@ class FlowMatchingEvolution(nn.Module):
                 step_mode=step_mode,
                 noise_level=noise_level,
                 sde_type=sde_type,
+                s=s,
             )
 
             if in_policy_window:
@@ -1596,6 +1698,7 @@ class FlowMatchingEvolution(nn.Module):
         steps=None,
         noise_scale=None,
         locate_context: Optional[Dict[str, torch.Tensor]] = None,
+        s: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         if steps is None:
             steps = self.ode_steps
@@ -1605,6 +1708,7 @@ class FlowMatchingEvolution(nn.Module):
 
         device = i_it_py.device
         N = i_it_py.size(0)
+        h, w = cnn_feature.size(2), cnn_feature.size(3)
         contour_scale = self.compute_contour_scale(i_it_py)
         if self._use_latent_policy:
             if self._latent_policy_eval_mode in ('ranker', 'selector', 'select'):
@@ -1628,24 +1732,62 @@ class FlowMatchingEvolution(nn.Module):
         dt = 1.0 / steps
 
         use_heun = (self._ode_solver == 'heun')
+        use_ab2  = (self._ode_solver == 'ab2')
         # V6r: self-conditioning state — starts at zero, updated each step
         x_self_cond = torch.zeros_like(x_t) if self._use_self_conditioning else None
+        # Adams-Bashforth 2nd-order: store previous velocity for multi-step correction
+        v_prev: Optional[torch.Tensor] = None
+
+        # KV-cache: pre-compute cross-attention K/V once when features are fixed.
+        # Stored inside each DiTBlockV3; the normal denoiser.forward() path
+        # reuses them automatically.
+        # Skipped when resample_feat_at_xt is on (features change per step).
+        # Set env FLOW_DISABLE_KV_CACHE=1 to force-disable for ablation.
+        _has_kv_cache = False
+        _kv_disabled = os.environ.get('FLOW_DISABLE_KV_CACHE', '').strip() in ('1', 'true', 'yes')
+        if (
+            not _kv_disabled
+            and not self._resample_feat_at_xt
+            and locate_context is None
+        ):
+            with torch.no_grad():
+                _has_kv_cache = self._set_denoiser_kv_cache(
+                    cnn_feature, sampled_feat, py_ind=py_ind, detail_feat=detail_feat
+                )
 
         for i in range(steps):
             t_val = i * dt
             t_tensor = torch.full((N,), t_val, device=device, dtype=torch.float32)
+            if self._resample_feat_at_xt:
+                with torch.no_grad():
+                    xt_disp_raw = self.denormalize_pred_disp(x_t, contour_scale)
+                    cur_contour = (i_it_py + xt_disp_raw).detach()
+                    cur_sampled_feat = snake_gcn_utils.get_gcn_feature(cnn_feature, cur_contour, py_ind, h, w)
+                    cur_detail_feat = self.sample_detail_features(
+                        cnn_feature,
+                        cur_contour,
+                        py_ind,
+                        h,
+                        w,
+                        sampled_feat=cur_sampled_feat,
+                        contour_scale=contour_scale,
+                    )
+            else:
+                cur_sampled_feat = sampled_feat
+                cur_detail_feat = detail_feat
             v_pred, _ = self.predict_velocity(
                 cnn_feature,
                 i_it_py,
                 c_it_py,
-                sampled_feat,
-                detail_feat,
+                cur_sampled_feat,
+                cur_detail_feat,
                 py_ind,
                 x_t,
                 t_tensor,
                 contour_scale=contour_scale_flat,
                 x_self_cond=x_self_cond,
                 locate_context=locate_context,
+                s=s,
             )
 
             # Update self-conditioning with current x1 estimate
@@ -1653,29 +1795,58 @@ class FlowMatchingEvolution(nn.Module):
                 x_self_cond = (x_t + (1.0 - t_val) * v_pred).detach()
 
             if use_heun and i < steps - 1:
-                # Heun's method (2nd-order Runge-Kutta): predictor-corrector
+                # Heun's method (2nd-order Runge-Kutta): predictor-corrector, 2x NFE
                 x_pred = x_t + v_pred * dt
                 t_next = torch.full((N,), t_val + dt, device=device, dtype=torch.float32)
+                if self._resample_feat_at_xt:
+                    with torch.no_grad():
+                        xt_disp_pred = self.denormalize_pred_disp(x_pred, contour_scale)
+                        pred_contour = (i_it_py + xt_disp_pred).detach()
+                        pred_sampled_feat = snake_gcn_utils.get_gcn_feature(cnn_feature, pred_contour, py_ind, h, w)
+                        pred_detail_feat = self.sample_detail_features(
+                            cnn_feature,
+                            pred_contour,
+                            py_ind,
+                            h,
+                            w,
+                            sampled_feat=pred_sampled_feat,
+                            contour_scale=contour_scale,
+                        )
+                else:
+                    pred_sampled_feat = sampled_feat
+                    pred_detail_feat = detail_feat
                 v_pred2, _ = self.predict_velocity(
                     cnn_feature,
                     i_it_py,
                     c_it_py,
-                    sampled_feat,
-                    detail_feat,
+                    pred_sampled_feat,
+                    pred_detail_feat,
                     py_ind,
                     x_pred,
                     t_next,
                     contour_scale=contour_scale_flat,
-                    x_self_cond=x_self_cond,  # use updated self-cond for corrector step
+                    x_self_cond=x_self_cond,
                     locate_context=locate_context,
+                    s=s,
                 )
                 x_t = x_t + (v_pred + v_pred2) * 0.5 * dt
+            elif use_ab2 and v_prev is not None:
+                # Adams-Bashforth 2nd-order: 2nd-order accuracy at 1x NFE per step.
+                # x_{n+1} = x_n + dt * (3/2 * v_n - 1/2 * v_{n-1})
+                x_t = x_t + dt * (1.5 * v_pred - 0.5 * v_prev)
             else:
+                # Euler step (also used for the first AB2 step to bootstrap v_prev)
                 x_t = x_t + v_pred * dt
+
+            v_prev = v_pred
 
             # V3.7: per-step ODE Fourier smoothing
             if self._ode_smooth_k > 0:
                 x_t = self.fourier_smooth(x_t, self._ode_smooth_k)
+
+        # Release KV cache stored in DiTBlockV3 instances
+        if _has_kv_cache:
+            self._clear_denoiser_kv_cache()
 
         disp = self.denormalize_pred_disp(x_t, contour_scale)
         return self.clamp_pred_disp(disp, i_it_py)
@@ -1689,6 +1860,7 @@ class FlowMatchingEvolution(nn.Module):
         steps=None,
         noise_scale=None,
         locate_context: Optional[Dict[str, torch.Tensor]] = None,
+        s: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         if steps is None:
             steps = self.ode_steps
@@ -1698,14 +1870,79 @@ class FlowMatchingEvolution(nn.Module):
         h, w = cnn_feature.size(2), cnn_feature.size(3)
         contour_scale = self.compute_contour_scale(i_it_py)
         contour_scale_flat = contour_scale.view(-1)
-        x_t = torch.zeros_like(i_it_py)
+        geom_position_flow = self._geom_position_flow
+        geom_seg_flow = geom_position_flow and self._geom_seg_flow
+        centroid = None
+        if geom_seg_flow:
+            centroid = self.compute_centroid(i_it_py)
+            x_t = torch.randn_like(i_it_py) * self._geom_noise_scale
+        elif geom_position_flow:
+            centroid = self.compute_centroid(i_it_py)
+            x_t = self.normalize_position(i_it_py, centroid, contour_scale)
+        else:
+            x_t = torch.zeros_like(i_it_py)
         if self._geom_x0_jitter > 0:
             x_t = x_t + torch.randn_like(i_it_py) * self._geom_x0_jitter
+
+        if geom_seg_flow:
+            steps = max(int(steps), 2)
+            t_init = self._get_geom_t_init()
+            front_steps = int(round(float(steps) * t_init))
+            front_steps = min(max(front_steps, 1), steps - 1)
+            back_steps = max(steps - front_steps, 1)
+            segment_specs = (
+                (front_steps, 1.0 / float(front_steps), True),
+                (back_steps, 1.0 / float(back_steps), False),
+            )
+            for seg_steps, dt_seg, use_init_feat in segment_specs:
+                for i in range(seg_steps):
+                    t_val = i * dt_seg
+                    if use_init_feat:
+                        cur = i_it_py
+                    else:
+                        cur = self.denormalize_position(
+                            x_t, centroid, contour_scale
+                        )
+                    sampled_feat = snake_gcn_utils.get_gcn_feature(cnn_feature, cur, py_ind, h, w)
+                    detail_feat = self.sample_detail_features(
+                        cnn_feature,
+                        cur,
+                        py_ind,
+                        h,
+                        w,
+                        sampled_feat=sampled_feat,
+                        contour_scale=contour_scale,
+                    )
+                    t_tensor = torch.full((N,), t_val, device=device, dtype=torch.float32)
+                    # Segmented position flow uses per-segment time embeddings: each bridge is a local [0, 1] ODE.
+                    v_pred, _ = self.predict_velocity(
+                        cnn_feature,
+                        i_it_py,
+                        c_it_py,
+                        sampled_feat,
+                        detail_feat,
+                        py_ind,
+                        x_t,
+                        t_tensor,
+                        contour_scale=contour_scale_flat,
+                        x_self_cond=None,
+                        locate_context=locate_context,
+                        s=s,
+                    )
+                    x_t = x_t + v_pred * dt_seg
+
+            final_poly = self.denormalize_position(x_t, centroid, contour_scale)
+            disp = final_poly - i_it_py
+            return self.clamp_pred_disp(disp, i_it_py)
+
         dt = 1.0 / steps
 
         for i in range(steps):
             t_val = i * dt
-            cur = i_it_py + self.denormalize_pred_disp(x_t, contour_scale)
+            if geom_position_flow:
+                cur = self.denormalize_position(x_t, centroid, contour_scale)
+            else:
+                cur = i_it_py + self.denormalize_pred_disp(x_t, contour_scale)
             sampled_feat = snake_gcn_utils.get_gcn_feature(cnn_feature, cur, py_ind, h, w)
             detail_feat = self.sample_detail_features(
                 cnn_feature,
@@ -1730,10 +1967,15 @@ class FlowMatchingEvolution(nn.Module):
                 contour_scale=contour_scale_flat,
                 x_self_cond=None,
                 locate_context=locate_context,
+                s=s,
             )
             x_t = x_t + v_pred * dt
 
-        disp = self.denormalize_pred_disp(x_t, contour_scale)
+        if geom_position_flow:
+            final_poly = self.denormalize_position(x_t, centroid, contour_scale)
+            disp = final_poly - i_it_py
+        else:
+            disp = self.denormalize_pred_disp(x_t, contour_scale)
         return self.clamp_pred_disp(disp, i_it_py)
 
     def sample_disp(self, cnn_feature, i_it_py, c_it_py, py_ind, steps=None, batch=None) -> torch.Tensor:
@@ -1835,8 +2077,12 @@ class FlowMatchingEvolution(nn.Module):
         current_contour = i_it_py.clone()
         total_disp = torch.zeros(N, P, 2, device=device, dtype=i_it_py.dtype)
         h, w = cnn_feature.size(2), cnn_feature.size(3)
+        cumulative_s = 0.0
 
         for step_idx in range(num_iter_steps):
+            s_tensor = None
+            if self._use_s_cond:
+                s_tensor = torch.full((N,), cumulative_s, device=device, dtype=i_it_py.dtype)
             sampled_feat = snake_gcn_utils.get_gcn_feature(cnn_feature, current_contour, py_ind, h, w)
             contour_scale = self.compute_contour_scale(current_contour)
             detail_feat = self.sample_detail_features(
@@ -1873,6 +2119,7 @@ class FlowMatchingEvolution(nn.Module):
                             steps=ode_steps,
                             noise_scale=step_ns,
                             locate_context=locate_context,
+                            s=s_tensor,
                         )
                     else:
                         d = self._sample_disp_from_sampled_feat(
@@ -1880,6 +2127,7 @@ class FlowMatchingEvolution(nn.Module):
                             sampled_feat, detail_feat, steps=ode_steps,
                             noise_scale=step_ns,
                             locate_context=locate_context,
+                            s=s_tensor,
                         )
                     all_disps.append(d)
                 disp = torch.stack(all_disps).mean(dim=0)
@@ -1893,6 +2141,7 @@ class FlowMatchingEvolution(nn.Module):
                         steps=ode_steps,
                         noise_scale=step_ns,
                         locate_context=locate_context,
+                        s=s_tensor,
                     )
                 else:
                     disp = self._sample_disp_from_sampled_feat(
@@ -1905,6 +2154,7 @@ class FlowMatchingEvolution(nn.Module):
                         steps=ode_steps,
                         noise_scale=step_ns,
                         locate_context=locate_context,
+                        s=s_tensor,
                     )
             if self._use_disp_gate and self._disp_gate_apply_inference:
                 gate = self.predict_disp_gate(sampled_feat, disp, contour_scale)
@@ -1913,8 +2163,115 @@ class FlowMatchingEvolution(nn.Module):
             applied_disp = disp * frac
             current_contour = current_contour + applied_disp
             total_disp = total_disp + applied_disp
+            cumulative_s = cumulative_s + (1.0 - cumulative_s) * float(frac)
 
         return total_disp
+
+    def sample_disp_curve(
+        self,
+        cnn_feature,
+        i_it_py,
+        c_it_py,
+        py_ind,
+        alpha: float = 2.0,
+        steps: int = 20,
+        noise_scale=None,
+        batch=None,
+        s_max: float = 0.97,
+        resample_feat: bool = True,
+    ):
+        """2D FM curved inference path.
+    
+        Walks a power-law curve t(τ)=τ^(1/α), s(τ)=τ^α on the (s,t) plane.
+        Each step combines t-direction velocity (model) and s-direction velocity (analytic, using d̂).
+        Feature resampling follows the evolving contour (DeepSnake-style).
+        """
+        N, P, _ = i_it_py.shape
+        device = i_it_py.device
+        if N == 0:
+            return torch.zeros((0, P, 2), device=device, dtype=i_it_py.dtype)
+        if noise_scale is None:
+            ns = self._infer_noise_scale
+            noise_scale = self._flow_noise_scale if ns < 0 else ns
+
+        steps = max(int(steps), 1)
+        alpha = max(float(alpha), 1e-6)
+        s_max = min(max(float(s_max), 0.0), 1.0 - 1e-4)
+        x = torch.randn_like(i_it_py) * float(noise_scale)
+        contour_scale = self.compute_contour_scale(i_it_py)
+        contour_scale_flat = contour_scale.view(-1)
+        h, w = cnn_feature.size(2), cnn_feature.size(3)
+        dt = 1.0 / steps
+        locate_context = None
+        if self._locate_token_enabled and batch is not None:
+            locate_context = self.build_locate_token_context(
+                batch,
+                i_it_py,
+                py_ind,
+                contour_scale=contour_scale,
+            )
+        sampled_feat = None
+        detail_feat = None
+        if not resample_feat:
+            ctx = self.prepare_sampling_context(cnn_feature, i_it_py, py_ind, batch=batch)
+            sampled_feat = ctx['sampled_feat']
+            detail_feat = ctx['detail_feat']
+            contour_scale = ctx['contour_scale']
+            contour_scale_flat = contour_scale.view(-1)
+            locate_context = ctx.get('locate_context', locate_context)
+
+        t_prev = 0.0
+        s_prev = 0.0
+        for i in range(steps):
+            tau = (i + 1) * dt
+            t_val = tau ** (1.0 / alpha)
+            s_val = min(tau ** alpha, s_max)
+            delta_t = t_val - t_prev
+            delta_s = s_val - s_prev
+            t_tensor = torch.full((N,), t_val, device=device, dtype=x.dtype)
+            s_tensor = torch.full((N,), s_val, device=device, dtype=x.dtype)
+            if resample_feat:
+                with torch.no_grad():
+                    xt_disp = self.denormalize_pred_disp(x, contour_scale)
+                    cur_contour = (i_it_py + xt_disp).detach()
+                    cur_sampled_feat = snake_gcn_utils.get_gcn_feature(cnn_feature, cur_contour, py_ind, h, w)
+                    cur_detail_feat = self.sample_detail_features(
+                        cnn_feature,
+                        cur_contour,
+                        py_ind,
+                        h,
+                        w,
+                        sampled_feat=cur_sampled_feat,
+                        contour_scale=contour_scale,
+                    )
+            else:
+                cur_sampled_feat = sampled_feat
+                cur_detail_feat = detail_feat
+            v_t, _ = self.predict_velocity(
+                cnn_feature,
+                i_it_py,
+                c_it_py,
+                cur_sampled_feat,
+                cur_detail_feat,
+                py_ind,
+                x,
+                t_tensor,
+                contour_scale=contour_scale_flat,
+                locate_context=locate_context,
+                s=s_tensor,
+            )
+            x1_hat = x + (1.0 - t_val) * v_t
+            d_hat = x1_hat / max(1.0 - s_val, 1e-4)
+            x = x + v_t * delta_t - d_hat * delta_s
+            t_prev = t_val
+            s_prev = s_val
+        disp = self.denormalize_pred_disp(d_hat, contour_scale)
+        if self._use_disp_gate and self._disp_gate_apply_inference:
+            if sampled_feat is None:
+                sampled_feat = snake_gcn_utils.get_gcn_feature(cnn_feature, i_it_py, py_ind, h, w)
+            gate = self.predict_disp_gate(sampled_feat, disp, contour_scale)
+            disp = disp * gate
+        return disp
 
     @staticmethod
     def _progress_targets_to_residual_fractions(targets):
@@ -2054,6 +2411,7 @@ class FlowMatchingEvolution(nn.Module):
                 i_gt_py = torch.stack([torch.roll(i_gt_py[i], -int(d2[i].argmin().item()), 0) for i in range(i_gt_py.size(0))], 0)
 
             x1_raw = i_gt_py - i_init_train_py
+            full_disp_for_s = x1_raw.clone()
 
             used_mixed_iter_interp = False
             if self.use_iterative_refinement and not self._geom_bridge:
@@ -2231,15 +2589,40 @@ class FlowMatchingEvolution(nn.Module):
                     i_init_train_py = i_init_train_py + x1_raw * frac_full
                     x1_raw = x1_raw * (1.0 - frac_full)
 
+            if self._use_s_cond:
+                full_norm = full_disp_for_s.norm(dim=-1).mean(dim=-1).clamp_min(1e-6)
+                residual_norm = x1_raw.norm(dim=-1).mean(dim=-1).clamp_min(1e-6)
+                train_s = (1.0 - residual_norm / full_norm).clamp(0.0, 1.0)
+            else:
+                train_s = None
+
             c_init_train_py = snake_gcn_utils.img_poly_to_can_poly(i_init_train_py)
             contour_scale = self.compute_contour_scale(i_init_train_py)
             contour_scale_flat = contour_scale.view(-1)
-            x1 = self.normalize_target_disp(x1_raw, contour_scale)
+            geom_position_flow = self._geom_bridge and self._geom_position_flow
+            geom_seg_flow = geom_position_flow and self._geom_seg_flow
+            centroid = None
+            if geom_position_flow:
+                centroid = self.compute_centroid(i_init_train_py)
+                x1 = self.normalize_position(i_gt_py, centroid, contour_scale)
+            else:
+                x1 = self.normalize_target_disp(x1_raw, contour_scale)
             N = x1.size(0)
 
             # --- Flow Matching Core ---
             t = self.sample_train_t(N, device=device, dtype=x1.dtype)
-            if self._geom_bridge:
+            if geom_seg_flow:
+                x_init = self.normalize_position(i_init_train_py, centroid, contour_scale)
+                x_gt = x1
+                x_noise = torch.randn_like(x_init) * self._geom_noise_scale
+                if self._geom_x0_jitter > 0:
+                    x_noise = x_noise + torch.randn_like(x_noise) * self._geom_x0_jitter
+                x0 = x_noise
+            elif geom_position_flow:
+                x0 = self.normalize_position(i_init_train_py, centroid, contour_scale)
+                if self._geom_x0_jitter > 0:
+                    x0 = x0 + torch.randn_like(x1) * self._geom_x0_jitter
+            elif self._geom_bridge:
                 x0 = torch.zeros_like(x1)
                 if self._geom_x0_jitter > 0:
                     x0 = x0 + torch.randn_like(x1) * self._geom_x0_jitter
@@ -2249,26 +2632,45 @@ class FlowMatchingEvolution(nn.Module):
                 self._geom_bridge
                 and self._geom_sched_sampling
                 and self._resample_feat_at_xt
+                and not geom_seg_flow
             )
             if use_geom_sched_sampling:
                 sched_prob = min(max(self._geom_sched_prob, 0.0), 1.0)
                 use_geom_sched_sampling = torch.rand(1, device=device).item() < sched_prob
 
-            if use_geom_sched_sampling:
+            model_t = t
+            if geom_seg_flow:
+                t_init = self._get_geom_t_init()
+                front_mask = t < t_init
+                local_t_front = t / t_init
+                local_t_back = (t - t_init) / (1.0 - t_init)
+                model_t = torch.where(front_mask, local_t_front, local_t_back).clamp(0.0, 1.0)
+                x0 = torch.where(front_mask, x_noise, x_init)
+                x1 = torch.where(front_mask, x_init, x_gt)
+                x_t = (1.0 - model_t) * x0 + model_t * x1
+            elif use_geom_sched_sampling:
                 inner_steps = max(int(self._geom_sched_inner_steps), 0)
                 dt_inner = 1.0 / float(inner_steps + 1)
                 k_land = int(torch.randint(inner_steps + 1, (1,), device=device).item())
                 t_land = x1.new_full((N, 1, 1), float(k_land) * dt_inner)
 
                 with torch.no_grad():
-                    x_roll = torch.zeros_like(x1)
+                    if geom_position_flow:
+                        x_roll = x0.detach().clone()
+                    else:
+                        x_roll = torch.zeros_like(x1)
                     for j in range(k_land):
                         t_j_scalar = float(j) * dt_inner
                         t_j = x1.new_full((N, 1, 1), t_j_scalar)
-                        cur_j = (
-                            i_init_train_py
-                            + self.denormalize_pred_disp(x_roll, contour_scale)
-                        ).detach()
+                        if geom_position_flow:
+                            cur_j = self.denormalize_position(
+                                x_roll, centroid, contour_scale
+                            ).detach()
+                        else:
+                            cur_j = (
+                                i_init_train_py
+                                + self.denormalize_pred_disp(x_roll, contour_scale)
+                            ).detach()
                         sampled_feat_j = snake_gcn_utils.get_gcn_feature(
                             cnn_feature, cur_j, py_ind, h, w
                         )
@@ -2301,23 +2703,39 @@ class FlowMatchingEvolution(nn.Module):
                             contour_scale=contour_scale_flat,
                             x_self_cond=None,
                             locate_context=locate_context_j,
+                            s=train_s,
                         )
                         x_roll = x_roll + v_j * dt_inner
                 x_t = x_roll.detach()
                 t = t_land
+                model_t = t
             else:
                 x_t = (1.0 - t) * x0 + t * x1
+                model_t = t
 
             # relative perturbation on x_t: noise scaled by per-point GT displacement magnitude.
             # sigma_rel * |x1| * randn -> auto-adapts to each point/sample, avoids guessing absolute scale.
             if self._geom_xt_jitter_rel > 0:
-                x1_norm = x1.norm(dim=-1, keepdim=True).clamp_min(1e-6)
+                if geom_position_flow:
+                    x1_norm = (x1 - x0).norm(dim=-1, keepdim=True).clamp_min(1e-6)
+                else:
+                    x1_norm = x1.norm(dim=-1, keepdim=True).clamp_min(1e-6)
                 x_t = x_t + torch.randn_like(x_t) * (self._geom_xt_jitter_rel * x1_norm)
 
             # --- 特征采样 & 预测 ---
-            if self._geom_bridge and self._resample_feat_at_xt:
-                xt_disp_raw = self.denormalize_pred_disp(x_t, contour_scale)
-                feat_poly = (i_init_train_py + xt_disp_raw).detach()
+            if geom_seg_flow:
+                xt_feat_poly = self.denormalize_position(
+                    x_t, centroid, contour_scale
+                ).detach()
+                feat_poly = torch.where(front_mask, i_init_train_py, xt_feat_poly)
+            elif self._resample_feat_at_xt:
+                if geom_position_flow:
+                    feat_poly = self.denormalize_position(
+                        x_t, centroid, contour_scale
+                    ).detach()
+                else:
+                    xt_disp_raw = self.denormalize_pred_disp(x_t, contour_scale)
+                    feat_poly = (i_init_train_py + xt_disp_raw).detach()
             else:
                 feat_poly = i_init_train_py
             sampled_feat_curr = snake_gcn_utils.get_gcn_feature(cnn_feature, feat_poly, py_ind, h, w)
@@ -2355,13 +2773,14 @@ class FlowMatchingEvolution(nn.Module):
                             detail_feat_curr,
                             py_ind,
                             x_t,
-                            t.view(-1),
+                            model_t.view(-1),
                             contour_scale=contour_scale_flat,
                             x_self_cond=None,  # dry run always starts unconditioned
                             locate_context=locate_context_curr,
+                            s=train_s,
                         )
                     # Self-cond = current estimate of clean displacement x1
-                    x_self_cond = (x_t + (1.0 - t) * v_dry).detach()
+                    x_self_cond = (x_t + (1.0 - model_t) * v_dry).detach()
                 else:
                     x_self_cond = torch.zeros_like(x_t)
 
@@ -2373,19 +2792,24 @@ class FlowMatchingEvolution(nn.Module):
                 detail_feat_curr,
                 py_ind,
                 x_t,
-                t.view(-1),
+                model_t.view(-1),
                 contour_scale=contour_scale_flat,
                 x_self_cond=x_self_cond,
                 locate_context=locate_context_curr,
+                s=train_s,
             )
 
             # 5. 计算目标速度 V_target = X_1 - X_0
-            if use_geom_sched_sampling:
+            if use_geom_sched_sampling and not geom_position_flow:
                 v_target = x1
             else:
                 v_target = x1 - x0
-            x1_pred = x_t + (1.0 - t) * v_pred
-            pred_disp = self.denormalize_pred_disp(x1_pred, contour_scale)
+            x1_pred = x_t + (1.0 - model_t) * v_pred
+            if geom_position_flow:
+                pred_poly = self.denormalize_position(x1_pred, centroid, contour_scale)
+                pred_disp = pred_poly - i_init_train_py
+            else:
+                pred_disp = self.denormalize_pred_disp(x1_pred, contour_scale)
             pred_disp = self.clamp_pred_disp(pred_disp, i_init_train_py)
             gate_loss_val = pred_disp.new_zeros(())
             disp_gate = pred_disp.new_ones((pred_disp.size(0), 1, 1))
@@ -2418,7 +2842,7 @@ class FlowMatchingEvolution(nn.Module):
             # x1_pred = x_t + (1-t)*v_pred  → penalise deviation from x1
             # Equivalent to (1-t)^2 * MSE(v_pred, v_target), upweighting t≈0
             if self._endpoint_loss_weight > 0:
-                x1_pred = x_t + (1.0 - t) * v_pred
+                x1_pred = x_t + (1.0 - model_t) * v_pred
                 endpoint_loss = F.mse_loss(x1_pred, x1, reduction='mean')
                 loss = loss + self._endpoint_loss_weight * endpoint_loss
 

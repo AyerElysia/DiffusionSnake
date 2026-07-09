@@ -652,10 +652,11 @@ class Network(nn.Module):
             except Exception as e:
                 print(f"[WARN] Failed to load YOLO pretrained weights: {e}")
 
-            # 将 P2 级别的特征通道压到 64，供 Snake 的 GCN 使用
-            # YOLO Detect 头拼接后的通道数为 reg_max*4 + nc（默认 reg_max=16 -> 64）
+# 将 P2 级别的特征通道压到 snake_feature_dim，供 Snake 的 GCN 使用
+            # YOLO Detect 头拼接后的通道数为 regmax*4 + nc（默认 regmax=16 -> 64）
+            _snake_feat_dim = int(getattr(cfg, 'snake_feature_dim', 64))
             in_ch = 64 + nc
-            self.cnn_proj = nn.Conv2d(in_ch, 64, kernel_size=1, bias=False)
+            self.cnn_proj = nn.Conv2d(in_ch, _snake_feat_dim, kernel_size=1, bias=False)
             self.use_p3_features = bool(
                 getattr(cfg, 'v3_4_use_p3_features', False)
                 or getattr(cfg, 'v3_7_use_p3_features', False)
@@ -664,7 +665,7 @@ class Network(nn.Module):
                 or getattr(cfg, 'v4_2_use_p3_features', False)
             )
             if self.use_p3_features:
-                self.cnn_proj_p3 = nn.Conv2d(in_ch, 64, kernel_size=1, bias=False)
+                self.cnn_proj_p3 = nn.Conv2d(in_ch, _snake_feat_dim, kernel_size=1, bias=False)
                 nn.init.zeros_(self.cnn_proj_p3.weight)
                 print("[Snake] P3 feature fusion enabled with zero-init residual.")
             self.use_swin_snake_feature = bool(getattr(cfg, 'use_swin_snake_feature', False))
@@ -740,6 +741,7 @@ class Network(nn.Module):
                 head_conv=head_conv,
                 backbone_name=str(getattr(cfg, 'heatmap_backbone', 'resnet18')),
                 pretrained=bool(getattr(cfg, 'heatmap_pretrained', False)),
+                feat_channels=int(getattr(cfg, 'heatmap_feat_channels', 64)),
                 mask_classes=nc if bool(getattr(cfg, 'use_heatmap_mask_head', False)) else 0,
             )
             print(
@@ -784,7 +786,7 @@ class Network(nn.Module):
         if self.locate_feat_inject:
             self.locate_feat_adapter = LocateFeatAdapter(
                 in_channels=int(getattr(cfg, 'locate_feat_dim', 2304)),
-                hidden_channels=64,
+                hidden_channels=int(getattr(cfg, 'locate_feat_adapt_hidden_channels', 64)),
             )
             print(
                 f"[LocateFeat] injection enabled dim={getattr(cfg, 'locate_feat_dim', 2304)} "
@@ -795,7 +797,7 @@ class Network(nn.Module):
             self.locate_feat_replacer = LocateFeatReplacer(
                 in_channels=int(getattr(cfg, 'locate_feat_dim', 2304)),
                 hidden_channels=int(getattr(cfg, 'locate_feat_replace_hidden_dim', 256)),
-                out_channels=64,
+                out_channels=int(getattr(cfg, 'locate_feat_replace_out_channels', 64)),
             )
             param_count = sum(p.numel() for p in self.locate_feat_replacer.parameters())
             print(
@@ -821,7 +823,7 @@ class Network(nn.Module):
             self.gcn = make_evolution(
                 use_grpo=getattr(cfg, 'use_grpo', False),
                 state_dim=128,
-                feature_dim=64,
+                feature_dim=int(getattr(cfg, 'snake_feature_dim', 64)),
                 num_points=128,
                 num_timesteps=getattr(cfg, 'diffusion_timesteps', 1000),
                 use_ddim_inference=getattr(cfg, 'use_ddim_inference', True),
