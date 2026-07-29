@@ -81,6 +81,24 @@ class DatasetCatalog(object):
             'ann_file': 'dummy_annotations.json',
             'split': 'mini'
         },
+        'VolMemTrain': {
+            'id': 'sagittal_2d_fixed',
+            'data_root': '/home/medteam/Zhrch/detect_3D_lgz2/datasets/sagittal_2d_fixed',
+            'ann_file': '/home/medteam/Zhrch/detect_3D_lgz2/datasets/sagittal_2d_fixed/manifests/slice_manifest.csv',
+            'split': 'train'
+        },
+        'VolMemVal': {
+            'id': 'sagittal_2d_fixed',
+            'data_root': '/home/medteam/Zhrch/detect_3D_lgz2/datasets/sagittal_2d_fixed',
+            'ann_file': '/home/medteam/Zhrch/detect_3D_lgz2/datasets/sagittal_2d_fixed/manifests/slice_manifest.csv',
+            'split': 'val'
+        },
+        'VolMemTest': {
+            'id': 'sagittal_2d_fixed',
+            'data_root': '/home/medteam/Zhrch/detect_3D_lgz2/datasets/sagittal_2d_fixed',
+            'ann_file': '/home/medteam/Zhrch/detect_3D_lgz2/datasets/sagittal_2d_fixed/manifests/slice_manifest.csv',
+            'split': 'test'
+        },
         'VocVal': {
             'id': 'voc',
             'data_root': 'data/voc/JPEGImages',

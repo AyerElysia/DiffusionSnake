@@ -1,0 +1,44 @@
+# VolMemSnake configuration schema. This file is not a trainable experiment.
+task: volmem
+model: verse_volmem_v0_1_scaffold
+
+volmem:
+  method_name: VolMemSnake
+  maturity: scaffold
+  task_definition: slice_sequential_volumetric_segmentation
+  native_3d_network: false
+
+  slice_encoder:
+    name: moonvit
+    frozen: true
+    feature_layers: [18, 26]
+    feature_dim_per_layer: 1152
+    per_layer_normalization: true
+    adapter: locate_feat_replacer
+    sampling_mode: half_pixel
+
+  slice_memory:
+    encoder: SliceMemoryEncoder
+    reader: SliceMemoryAttention
+    bank: SliceMemoryBank
+    capacity: 4
+    memory_dim: 256
+    reset_scope: volume
+
+  contour_decoder:
+    name: v4_6c_flow
+    adapter: pending
+
+  forbidden_paths:
+    legacy_multislice_image_input: true
+    auxiliary_cross_slice_feature_path: true
+    auxiliary_cross_slice_contour_path: true
+    independent_geometric_state_path: true
+    experimental_token_side_path: true
+    native_volume_operator_path: true
+
+  training_contract:
+    unit: ordered_volume_sequence
+    split_scope: volume_id
+    requires_physical_slice_position: true
+    official_training_enabled: false
