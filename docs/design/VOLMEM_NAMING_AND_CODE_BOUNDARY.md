@@ -97,21 +97,34 @@ verse_volmem_v1_0_baseline.yaml
 
 只有达到 `baseline` 后才允许成为后续实验的默认父配置。
 
-## 6. 首版唯一数据流
+## 6. 单实验唯一 Memory 数据流
+
+VolMem 的每个实验只能选择一条跨切片 Memory 读取路径，禁止叠加。
+
+### v0.2 对照基线
 
 ```text
 slice_image
   -> MoonViT(layer_18, layer_26)
-  -> per-layer normalization + LocateFeatReplacer
-  -> half-pixel aligned slice_features
-  -> SliceMemoryAttention(slice_features, memory_bank)
+  -> SliceMemoryAttention on whole-grid features
+  -> LocateFeatReplacer
   -> V4.6c contour flow
-  -> contour_prediction
-  -> SliceMemoryEncoder(slice_features, contour_prediction)
-  -> memory_bank.append(state)
+  -> SliceMemoryEncoder -> bank.append(state)
 ```
 
-跨切片信息只能通过 `SliceMemoryAttention / SliceMemoryEncoder / SliceMemoryBank` 三类接口流动。任何其他读取邻层图像、轮廓或特征的代码都违反主线契约。
+### v0.3 MemFlowDiT 候选主线
+
+```text
+slice_image
+  -> MoonViT(layer_18, layer_26)
+  -> LocateFeatReplacer without whole-grid Memory reader
+  -> Flow DiT contour tokens
+  -> block-level cross-attention to Slice Memory with relative delta-z
+  -> velocity field at every ODE time
+  -> SliceMemoryEncoder -> bank.append(state)
+```
+
+`flow time t` 与相对层距 `delta-z` 使用独立编码。Memory 为空时，block-level Memory 残差必须严格为零，此路径等价于普通单帧 2D V4.6c。v0.3 禁止同时实例化 v0.2 的 `SliceMemoryAttention` whole-grid reader。
 
 ## 7. 数据契约
 
