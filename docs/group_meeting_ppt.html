@@ -1,0 +1,340 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<title>矢状位椎体分割 — 组会汇报</title>
+<style>
+*{box-sizing:border-box;margin:0;padding:0}
+body{font-family:"PingFang SC","Microsoft YaHei","Segoe UI",sans-serif;background:#0f172a;color:#e2e8f0;overflow:hidden}
+.slides{width:100vw;height:100vh;position:relative}
+.slide{position:absolute;inset:0;display:flex;flex-direction:column;justify-content:center;align-items:center;padding:56px 64px;opacity:0;transition:opacity .35s;pointer-events:none}
+.slide.active{opacity:1;pointer-events:all}
+.s1{background:linear-gradient(135deg,#0f172a,#1e3a5f)}
+.s2{background:linear-gradient(135deg,#0f172a,#0a2a1a)}
+.s3{background:linear-gradient(135deg,#1a0f0f,#2d1b1b)}
+.s4{background:linear-gradient(135deg,#0f172a,#0a1a2a)}
+.s5{background:linear-gradient(135deg,#0a1a2a,#1a0a2a)}
+.s6{background:linear-gradient(135deg,#0a2a1a,#0f172a)}
+.s7{background:linear-gradient(135deg,#0a1a1a,#0f172a)}
+.s8{background:linear-gradient(135deg,#1e3a5f,#0f172a)}
+h1{font-size:2.5em;font-weight:700;text-align:center;line-height:1.25}
+h2{font-size:1.85em;font-weight:700;margin-bottom:28px;text-align:center}
+h3{font-size:1.1em;font-weight:600;margin-bottom:10px}
+.sub{font-size:1.1em;color:#94a3b8;margin-top:14px;text-align:center}
+.date{font-size:.95em;color:#64748b;margin-top:26px}
+.section-label{font-size:.8em;color:#64748b;text-transform:uppercase;letter-spacing:2px;margin-bottom:10px;text-align:center}
+.g2{display:grid;grid-template-columns:1fr 1fr;gap:20px;width:100%;max-width:1050px}
+.g3{display:grid;grid-template-columns:1fr 1fr 1fr;gap:16px;width:100%;max-width:1050px}
+.card{background:rgba(255,255,255,.055);border:1px solid rgba(255,255,255,.1);border-radius:12px;padding:22px}
+.card-r{border-color:#dc2626;background:rgba(220,38,38,.08)}
+.card-g{border-color:#16a34a;background:rgba(22,163,74,.08)}
+.card-b{border-color:#2563eb;background:rgba(37,99,235,.08)}
+.card-y{border-color:#ca8a04;background:rgba(202,138,4,.08)}
+.card-p{border-color:#7c3aed;background:rgba(124,58,237,.08)}
+ul{list-style:none}
+li{padding:6px 0 6px 22px;position:relative;font-size:.92em;line-height:1.5}
+li::before{content:"▸";position:absolute;left:0;color:#60a5fa}
+li.x::before{content:"✗";color:#f87171}
+li.ok::before{content:"✓";color:#4ade80}
+li.warn::before{content:"⚠";color:#facc15}
+.metrics{display:flex;gap:18px;justify-content:center;flex-wrap:wrap;margin-top:20px}
+.m{text-align:center;padding:14px 22px;background:rgba(255,255,255,.06);border-radius:10px;min-width:130px}
+.mv{font-size:1.9em;font-weight:700}
+.ml{font-size:.8em;color:#94a3b8;margin-top:4px;line-height:1.4}
+.G{color:#4ade80}.R{color:#f87171}.B{color:#60a5fa}.Y{color:#facc15}.P{color:#c084fc}.O{color:#fb923c}
+code{font-family:"Fira Code","Courier New",monospace;background:rgba(0,0,0,.35);padding:2px 7px;border-radius:4px;font-size:.86em;color:#7dd3fc}
+.flow{display:flex;align-items:center;gap:10px;flex-wrap:wrap;justify-content:center;margin:16px 0}
+.fb{background:rgba(255,255,255,.07);border:1px solid rgba(255,255,255,.15);border-radius:8px;padding:10px 16px;text-align:center;font-size:.88em}
+.fb-g{border-color:#4ade80;background:rgba(74,222,128,.1);color:#4ade80;font-weight:700}
+.fb-r{border-color:#f87171;background:rgba(248,113,113,.1);color:#f87171}
+.fb-y{border-color:#facc15;background:rgba(250,204,21,.1);color:#facc15}
+.arr{font-size:1.4em;color:#60a5fa}
+.arr-r{color:#f87171}
+.badge{display:inline-block;padding:3px 12px;border-radius:20px;font-size:.82em;font-weight:600;margin:3px}
+.bb{background:#1d4ed8;color:#bfdbfe}
+.bg{background:#166534;color:#bbf7d0}
+.br{background:#991b1b;color:#fecaca}
+.by{background:#854d0e;color:#fef08a}
+.bp{background:#5b21b6;color:#ede9fe}
+table{border-collapse:collapse;width:100%;font-size:.88em}
+th{background:rgba(59,130,246,.25);padding:10px 16px;text-align:left}
+td{padding:9px 16px;border-bottom:1px solid rgba(255,255,255,.07)}
+.nav{position:fixed;bottom:22px;right:28px;display:flex;gap:10px;z-index:100}
+.nav button{background:rgba(255,255,255,.1);border:1px solid rgba(255,255,255,.2);color:#e2e8f0;padding:9px 18px;border-radius:8px;cursor:pointer;font-size:.88em;transition:background .2s}
+.nav button:hover{background:rgba(255,255,255,.22)}
+.pn{position:fixed;bottom:22px;left:28px;color:#475569;font-size:.88em;z-index:100}
+.bar{position:fixed;top:0;left:0;height:3px;background:#3b82f6;transition:width .35s;z-index:100}
+</style>
+</head>
+<body>
+<div class="bar" id="bar"></div>
+<div class="pn" id="pn">1 / 8</div>
+<div class="slides" id="slides">
+
+<!-- S1 Title -->
+<div class="slide s1 active">
+  <div class="section-label">DiffusionSnake · 组会汇报 · 2026-07</div>
+  <h1>矢状位椎体实例分割<br>新方案汇报</h1>
+  <div class="sub">纯2D + MoonViT特征 + V4.6c Flow Matching + 时序传播</div>
+  <div style="margin-top:24px;display:flex;gap:8px;justify-content:center;flex-wrap:wrap">
+    <span class="badge bb">DiffusionSnake-12-30</span>
+    <span class="badge bg">GPU6 训练中</span>
+    <span class="badge bp">MoonViT特征</span>
+    <span class="badge by">时序推理</span>
+  </div>
+  <div class="date">矢状位脊椎CT · 25类椎体分割</div>
+</div>
+
+<!-- S2 Why new approach -->
+<div class="slide s2">
+  <h2>为什么要换方案？</h2>
+  <div class="g2">
+    <div class="card card-r">
+      <h3 class="R">❌ 之前的伪3D方案（失败）</h3>
+      <ul>
+        <li class="x">把前帧+当前帧+后帧拼成3通道RGB输入</li>
+        <li class="x">GT-box eval 前景 Dice 仅 <strong class="R">0.130</strong></li>
+        <li class="x">Flow输出系统性外扩，面积膨胀中位数 <strong>14.46×</strong></li>
+        <li class="x">根因：训练用GT极值点八边形初始化；推理用bbox中点八边形，两条不同路径 → <strong>训练/推理不一致</strong></li>
+        <li class="x">5000步中只有2170次有效contour监督</li>
+      </ul>
+    </div>
+    <div class="card card-g">
+      <h3 class="G">✅ 新方案设计原则</h3>
+      <ul>
+        <li class="ok">回归 <strong>纯2D单帧</strong>，与最早验证过的2D基线保持一致</li>
+        <li class="ok">用 <strong>MoonViT</strong> 替换YOLO特征，提升语义表达能力</li>
+        <li class="ok">V4.6c MoE扩散头 + V4.9 rich-state sampling</li>
+        <li class="ok">训练/推理初始化 <strong>严格一致</strong></li>
+        <li class="ok">时序信息只在 <strong>初始化层面</strong> 注入，不改模型结构</li>
+      </ul>
+    </div>
+  </div>
+  <div class="metrics">
+    <div class="m"><div class="mv R">0.130</div><div class="ml">伪3D方案<br>GT-box Dice</div></div>
+    <div style="font-size:2em;align-self:center">→</div>
+    <div class="m"><div class="mv G">待测</div><div class="ml">新方案<br>GT-box Dice</div></div>
+    <div class="m"><div class="mv Y">14.46×</div><div class="ml">Flow外扩面积<br>膨胀倍数</div></div>
+    <div class="m"><div class="mv G">~1×</div><div class="ml">新方案预期<br>面积变化</div></div>
+  </div>
+</div>
+
+<!-- S3 Architecture -->
+<div class="slide s4">
+  <h2>新方案架构</h2>
+  <div class="flow">
+    <div class="fb">矢状位切片<br><small>灰度图→3通道复制</small></div>
+    <div class="arr">→</div>
+    <div class="fb">ResNet34<br><small>heatmap检测头</small></div>
+    <div class="arr">→</div>
+    <div class="fb fb-y">检测框<br><small>26类</small></div>
+  </div>
+  <div class="flow" style="margin-top:0">
+    <div class="fb">切片图像<br><small>448×448</small></div>
+    <div class="arr">→</div>
+    <div class="fb fb-g">MoonViT<br><small>layer_18 离线缓存</small></div>
+    <div class="arr">→</div>
+    <div class="fb fb-g">LocateFeatReplacer<br><small>1152→256 dim</small></div>
+  </div>
+  <div class="flow">
+    <div class="fb">bbox八边形<br><small>初始轮廓</small></div>
+    <div class="arr">→</div>
+    <div class="fb fb-g">V4.6c DiT<br><small>Flow Matching ODE</small></div>
+    <div class="arr">→</div>
+    <div class="fb fb-g">预测轮廓</div>
+  </div>
+  <div class="g3" style="margin-top:16px;max-width:950px">
+    <div class="card card-b">
+      <h3 class="B">图像输入</h3>
+      <ul>
+        <li><code>center_repeat</code> 模式</li>
+        <li>单帧灰度图复制3通道</li>
+        <li><strong>不使用邻居帧</strong></li>
+      </ul>
+    </div>
+    <div class="card card-g">
+      <h3 class="G">MoonViT特征</h3>
+      <ul>
+        <li>仅用当前帧 <code>center_only</code></li>
+        <li>layer_18 · 1152-dim</li>
+        <li>20,631个npz离线缓存</li>
+      </ul>
+    </div>
+    <div class="card card-p">
+      <h3 class="P">V4.6c扩散头</h3>
+      <ul>
+        <li>MoE: 8专家 top-2 + shared</li>
+        <li>Cyclic router · 256-dim</li>
+        <li>V4.9 rich-state sampling</li>
+      </ul>
+    </div>
+  </div>
+</div>
+
+<!-- S4 Training innovation -->
+<div class="slide s5">
+  <h2>训练创新：前帧轮廓初始化</h2>
+  <div class="g2">
+    <div class="card">
+      <h3 class="B">设计动机</h3>
+      <ul>
+        <li>矢状位相邻切片解剖结构几乎一样</li>
+        <li>前帧轮廓 ≈ 当前帧GT（偏移仅几像素）</li>
+        <li>让模型学会"从近初始轮廓做精修"</li>
+        <li>自然对齐推理时的时序复用场景</li>
+      </ul>
+      <div style="margin-top:14px;padding:12px;background:rgba(96,165,250,.08);border-radius:8px;border-left:3px solid #60a5fa">
+        <code>prev_contour_init_prob: 0.3</code><br>
+        <small style="color:#94a3b8">训练时30%概率用前帧GT轮廓替换bbox八边形初始化</small>
+      </div>
+    </div>
+    <div class="card">
+      <h3 class="G">实现流程</h3>
+      <div class="flow" style="flex-direction:column;align-items:flex-start;gap:8px;margin:0">
+        <div class="fb" style="width:100%">① 读取相邻slice的mask（同case）</div>
+        <div class="fb" style="width:100%">② 按class_id提取同类轮廓</div>
+        <div class="fb" style="width:100%">③ 应用<strong>相同</strong>空间变换（flip/crop/transform）</div>
+        <div class="fb" style="width:100%">④ uniformsample到poly_num点，起点对齐</div>
+        <div class="fb fb-g" style="width:100%">⑤ 替换 <code>i_it_py</code>，喂给Flow ODE</div>
+      </div>
+      <div style="margin-top:10px;font-size:.85em;color:#94a3b8">
+        ⚠ 相邻帧无该类别时自动回退到bbox八边形
+      </div>
+    </div>
+  </div>
+  <div class="metrics" style="margin-top:16px">
+    <div class="m"><div class="mv G">30%</div><div class="ml">前帧初始化概率<br>（其余70%用八边形）</div></div>
+    <div class="m"><div class="mv B">0</div><div class="ml">架构改动<br>（只改Dataset）</div></div>
+    <div class="m"><div class="mv Y">near_zero</div><div class="ml">V4.9 rich sampling<br>已覆盖此分布</div></div>
+  </div>
+</div>
+
+<!-- S5 Inference temporal -->
+<div class="slide s6">
+  <h2>推理创新：时序轮廓传播</h2>
+  <div class="g2">
+    <div class="card">
+      <h3 class="G">推理流程</h3>
+      <div class="flow" style="flex-direction:column;align-items:flex-start;gap:8px;margin:0">
+        <div class="fb fb-y" style="width:100%">维护 prev_cache = {cls_id: contour}</div>
+        <div class="fb" style="width:100%">Slice N: 检测 → 各类别分割</div>
+        <div class="fb fb-g" style="width:100%">更新 prev_cache ← output['py'] + py_cls</div>
+        <div class="fb" style="width:100%">Slice N+1: 检测 → 查 prev_cache</div>
+        <div class="fb fb-g" style="width:100%">命中 → 前帧轮廓作为init（替换八边形）</div>
+        <div class="fb" style="width:100%">未命中 → 标准bbox八边形init</div>
+      </div>
+    </div>
+    <div class="card">
+      <h3 class="B">设计亮点</h3>
+      <ul>
+        <li class="ok">椎体每类唯一 → 按<strong>class_id直接匹配</strong>，无需IoU</li>
+        <li class="ok">case切换时自动清空缓存</li>
+        <li class="ok">output['py'] 已是 feature 坐标 → 直接缓存无需变换</li>
+        <li class="ok">复用现有 <code>sam_i_it_py</code> 注入路径 → 零模型改动</li>
+        <li class="ok">新出现的椎体 → 自动回退八边形</li>
+      </ul>
+      <div style="margin-top:14px;padding:12px;background:rgba(74,222,128,.08);border-radius:8px;border-left:3px solid #4ade80;font-size:.85em">
+        <strong>代码路径：</strong><br>
+        <code>lib/utils/snake/prev_contour_init.py</code><br>
+        hook at <code>ct_snake.py</code> (两处分支)<br>
+        <code>scripts/sagittal_temporal_inference.py</code>
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- S6 Training status -->
+<div class="slide s7">
+  <h2>训练现状</h2>
+  <div class="metrics">
+    <div class="m"><div class="mv G">GPU6</div><div class="ml">运行中<br>41GB空闲显存</div></div>
+    <div class="m"><div class="mv B">Step 340+</div><div class="ml">Epoch 0<br>共14384 steps/epoch</div></div>
+    <div class="m"><div class="mv Y">3.0GB</div><div class="ml">显存峰值<br>(修复后稳定)</div></div>
+    <div class="m"><div class="mv P">99%</div><div class="ml">GPU利用率</div></div>
+  </div>
+  <div class="g2" style="margin-top:24px">
+    <div class="card card-g">
+      <h3 class="G">Loss 收敛情况</h3>
+      <table>
+        <tr><th>指标</th><th>Step 20</th><th>Step 10540</th></tr>
+        <tr><td>det_loss</td><td>311.6</td><td class="G">0.88</td></tr>
+        <tr><td>diff_loss</td><td>0.44</td><td class="G">0.003–0.017</td></tr>
+        <tr><td>diff_lossA1</td><td>1.26</td><td class="G">0.016–0.030</td></tr>
+      </table>
+      <div style="margin-top:10px;font-size:.85em;color:#94a3b8">检测头和Flow都在快速收敛，无NaN/crash</div>
+    </div>
+    <div class="card card-y">
+      <h3 class="Y">⚠ 遇到并解决的问题</h3>
+      <ul>
+        <li class="warn">MoonViT cache key配置错误<br><small style="color:#94a3b8">locate_feat_fusion_mode → sagittal_moonvit_fusion_mode</small></li>
+        <li class="warn">center_only分支缺少patch_size元数据 → 补齐</li>
+        <li class="warn">GPU显存"泄漏"假象<br><small style="color:#94a3b8">max_memory_allocated()历史峰值不重置，大batch后缓存池堆积 → OOM</small></li>
+        <li class="ok">修复：每500 step调用<code>torch.cuda.empty_cache()</code></li>
+      </ul>
+    </div>
+  </div>
+</div>
+
+<!-- S7 Next steps -->
+<div class="slide s8">
+  <h2>下一步计划</h2>
+  <div class="g3">
+    <div class="card card-b">
+      <h3 class="B">① 训练验证</h3>
+      <ul>
+        <li>持续监控loss曲线</li>
+        <li>50 epoch存checkpoint</li>
+        <li>GT-box eval验证分割Dice</li>
+      </ul>
+    </div>
+    <div class="card card-p">
+      <h3 class="P">② 时序消融</h3>
+      <ul>
+        <li><code>--no_temporal</code>对比实验</li>
+        <li>量化前帧初始化收益</li>
+        <li>调整 <code>prev_contour_init_prob</code></li>
+      </ul>
+    </div>
+    <div class="card card-g">
+      <h3 class="G">③ 后续扩展</h3>
+      <ul>
+        <li>如效果好，可探索体素3D</li>
+        <li>Warm-start路径修复（可选）</li>
+        <li>对比伪3D vs 纯2D+时序</li>
+      </ul>
+    </div>
+  </div>
+  <div style="margin-top:32px;text-align:center">
+    <div class="section-label">核心设计原则</div>
+    <div style="font-size:1.3em;font-weight:600;color:#e2e8f0">
+      改动最小化 · 回归验证过的2D基线 · 特征层用MoonViT · 初始化层用时序传播
+    </div>
+  </div>
+</div>
+
+</div>
+
+<div class="nav">
+  <button onclick="prevSlide()">← 上一页</button>
+  <button onclick="nextSlide()">下一页 →</button>
+</div>
+
+<script>
+let cur = 0;
+const slides = document.querySelectorAll('.slide');
+const total = slides.length;
+function show(i){
+  slides.forEach((s,idx)=>s.classList.toggle('active', idx===i));
+  document.getElementById('pn').textContent = (i+1)+' / '+total;
+  document.getElementById('bar').style.width = ((i+1)/total*100)+'%';
+}
+function nextSlide(){ cur=(cur+1)%total; show(cur); }
+function prevSlide(){ cur=(cur-1+total)%total; show(cur); }
+document.addEventListener('keydown', e=>{
+  if(e.key==='ArrowRight'||e.key===' ') nextSlide();
+  if(e.key==='ArrowLeft') prevSlide();
+});
+show(0);
+</script>
+</body>
+</html>

@@ -200,3 +200,36 @@ cython_debug/
 clash/
 .gemini/
 SAMSnake/
+
+################################################################################
+# Temporary / Generated Files (2026-07-31 cleanup)
+################################################################################
+
+# Virtual environments
+.venv_pptx/
+
+# nohup outputs
+nohup.out
+nohup2.out
+nohup*.out
+test/*.nohup*.out
+test/*.nohup*.out.*
+
+# HTML render check temp
+docs/report/.html_render_check/
+
+# Eagle third-party
+Eagle/
+
+# Large evaluation result image directories (use scripts to regenerate)
+docs/report/perpoint_final_eval/
+docs/report/nsd_clear_full_20260708/
+docs/report/nsd_full_eval_20260708/
+docs/report/moonvit_pseudo3d_formal_training_assets/
+docs/report/perpoint_bottleneck_analysis/
+docs/report/perpoint_policy_bottlenecks/
+docs/report/perpoint_grouped_comparison/
+docs/report/sagittal_pseudo3d_assets/
+
+# Backup files (already tracked in original locations)
+grpo_train_v5_geom_action.py.bak_before_cleanup

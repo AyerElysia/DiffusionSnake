@@ -1,0 +1,171 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>逐点 FM 路线瓶颈分析报告</title>
+<style>
+:root{--bg:#0d1117;--panel:#161b22;--panel2:#1f2632;--text:#e6edf3;--muted:#8b949e;--blue:#58a6ff;--green:#3fb950;--orange:#d29922;--red:#f85149;--purple:#bc8cff;--cyan:#39c5cf;--border:#30363d;--shadow:rgba(0,0,0,.28)}
+*{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--text);font-family:-apple-system,BlinkMacSystemFont,"Segoe UI","PingFang SC","Microsoft YaHei",Arial,sans-serif;line-height:1.72;font-size:15px}.wrap{max-width:1240px;margin:0 auto;padding:28px 26px 90px}header{padding:30px 32px;background:linear-gradient(135deg,#152238,#201b2c 58%,#14272d);border:1px solid var(--border);border-radius:16px;box-shadow:0 12px 32px var(--shadow)}h1{font-size:30px;line-height:1.3;margin:0 0 10px}h2{font-size:23px;margin:42px 0 16px;padding-bottom:9px;border-bottom:1px solid var(--border)}h3{font-size:18px;margin:28px 0 12px;color:#d2d9e3}.subtitle{font-size:16px;color:#c2cad4}.meta{margin-top:12px;color:var(--muted);font-size:13px}.panel{background:var(--panel);border:1px solid var(--border);border-radius:12px;padding:20px 22px;margin:16px 0;box-shadow:0 6px 18px var(--shadow)}.tldr{border-left:5px solid var(--blue);background:linear-gradient(135deg,#172131,#211b2c)}.success{border-left:5px solid var(--green)}.warn{border-left:5px solid var(--orange)}.danger{border-left:5px solid var(--red)}.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(235px,1fr));gap:14px;margin:17px 0}.kpi{padding:17px 18px;border-radius:11px;background:var(--panel);border:1px solid var(--border)}.kpi .v{font:700 26px/1.2 ui-monospace,SFMono-Regular,Consolas,monospace;color:var(--blue)}.kpi .v.good{color:var(--green)}.kpi .v.bad{color:var(--red)}.kpi .v.warn{color:var(--orange)}.kpi .label{font-weight:600;margin-top:6px}.kpi .sub{font-size:12px;color:var(--muted);margin-top:3px}table{width:100%;border-collapse:collapse;margin:14px 0;font-size:14px}th,td{padding:10px 12px;border-bottom:1px solid var(--border);vertical-align:top}th{background:var(--panel2);color:#a9cfff;text-align:left}tr:hover td{background:rgba(255,255,255,.025)}code{font-family:ui-monospace,SFMono-Regular,Consolas,monospace;color:#c9d1d9;background:#111820;border:1px solid #2a333d;border-radius:5px;padding:1px 5px}.num{font-family:ui-monospace,SFMono-Regular,Consolas,monospace;text-align:right;white-space:nowrap}.good-text{color:var(--green);font-weight:700}.bad-text{color:var(--red);font-weight:700}.warn-text{color:var(--orange);font-weight:700}.toc{columns:2;column-gap:34px}.toc a{display:block;color:#a9cfff;text-decoration:none;padding:3px 0}.figure{margin:18px 0;padding:14px;background:#0f151d;border:1px solid var(--border);border-radius:12px}.figure img{display:block;max-width:100%;height:auto;margin:auto;border-radius:8px;border:1px solid var(--border)}.caption{font-size:13px;color:var(--muted);margin-top:10px}.decision{padding:14px 16px;border-radius:10px;background:#101b27;border:1px solid #2a4564}.small{font-size:13px;color:var(--muted)}
+</style>
+</head>
+<body><div class="wrap">
+<header>
+<h1>逐点 FM 路线瓶颈分析报告</h1>
+<div class="subtitle">围绕“逐点路线为什么仍不如 geom 探索，以及是不是小策略网络能力太差”的诊断结论</div>
+<div class="meta">日期：2026-07-10 · 项目：DiffusionSnake-12-30 · 数据集：1232_final · 统一评估：5-step rollout, actual ODE=10 · 分析样本：177 images / 5,411 contours / 692,608 valid points</div>
+</header>
+
+<section class="panel tldr">
+<h2 style="margin-top:0;border:0">执行结论</h2>
+<p><b>当前证据不支持“逐点 FM 路线差，主要是因为 H64 小策略网络太弱”。</b>H256 没有稳定优于 H64，线性模型在 current 输入上的 R² 反而最高；把输入扩到 richer feature 后方向符号略好，但 R² 变差。这说明主要瓶颈不是单纯网络宽度。</p>
+<p><b>更可信的主因排序是：</b>第一，动作族上限太低；第二，当前点特征对 reward-credit 的可辨识性弱；第三，reward 的方向大体有用但强度排序弱；第四，step4 的时序污染和训练覆盖会进一步稀释信号，但不是唯一根因。</p>
+<div class="decision"><b>路线裁决：</b>逐点 FM scale 证明了“点级局部方向可以学到一点”，尤其最终步有弱信号；但它的动作族是沿 FM velocity 的 ±10% scale，oracle 上限本身很低，所以即使学会，也很难变成整体 IoU / Dice / mBoundF 收益。</div>
+</section>
+
+<div class="grid">
+<div class="kpi"><div class="v bad">7.34%</div><div class="label">当前 ±10% scale oracle 平方误差下降</div><div class="sub">动作族上限很低</div></div>
+<div class="kpi"><div class="v bad">86.49%</div><div class="label">当前 scale 撞边界比例</div><div class="sub">大量点想要超出 ±10%</div></div>
+<div class="kpi"><div class="v good">85.50%</div><div class="label">法向 residual oracle 平方误差下降</div><div class="sub">说明方向自由度才是大瓶颈</div></div>
+<div class="kpi"><div class="v warn">0.0080</div><div class="label">current H64 reward-credit R²</div><div class="sub">输入对点级收益解释力弱</div></div>
+<div class="kpi"><div class="v warn">0.5396</div><div class="label">v15 最终步 balanced sign</div><div class="sub">有弱方向信号，但不够强</div></div>
+<div class="kpi"><div class="v bad">-0.000278</div><div class="label">v15 对 FM 的 IoU 差值</div><div class="sub">CI 跨 0，未证明整体改善</div></div>
+</div>
+
+<section class="panel"><h2 style="margin-top:0">目录</h2><div class="toc">
+<a href="#scope">1. 本次诊断口径</a><a href="#e0">2. 评估路径校正</a><a href="#capacity">3. 小策略网络是否太弱</a><a href="#oracle">4. 动作族上限</a><a href="#reward">5. Reward 信号是否合理</a><a href="#causal">6. 短程因果训练</a><a href="#full-eval">7. 全量评估结论</a><a href="#why">8. 为什么逐点仍不如 geom</a><a href="#next">9. 后续建议</a><a href="#files">10. 文件索引与验证</a>
+</div></section>
+
+<h2 id="scope">1. 本次诊断口径</h2>
+<p>这份报告只回答一个问题：逐点 FM 路线当前为什么不佳，尤其是不是因为策略小网络能力不够。分析尽量避免只看在线 PPO 曲线，而是拆成四类证据：</p>
+<table><tr><th>证据</th><th>目的</th><th>结论用途</th></tr>
+<tr><td>零策略 parity</td><td>确认 off/mean 评估路径一致</td><td>排除 ODE 20/10 混杂造成的假差异</td></tr>
+<tr><td>reward-credit 监督 probe</td><td>测试当前输入和更大网络能否预测点级收益</td><td>判断是不是 H64 容量不足</td></tr>
+<tr><td>GT diagnostic oracle</td><td>在不训练网络的情况下测动作族理论上限</td><td>判断动作参数化是否天然受限</td></tr>
+<tr><td>短程因果训练</td><td>比较 final-only、cyclic、last-two</td><td>判断 step4 时序污染和覆盖策略影响</td></tr></table>
+<div class="panel warn"><b>安全边界：</b>normal residual、2D residual、GT oracle target 都是诊断上限，不能直接加入正式训练策略。后续如果要改动作族，需要单独设计可训练、无 GT 泄漏、可上线的策略。</div>
+
+<h2 id="e0">2. 评估路径校正</h2>
+<p>旧逐点报告里有一部分 mean/off 对比混入了 actual ODE=20 与 ODE=10 的差异，所以那部分不能作为严格因果证据。本轮先做了零策略 parity：</p>
+<table><tr><th>检查项</th><th>结果</th></tr>
+<tr><td>checkpoint</td><td><code>data/cache/perpoint_policy_bottlenecks/v15_step1020_zero_output_eval_only.pt</code></td></tr>
+<tr><td>rollout</td><td>统一 5-step rollout，actual ODE=10</td></tr>
+<tr><td>样本</td><td>8 个测试样本，off 与 mean 使用同一 checkpoint</td></tr>
+<tr><td>逐样本数组</td><td><code>np.array_equal=True</code>，<code>max_abs=0.0</code></td></tr>
+<tr><td>指标</td><td>IoU 0.841115，Dice 0.911923，mBoundF 0.777528，NSD 0.867458</td></tr></table>
+<p>这个结果说明：后续 corrected eval 的 off/mean 对比路径已经对齐，后面的瓶颈分析可以建立在统一口径上。</p>
+
+<h2 id="capacity">3. 小策略网络是否太弱</h2>
+<h3>3.1 当前策略结构</h3>
+<table><tr><th>组件</th><th>数值</th><th>说明</th></tr>
+<tr><td>总参数</td><td class="num">12,835</td><td>包含 step embedding、global branch、point branch</td></tr>
+<tr><td>step embedding</td><td class="num">160</td><td><code>[5,32]</code></td></tr>
+<tr><td>global_net</td><td class="num">6,338</td><td>主要影响 logstd；<code>zero_mean_local=True</code> 时 global <code>mu_g</code> 不进入最终点级 <code>mu_pp</code></td></tr>
+<tr><td>point_net</td><td class="num">6,337</td><td>真正承担点级方向表达</td></tr>
+<tr><td>current 输入</td><td class="num">97-D</td><td>64 sampled local feature + 32 step embedding + 1 normalized FM magnitude</td></tr>
+<tr><td>richer 输入</td><td class="num">462-D</td><td>诊断用扩展特征，不是当前在线策略输入</td></tr></table>
+<p>所以“12,835 参数太少”这个说法要更精确：真正点级均值表达主要在 6,337 参数的 point_net 上，但容量 probe 并没有显示 H256 能明显解决问题。</p>
+
+<h3>3.2 Reward-credit probe</h3>
+<p>使用 full177 cache 的真实状态，只在 <code>counterfactual_mask=True</code> 且 finite 的 86,576 个点上训练监督 probe，image-held-out split，seeds 20260712/13/14，target 是 <code>reward_credit</code>。</p>
+<table><tr><th>Feature</th><th>Model</th><th>R² mean</th><th>Pearson</th><th>Balanced sign</th><th>解读</th></tr>
+<tr><td>current 97-D</td><td>linear</td><td class="num good-text">0.01573</td><td class="num">0.12567</td><td class="num">0.49817</td><td>线性 R² 最高，但方向接近随机</td></tr>
+<tr><td>current 97-D</td><td>H64</td><td class="num">0.00798</td><td class="num">0.10906</td><td class="num">0.50676</td><td>当前策略容量级别，没有明显解释力</td></tr>
+<tr><td>current 97-D</td><td>H256</td><td class="num bad-text">0.00216</td><td class="num">0.10268</td><td class="num">0.50787</td><td>加宽没有解决 current 输入问题</td></tr>
+<tr><td>richer 462-D</td><td>linear</td><td class="num">0.00262</td><td class="num">0.12924</td><td class="num">0.51674</td><td>方向略好，强度解释仍弱</td></tr>
+<tr><td>richer 462-D</td><td>H64</td><td class="num bad-text">-0.05058</td><td class="num">0.11203</td><td class="num good-text">0.52175</td><td>balanced sign 最高，但 R² 变差</td></tr>
+<tr><td>richer 462-D</td><td>H256</td><td class="num bad-text">-0.04664</td><td class="num good-text">0.15746</td><td class="num">0.51917</td><td>Pearson 最高，但不是稳定容量胜利</td></tr></table>
+<div class="panel success"><b>裁决：</b>小网络能力不足不是主因。更大的 H256 没有在 current 输入下稳定优于 H64；richer 输入只让方向分类略有改善，强度拟合依然很差。主要问题更像是“点状态里缺少能判断该点该快该慢的可辨识信息”，而不是把 H64 换成 H256 就能解决。</div>
+
+<h2 id="oracle">4. 动作族上限</h2>
+<p>full177 动作上限分析使用 deterministic 前四步结束、第五步 action 前的真实状态，测试不同 diagnostic oracle 对 GT 端点误差的理论改善。最终输出目录是 <code>report/perpoint_bottleneck_analysis/full177_oracle_reward_20260710_locany_b20</code>。</p>
+<table><tr><th>Oracle</th><th>Mean error</th><th>RMSE</th><th>Mean gain</th><th>平方误差下降</th><th>撞边界</th><th>含义</th></tr>
+<tr><td>pure_fm</td><td class="num">0.268653</td><td class="num">0.431440</td><td class="num">0</td><td class="num">0%</td><td class="num">NA</td><td>原始 FM velocity</td></tr>
+<tr><td>scale_current ±10%</td><td class="num">0.254944</td><td class="num">0.415301</td><td class="num">0.013710</td><td class="num bad-text">7.341%</td><td class="num bad-text">86.49%</td><td>当前逐点动作族上限</td></tr>
+<tr><td>scale_wider ±100%</td><td class="num">0.195135</td><td class="num">0.336963</td><td class="num">0.073518</td><td class="num warn-text">39.001%</td><td class="num">44.77%</td><td>放大 scale 后改善明显</td></tr>
+<tr><td>scale_unbounded</td><td class="num">0.149881</td><td class="num">0.266472</td><td class="num">0.118772</td><td class="num good-text">61.853%</td><td class="num">0%</td><td>沿 FM 方向的最优连续缩放</td></tr>
+<tr><td>scale_zero_mean</td><td class="num">0.256573</td><td class="num">0.415726</td><td class="num">0.012080</td><td class="num bad-text">7.152%</td><td class="num bad-text">88.95%</td><td>和当前 zero-mean 约束一致</td></tr>
+<tr><td>normal_residual</td><td class="num">0.076769</td><td class="num">0.164294</td><td class="num">0.191884</td><td class="num good-text">85.499%</td><td class="num">NA</td><td>法向方向上限远高</td></tr>
+<tr><td>residual_2d</td><td class="num">≈0</td><td class="num">≈0</td><td class="num">0.268653</td><td class="num good-text">100%</td><td class="num">NA</td><td>理论端点 residual 上限</td></tr></table>
+<div class="figure"><img src="perpoint_bottleneck_analysis/full177_oracle_reward_20260710_locany_b20/oracle_errors.png" alt="oracle endpoint errors"><div class="caption">图 1：不同动作族 diagnostic oracle 的端点误差。当前 ±10% FM scale 的改善上限明显低于 normal residual。</div></div>
+<div class="panel danger"><b>关键判断：</b>当前逐点路线不是没有任何局部信号，而是信号被绑定在“沿 FM velocity 小幅缩放”这个动作族里。这个动作族对精修任务太窄，oracle 本身只给约 7% 的平方误差改善，并且 86.49% 的点已经撞到 ±10% 边界。</div>
+
+<h2 id="reward">5. Reward 信号是否合理</h2>
+<p>reward-credit 与最终 mask-level metric delta 的关系不是完全随机。它的符号方向多数时候是对的，但强度排序偏弱。这解释了为什么 PPO 能看到一点方向信号，却很难稳定推高全局指标。</p>
+<table><tr><th>最终指标</th><th>Pearson</th><th>Spearman</th><th>Sign agreement</th><th>Balanced sign</th><th>结论</th></tr>
+<tr><td>Dice</td><td class="num">0.14366</td><td class="num">0.17514</td><td class="num">0.84406</td><td class="num">0.83512</td><td>方向好，强度弱</td></tr>
+<tr><td>IoU</td><td class="num">0.14420</td><td class="num">0.17514</td><td class="num">0.84406</td><td class="num">0.83512</td><td>与 Dice 一致</td></tr>
+<tr><td>mBoundF</td><td class="num good-text">0.23724</td><td class="num">0.17326</td><td class="num">0.84115</td><td class="num">0.83186</td><td>边界指标相关性最强</td></tr>
+<tr><td>NSD</td><td class="num">0.16455</td><td class="num bad-text">0.09438</td><td class="num">0.80822</td><td class="num">0.80001</td><td>NSD 方向仍可用，排序更弱</td></tr></table>
+<div class="figure"><img src="perpoint_bottleneck_analysis/full177_oracle_reward_20260710_locany_b20/reward_credit_alignment.png" alt="reward credit alignment"><div class="caption">图 2：reward-credit 与最终 metric delta 的对齐。符号一致率高，但 Pearson/Spearman 较低。</div></div>
+<p>这说明奖励函数不是“全没信号”，但它更像一个方向判别器，不是一个高质量的强度估计器。对于 PPO 来说，强度排序弱会让 advantage 排序不稳定，尤其在动作上限又很窄时，最终表现容易停在微弱 NSD 变化而不是整体轮廓质量提升。</p>
+
+<h2 id="causal">6. 短程因果训练</h2>
+<p>为了排除“只是训练覆盖或第四步污染”的解释，做了三个 20-epoch 短程对照，均看 step1020 的 DIAG-POINT。</p>
+<table><tr><th>路线</th><th>Active steps</th><th>pref_corr</th><th>centered_corr</th><th>sign_acc</th><th>balanced</th><th>gain</th><th>结论</th></tr>
+<tr><td>final-only random</td><td>step4</td><td class="num">0.0825</td><td class="num">0.0595</td><td class="num">0.447</td><td class="num">0.507</td><td class="num">+0.000002</td><td>最终步有弱信号</td></tr>
+<tr><td>final-only cyclic</td><td>step4</td><td class="num">0.0798</td><td class="num">0.0533</td><td class="num">0.500</td><td class="num">0.515</td><td class="num">+0.000001</td><td>覆盖方式略好，但幅度很小</td></tr>
+<tr><td>last-two random</td><td>step3, step4</td><td class="num">0.0463</td><td class="num">0.0350</td><td class="num">0.488</td><td class="num">0.503</td><td class="num">+0.000002</td><td>加入前一步没有改善</td></tr></table>
+<p>这个结果支持一个折中判断：step4 确实更难，时序污染和覆盖策略会影响训练；但即使用 final-only 和 cyclic 处理，balanced 也只到 0.515 左右，不能把问题完全解释成“训练步选择不对”。</p>
+
+<h2 id="full-eval">7. 全量评估结论</h2>
+<h3>7.1 v15 对同 checkpoint FM</h3>
+<table><tr><th>指标</th><th>FM</th><th>v15</th><th>v15-FM</th><th>95% CI</th><th>判断</th></tr>
+<tr><td>IoU</td><td class="num">0.851894</td><td class="num">0.851617</td><td class="num bad-text">-0.000278</td><td class="num">[-0.001005, +0.000473]</td><td>未改善</td></tr>
+<tr><td>Dice</td><td class="num">0.918754</td><td class="num">0.918634</td><td class="num bad-text">-0.000120</td><td class="num">[-0.000608, +0.000364]</td><td>未改善</td></tr>
+<tr><td>mBoundF</td><td class="num">0.776860</td><td class="num">0.776641</td><td class="num bad-text">-0.000219</td><td class="num">[-0.001015, +0.000572]</td><td>未改善</td></tr>
+<tr><td>NSD</td><td class="num">0.865740</td><td class="num">0.867100</td><td class="num good-text">+0.001361</td><td class="num">[+0.000009, +0.002709]</td><td>有提升</td></tr></table>
+<h3>7.2 v15 对当前 delta-NSD RL</h3>
+<table><tr><th>指标</th><th>delta-NSD RL</th><th>v15</th><th>v15-deltaNSD</th><th>95% CI</th><th>判断</th></tr>
+<tr><td>IoU</td><td class="num">0.854005</td><td class="num">0.851617</td><td class="num bad-text">-0.002389</td><td class="num">[-0.003151, -0.001623]</td><td>显著更差</td></tr>
+<tr><td>Dice</td><td class="num">0.920005</td><td class="num">0.918634</td><td class="num bad-text">-0.001370</td><td class="num">[-0.001878, -0.000862]</td><td>显著更差</td></tr>
+<tr><td>mBoundF</td><td class="num">0.778915</td><td class="num">0.776641</td><td class="num bad-text">-0.002273</td><td class="num">[-0.003101, -0.001443]</td><td>显著更差</td></tr>
+<tr><td>NSD</td><td class="num">0.868963</td><td class="num">0.867100</td><td class="num bad-text">-0.001863</td><td class="num">[-0.003226, -0.000499]</td><td>显著更差</td></tr></table>
+<p>最终步点级 sign CI 为 <code>[0.50681, 0.57239]</code>，<code>p_balanced_le_0p5=0.00927</code>，但该区间没有建模轮廓内相关性，只能作为辅助证据。它说明有弱局部信号，不说明整体路线已经成功。</p>
+
+<h2 id="why">8. 为什么逐点仍不如 geom 探索</h2>
+<table><tr><th>候选原因</th><th>证据强度</th><th>判断</th></tr>
+<tr><td>H64 小网络太弱</td><td>弱</td><td>H256 不稳定优于 H64；current 线性 R² 更高，所以不能作为主因</td></tr>
+<tr><td>输入缺少可辨识信息</td><td>中到强</td><td>reward-credit probe 的 R² 很低，richer 输入只轻微改善方向</td></tr>
+<tr><td>动作族太窄</td><td>强</td><td>±10% oracle 只有 7.34% 平方误差下降，86.49% 撞边界；normal residual 上限高得多</td></tr>
+<tr><td>reward 强度排序弱</td><td>中到强</td><td>sign agreement 高，但 Pearson/Spearman 低，advantage 排序不够可靠</td></tr>
+<tr><td>step4 时序污染</td><td>中</td><td>最终步好于前一步，但 final-only 也只给很弱提升</td></tr>
+<tr><td>逐点高频破坏轮廓</td><td>中</td><td>当前小幅 scale 避免了大破坏，但同时限制了收益上限</td></tr></table>
+<div class="panel warn"><b>综合解释：</b>geom 探索虽然表达低频，但它的扰动更容易改变整体轮廓形态，并且 reward 对整体形态更敏感。逐点 FM scale 的自由度看起来高，但每个自由度只能沿 FM 方向做小幅快慢调节；一旦 FM 方向本身和 GT residual 不共线，策略再聪明也只能在错误子空间里优化。</div>
+
+<h2 id="next">9. 后续建议</h2>
+<p>下面是建议方向，不是已经上线的新训练机制。按照当前项目规矩，任何正式新增方案都需要先明确告知并得到确认。</p>
+<table><tr><th>优先级</th><th>建议</th><th>理由</th><th>风险</th></tr>
+<tr><td>高</td><td>设计受约束的 <code>FM + normal residual</code> 或局部低维 basis 动作族</td><td>oracle 显示方向自由度是核心瓶颈</td><td>需要防止锯齿和高频破坏</td></tr>
+<tr><td>高</td><td>改进 reward 强度对齐，而不只看符号</td><td>当前 reward 方向对，但排序弱，PPO advantage 会不稳</td><td>需要避免 reward 过拟合某一指标</td></tr>
+<tr><td>中</td><td>给 point policy 增加边界梯度、局部 patch、邻域上下文</td><td>当前 97-D 输入可辨识性不足</td><td>计算量上升，需做离线 probe 再上线</td></tr>
+<tr><td>中</td><td>把 final-only 作为诊断训练窗口，而不是立即替代主训练</td><td>最终步信号最干净，可用于验证动作族和 reward</td><td>可能退化为过短视的末步修正</td></tr>
+<tr><td>低</td><td>单纯把 H64 加到 H256 或更大</td><td>现有 probe 不支持这是主瓶颈</td><td>增加训练不稳定和调参成本</td></tr></table>
+<div class="panel success"><b>最现实的下一步：</b>不要先堆大网络。先用离线 oracle 和短程 final-only 对照验证一个更合理的局部动作族，例如“FM 主方向 + 小幅法向 residual + 平滑/低频约束”，再决定是否进入长训。</div>
+
+<h2 id="files">10. 文件索引与验证</h2>
+<table><tr><th>类型</th><th>路径</th><th>说明</th></tr>
+<tr><td>真实状态 cache</td><td><code>data/cache/perpoint_policy_bottlenecks/final_step_full177_cf16_20260710.npz</code></td><td>177 images，5,411 contours，692,608 valid points</td></tr>
+<tr><td>cache provenance</td><td><code>data/cache/perpoint_policy_bottlenecks/final_step_full177_cf16_20260710.provenance.json</code></td><td>记录生成口径</td></tr>
+<tr><td>动作上限 summary</td><td><code>report/perpoint_bottleneck_analysis/full177_oracle_reward_20260710_locany_b20/summary.json</code></td><td>本报告 oracle 数值来源</td></tr>
+<tr><td>动作上限图</td><td><code>report/perpoint_bottleneck_analysis/full177_oracle_reward_20260710_locany_b20/oracle_errors.png</code></td><td>图 1</td></tr>
+<tr><td>reward 对齐图</td><td><code>report/perpoint_bottleneck_analysis/full177_oracle_reward_20260710_locany_b20/reward_credit_alignment.png</code></td><td>图 2</td></tr>
+<tr><td>容量 probe</td><td><code>report/perpoint_bottleneck_analysis/full177_reward_credit_probe_20260710/summary.json</code></td><td>H64/H256/linear 对照</td></tr>
+<tr><td>全量评估</td><td><code>report/perpoint_final_eval/v15_step1020_key_paired_comparisons.json</code></td><td>v15、FM、delta-NSD 的配对比较</td></tr>
+<tr><td>分步诊断</td><td><code>report/perpoint_final_eval/v15_step1020_corrected_by_step_diag.json</code></td><td>step3/step4 点级诊断</td></tr>
+<tr><td>最终步 sign CI</td><td><code>report/perpoint_final_eval/v15_step1020_finalstep_sign_ci.json</code></td><td>辅助统计证据</td></tr>
+<tr><td>旧报告勘误目标</td><td><code>report/PERPOINT_FM_EXPLORATION_FINAL_REPORT_20260710.html</code></td><td>保留历史记录，但旧 mean/off 需按勘误阅读</td></tr></table>
+<h3>验证命令</h3>
+<table><tr><th>检查</th><th>命令 / 结果</th></tr>
+<tr><td>单测</td><td><code>/home/medteam/miniconda3/envs/locany/bin/python -m pytest -q tests/test_eval_unified_rollout.py tests/test_per_point_ppo.py tests/test_continuous_boundary_credit.py tests/test_perpoint_policy_bottlenecks.py tests/test_grpo_experiment_controls.py</code><br>结果：<code>26 passed in 13.11s</code></td></tr>
+<tr><td>上限分析</td><td><code>/home/medteam/miniconda3/envs/locany/bin/python scripts/analyze_perpoint_policy_bottlenecks.py --cache data/cache/perpoint_policy_bottlenecks/final_step_full177_cf16_20260710.npz --out-dir report/perpoint_bottleneck_analysis/full177_oracle_reward_20260710_locany_b20 --skip-probes --bootstrap-samples 20</code><br>结果：写出 8 个 artifacts</td></tr>
+<tr><td>注意</td><td>bootstrap b20 只作为 sanity CI；最终统计精度仍以 full eval 的 20,000 次 bootstrap 为主。</td></tr></table>
+
+<section class="panel danger">
+<h2 style="margin-top:0;border:0">最终判断</h2>
+<p>逐点路线目前不如 geom，并不是因为策略完全不会学习，也不是简单把小 net 加宽就能解决。它的问题更基础：当前动作族把所有点限制在 FM velocity 方向附近做 ±10% 快慢调节，而真实精修误差经常需要横向、法向或局部形态自由度。奖励函数提供了一定方向信号，但强度排序不够好，无法弥补动作族上限低的问题。</p>
+<p>因此，下一轮逐点研究应该优先改“动作空间 + reward 强度对齐”，其次再考虑输入特征和网络容量。单独加大 H64，不应该作为主线。</p>
+</section>
+
+</div></body>
+</html>

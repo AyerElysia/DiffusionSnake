@@ -99,6 +99,30 @@ class DatasetCatalog(object):
             'ann_file': '/home/medteam/Zhrch/detect_3D_lgz2/datasets/sagittal_2d_fixed/manifests/slice_manifest.csv',
             'split': 'test'
         },
+        'SagittalPseudo3DTrain': {
+            'id': 'sagittal_2d_fixed',
+            'data_root': '/home/medteam/Zhrch/detect_3D_lgz2/datasets/sagittal_2d_fixed',
+            'ann_file': '/home/medteam/Zhrch/detect_3D_lgz2/datasets/sagittal_2d_fixed/manifests/slice_manifest.csv',
+            'split': 'train'
+        },
+        'SagittalPseudo3DVal': {
+            'id': 'sagittal_2d_fixed',
+            'data_root': '/home/medteam/Zhrch/detect_3D_lgz2/datasets/sagittal_2d_fixed',
+            'ann_file': '/home/medteam/Zhrch/detect_3D_lgz2/datasets/sagittal_2d_fixed/manifests/slice_manifest.csv',
+            'split': 'val'
+        },
+        'SagittalPseudo3DMini': {
+            'id': 'sagittal_2d_fixed',
+            'data_root': '/home/medteam/Zhrch/detect_3D_lgz2/datasets/sagittal_2d_fixed',
+            'ann_file': '/home/medteam/Zhrch/detect_3D_lgz2/datasets/sagittal_2d_fixed/manifests/slice_manifest.csv',
+            'split': 'mini'
+        },
+        'SagittalPseudo3DTest': {
+            'id': 'sagittal_2d_fixed',
+            'data_root': '/home/medteam/Zhrch/detect_3D_lgz2/datasets/sagittal_2d_fixed',
+            'ann_file': '/home/medteam/Zhrch/detect_3D_lgz2/datasets/sagittal_2d_fixed/manifests/slice_manifest.csv',
+            'split': 'test'
+        },
         'VocVal': {
             'id': 'voc',
             'data_root': 'data/voc/JPEGImages',

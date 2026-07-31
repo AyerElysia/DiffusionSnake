@@ -51,6 +51,15 @@ class DiTDenoiserV3(nn.Module):
         ffn_moe_routed_scale: float = 1.0,
         ffn_moe_use_point_embed: bool = True,
         ffn_moe_use_cyclic_router: bool = True,
+        use_prototype_phi_moe: bool = False,
+        prototype_phi_moe_layers: str = 'odd',
+        prototype_phi_num_experts: int = 4,
+        prototype_phi_top_k: int = 1,
+        prototype_phi_hidden_dim: int = 0,
+        prototype_phi_router_temperature: float = 0.20,
+        prototype_phi_balance_weight: float = 1e-3,
+        prototype_phi_ema_decay: float = 0.99,
+        prototype_phi_contrastive_weight: float = 1e-3,
         **kwargs,  # Accept but ignore extra kwargs for compatibility
     ):
         super().__init__()
@@ -85,6 +94,20 @@ class DiTDenoiserV3(nn.Module):
             state_dim=state_dim, feature_dim=feature_dim
         )
 
+        layer_spec = str(prototype_phi_moe_layers).strip().lower()
+        if layer_spec == 'all':
+            prototype_layer_ids = set(range(num_layers))
+        elif layer_spec in ('odd', 'local', 'interleave'):
+            prototype_layer_ids = set(range(1, num_layers, 2))
+        elif layer_spec in ('even', 'global'):
+            prototype_layer_ids = set(range(0, num_layers, 2))
+        elif layer_spec in ('none', ''):
+            prototype_layer_ids = set()
+        else:
+            prototype_layer_ids = {
+                int(part.strip()) for part in layer_spec.split(',') if part.strip()
+            }
+
         # 5. DiT Blocks V3 (Self -> Cross Flow)
         self.dit_layers = nn.ModuleList([
             DiTBlockV3(
@@ -102,8 +125,16 @@ class DiTDenoiserV3(nn.Module):
                 ffn_moe_routed_scale=ffn_moe_routed_scale,
                 ffn_moe_use_point_embed=ffn_moe_use_point_embed,
                 ffn_moe_use_cyclic_router=ffn_moe_use_cyclic_router,
+                use_prototype_phi_moe=bool(use_prototype_phi_moe) and i in prototype_layer_ids,
+                prototype_phi_num_experts=prototype_phi_num_experts,
+                prototype_phi_top_k=prototype_phi_top_k,
+                prototype_phi_hidden_dim=prototype_phi_hidden_dim,
+                prototype_phi_router_temperature=prototype_phi_router_temperature,
+                prototype_phi_balance_weight=prototype_phi_balance_weight,
+                prototype_phi_ema_decay=prototype_phi_ema_decay,
+                prototype_phi_contrastive_weight=prototype_phi_contrastive_weight,
             )
-            for _ in range(num_layers)
+            for i in range(num_layers)
         ])
 
         # 6. Final Layer

@@ -3,7 +3,6 @@ import cv2
 import numpy as np
 import torch
 
-from lib.utils import data_utils
 from lib.utils.snake import snake_config
 
 
@@ -67,12 +66,6 @@ def draw_results(orig_img_bgr, det_b, pred_poly, gt_poly, save_path,
     cv2.imwrite(save_path, img)
 
 
-def _to_numpy(x):
-    if isinstance(x, torch.Tensor):
-        x = x.detach().cpu().numpy()
-    return np.asarray(x, dtype=np.float32)
-
-
 def save_affine_visualization(*, output: dict, batch: dict, tag: str, save_dir: str):
     if batch is None:
         return
@@ -93,68 +86,53 @@ def save_affine_visualization(*, output: dict, batch: dict, tag: str, save_dir: 
     else:
         inp_img = np.array(inp_bgr)
 
-    center = _to_numpy(batch['meta']['center'][0])
-    scale = _to_numpy(batch['meta']['scale'][0])
-    input_w, input_h = int(snake_config.voc_input_w), int(snake_config.voc_input_h)
-    output_w = int(input_w // snake_config.down_ratio)
-    output_h = int(input_h // snake_config.down_ratio)
-    trans_input_inv = data_utils.get_affine_transform(
-        center, scale, 0, [input_w, input_h], inv=1
-    ).astype(np.float32)
-    trans_output_inv = data_utils.get_affine_transform(
-        center, scale, 0, [output_w, output_h], inv=1
-    ).astype(np.float32)
-
-    def apply_affine_pts(pts, M):
-        return data_utils.affine_transform(pts.reshape(-1, 2), M).reshape(pts.shape)
-
-    # detections in original-image coords
+    # `orig_img` is the already-warped network input. Detection boxes are in
+    # input coordinates, while Snake/Flow polygons are in stride-4 feature
+    # coordinates. Keep every overlay in this affine-input frame.
     det = output.get('detection', None)
-    det_orig = None
-    if det is not None and isinstance(det, torch.Tensor) and det.size(0) > 0:
-        det_b = det[0].detach().float().cpu()
-        det_raw = det_b.numpy().copy()
-        for i in range(det_raw.shape[0]):
-            x1, y1, x2, y2 = det_raw[i, :4]
-            p = np.array([[x1, y1], [x2, y2]], dtype=np.float32)
-            p_orig = apply_affine_pts(p, trans_input_inv)
-            det_raw[i, 0:2] = p_orig[0]
-            det_raw[i, 2:4] = p_orig[1]
-        det_orig = torch.from_numpy(det_raw)
+    det_affine = None
+    if isinstance(det, torch.Tensor) and det.ndim == 3 and det.size(0) > 0:
+        det_affine = det[0].detach().float().cpu()
 
-    # polys in original-image coords
+    output_stride = float(snake_config.down_ratio)
     pred_py = output.get('py', None)
-    pred_orig = None
+    pred_affine = None
     if pred_py is not None:
-        last = pred_py[-1] if isinstance(pred_py, list) else pred_py
+        last = pred_py[-1] if isinstance(pred_py, (list, tuple)) else pred_py
         if isinstance(last, torch.Tensor) and last.numel() > 0:
-            pred_raw = last.detach().float().cpu().numpy()
-            pred_orig = apply_affine_pts(pred_raw, trans_output_inv)
+            pred_affine = last.detach().float().cpu().numpy() * output_stride
 
     init_py = output.get('it_py', None)
-    init_orig = None
+    init_affine = None
     if isinstance(init_py, torch.Tensor) and init_py.numel() > 0:
-        init_raw = init_py.detach().float().cpu().numpy()
-        init_orig = apply_affine_pts(init_raw, trans_output_inv)
+        init_affine = init_py.detach().float().cpu().numpy() * output_stride
 
-    gt_orig = None
+    gt_affine = None
     if 'i_gt_py' in batch and 'meta' in batch and 'ct_num' in batch['meta']:
         ct_meta = batch['meta']['ct_num']
         ct_num = int(ct_meta[0].item()) if isinstance(ct_meta, torch.Tensor) else int(ct_meta)
         gt = batch['i_gt_py'][0][:ct_num]
         if isinstance(gt, torch.Tensor):
             gt = gt.detach().float().cpu().numpy()
-        gt_orig = apply_affine_pts(gt, trans_output_inv)
+        gt_affine = np.asarray(gt, dtype=np.float32) * output_stride
 
-    gt4_orig = None
+    gt4_affine = None
     if 'i_gt_4py' in batch and 'meta' in batch and 'ct_num' in batch['meta']:
         ct_meta = batch['meta']['ct_num']
         ct_num = int(ct_meta[0].item()) if isinstance(ct_meta, torch.Tensor) else int(ct_meta)
         gt4 = batch['i_gt_4py'][0][:ct_num]
         if isinstance(gt4, torch.Tensor):
             gt4 = gt4.detach().float().cpu().numpy()
-        gt4_orig = apply_affine_pts(gt4, trans_output_inv)
+        gt4_affine = np.asarray(gt4, dtype=np.float32) * output_stride
 
     os.makedirs(save_dir, exist_ok=True)
     save_path_aff = os.path.join(save_dir, f'vis_affine_{tag}.png')
-    draw_results(inp_img, det_orig, pred_orig, gt_orig, save_path_aff, init_poly=init_orig, gt4_poly=gt4_orig)
+    draw_results(
+        inp_img,
+        det_affine,
+        pred_affine,
+        gt_affine,
+        save_path_aff,
+        init_poly=init_affine,
+        gt4_poly=gt4_affine,
+    )

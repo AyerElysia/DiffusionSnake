@@ -218,6 +218,53 @@ class Dataset(data.Dataset):
                 test_ids = sorted(set(all_ids) - train_set)
                 self.imgs = [id_to_path[i] for i in test_ids if i in id_to_path]
 
+        # locate_feat cache setup (matches lib/datasets/voc/snake.py logic)
+        self.locate_feat_enabled = bool(
+            getattr(cfg, 'locate_feat_inject', False)
+            or getattr(cfg, 'locate_feat_replace', False)
+            or getattr(cfg, 'use_locate_token_dit', False)
+        )
+        cache_root = getattr(cfg, 'locate_feat_cache_dir', '') or getattr(cfg, 'locate_feat_cache_root', 'data/locate_feat_cache')
+        self.locate_feat_cache_root = str(cache_root or '')
+        keys = getattr(cfg, 'locate_feat_keys', ['feat'])
+        if isinstance(keys, str):
+            keys = [x.strip() for x in keys.split(',') if x.strip()]
+        self.locate_feat_keys = list(keys) if keys else ['feat']
+        # test/val images always use the "test" cache subdirectory
+        self.locate_feat_split = 'test'
+
+    def _load_locate_feature(self, img_path):
+        """Load pre-computed MoonViT locate features from cache (mirrors lib/datasets/voc/snake.py)."""
+        if not self.locate_feat_enabled:
+            return None
+        stem = os.path.splitext(os.path.basename(img_path))[0]  # e.g. "157_image"
+        feat_path = os.path.join(self.locate_feat_cache_root, self.locate_feat_split, f'{stem}.npz')
+        if not os.path.exists(feat_path):
+            return None
+        try:
+            import numpy as np
+            npz = np.load(feat_path)
+            missing_keys = [key for key in self.locate_feat_keys if key not in npz.files]
+            if missing_keys:
+                return None
+            arrays = [np.asarray(npz[key], dtype=np.float16) for key in self.locate_feat_keys]
+            feat = np.concatenate(arrays, axis=0) if len(arrays) > 1 else arrays[0]
+            def get_npz(k, default):
+                return npz[k].tolist() if k in npz.files else default
+            return {
+                'locate_feat': feat,
+                'locate_feat_grid_hw': np.asarray(get_npz('grid_hw', feat.shape[-2:]), dtype=np.int32),
+                'locate_feat_orig_hw': np.asarray(get_npz('orig_hw', [0, 0]), dtype=np.int32),
+                'locate_feat_resized_hw': np.asarray(get_npz('resized_hw', [0, 0]), dtype=np.int32),
+                'locate_feat_padded_hw': np.asarray(get_npz('padded_hw', [0, 0]), dtype=np.int32),
+                'locate_feat_pad': np.asarray(get_npz('pad', [0, 0, 0, 0]), dtype=np.int32),
+                'locate_feat_scale': np.asarray(get_npz('scale', [1.0]), dtype=np.float32),
+                'locate_feat_patch_size': np.asarray(get_npz('patch_size', [14]), dtype=np.int32),
+                'locate_feat_path': feat_path,
+            }
+        except Exception:
+            return None
+
     def normalize_image(self, inp):
         inp = (inp.astype(np.float32) / 255.)
         inp = (inp - snake_config.mean) / snake_config.std
@@ -255,9 +302,23 @@ class Dataset(data.Dataset):
         # inp = inp[:, start_x:end_x, start_y:end_y]
         # # =====================================
 
+        inv_trans_input = cv2.invertAffineTransform(trans_input).astype(np.float32)
         ret = {'inp': inp}
-        meta = {'center': center, 'scale': scale, 'vis_GT': '', 'ann': ''}
+        meta = {
+            'center': center,
+            'scale': scale,
+            'vis_GT': '',
+            'ann': '',
+            'inv_trans_input': inv_trans_input,
+            'orig_hw': np.asarray([height, width], dtype=np.float32),
+            'flipped': np.asarray([0], dtype=np.float32),
+        }
         ret.update({'meta': meta})
+
+        # Load locate features from cache if enabled
+        locate_feat = self._load_locate_feature(self.imgs[index])
+        if locate_feat is not None:
+            ret.update(locate_feat)
 
         return ret, self.imgs[index]
 
@@ -534,7 +595,9 @@ def visualize_polygons(pred_polys_tensor, orig_img, detection, save_name, class_
         cv2.imwrite(save_path, canvas)
 
 def TEST():
-    visual = 1
+    visual = 0  # 全量评估时关闭可视化，只输出指标
+    # 评估时强制关闭 gt detection，避免 ct_01 KeyError
+    cfg.use_gt_det = False
     network = make_network(cfg).cuda()
     # 指标日志文件
     log_path = os.path.join(cfg.test.visual_save_root, 'metrics_log.txt')
@@ -650,29 +713,34 @@ def TEST():
         img = cv2.imread(img_path)
         print(img_name)
         batch['inp'] = torch.FloatTensor(batch['inp'])[None].cuda()
+        # Add batch dimension to locate_feat and related meta so ct_snake can process them
+        if 'locate_feat' in batch:
+            import torch as _torch
+            batch['locate_feat'] = _torch.as_tensor(batch['locate_feat'], dtype=_torch.float16).unsqueeze(0).cuda()
+            for _k in ('locate_feat_grid_hw', 'locate_feat_pad', 'locate_feat_scale', 'locate_feat_patch_size'):
+                if _k in batch:
+                    batch[_k] = _torch.as_tensor(batch[_k]).unsqueeze(0)
+        if 'meta' in batch:
+            for _k in ('inv_trans_input', 'orig_hw', 'flipped'):
+                if _k in batch['meta']:
+                    import numpy as _np
+                    v = batch['meta'][_k]
+                    if isinstance(v, _np.ndarray):
+                        batch['meta'][_k] = v[None]  # add batch dim
         with torch.no_grad():
-            output = network(batch['inp'], batch)  # dict_keys(['ct_hm', 'wh', 'ct', 'detection', 'it_ex', 'ex', 'it_py', 'py'])
+            output = network(batch['inp'], batch)
             poly = output['py']
-            detection = output['detection']
-            
-            # if detection.shape[1] > 0:  # 确保有检测结果
-            #     print(f"检测结果数量: {detection.shape[1]}")
-            #     # 统计各类别的检测数量
-            #     unique_classes, counts = torch.unique(detection[:, :, 5], return_counts=True)
-            #     for cls, count in zip(unique_classes, counts):
-            #         print(f"  类别 {int(cls)}: {count} 个检测结果")
+            detection = output.get('detection', None)
+            # poly 可能是 list 或 tensor；取最后一个精炼步的结果
+            poly_last = poly[-1] if (isinstance(poly, (list, tuple)) and len(poly) > 0) \
+                        else (poly if isinstance(poly, torch.Tensor) and poly.shape[0] > 0 else None)
 
-            # ===== 评估 =====
-            # 预测实例掩码与类别
-            # 处理GT掩码，按类别分组
+            # ===== 处理GT掩码 =====
             mask_paths = glob.glob(img_path.replace("_image.png", "_mask") + "*")
             gt_masks = []
             gt_classes = []
-            mask_gt_combined = np.zeros((512, 512))  # 用于类别无关的整体计算
-            
+            mask_gt_combined = np.zeros((512, 512))
             for maskpath in mask_paths:
-                # 从文件名提取类别信息
-                # 假设文件名格式为: xxx_mask_classID.png
                 class_match = re.search(r'_mask_(\d+)\.png', maskpath)
                 if class_match:
                     class_id = int(class_match.group(1))
@@ -681,47 +749,23 @@ def TEST():
                     gt_masks.append(mask_binary)
                     gt_classes.append(class_id)
                     mask_gt_combined = np.maximum(mask_gt_combined, mask_binary)
-                
-            # ===== 可视化 =====
-            if visual:
-                visual_poly = poly[-1] * 4
-                visualize_polygons(visual_poly, img, detection=detection, save_name=img_name, class_colors=class_colors, class_name=class_list, gt_masks=gt_masks)
-            
 
-            # # 提取每个检测结果的金标签，用于信息传递
-            # for i in range (poly[-1].shape[0]):
-            #     # 为每个预测创建单独的掩码
-            #     single_poly = poly[-1][i:i+1]
-            #     single_mask = poly2mask(single_poly)
-            #     max_iou = 0
-            #     for j in range(len(gt_masks)):
-            #         iou = cal_iou(single_mask, gt_masks[j])
-            #         if iou > max_iou:
-            #             max_iou = iou
-            #             label = gt_classes[j]
-            #     if (detection[0, i, 5]+1) != label:
-            #         print(f"poly {i} convert label from {detection[0, i, 5]+1} to {label}")
-            #         detection[0, i, 5] = label
-                
-            # 如果没有找到按类别分组的掩码，使用原始方式
             if not gt_masks:
                 for maskpath in mask_paths:
                     mask = cv2.imread(maskpath, 0)
-                    mask_binary = (mask > 0).astype(np.float32)
-                    mask_gt_combined = np.maximum(mask_gt_combined, mask_binary)
-                # 对于无法识别类别的情况，假设为类别1
+                    if mask is not None:
+                        mask_binary = (mask > 0).astype(np.float32)
+                        mask_gt_combined = np.maximum(mask_gt_combined, mask_binary)
                 gt_masks = [mask_gt_combined]
                 gt_classes = [1]
-            
-            # 确保mask_gt的值在0-1之间
+
             mask_gt_combined = np.clip(mask_gt_combined, 0, 1)
-            
-            # 修复：正确生成类别无关的预测掩码，使用所有预测结果
+
+            # ===== 生成预测掩码 =====
             pred_mask_combined = np.zeros((512, 512))
-            if poly[-1].shape[0] > 0:  # 确保有预测结果
-                for j in range(poly[-1].shape[0]):
-                    # 为每个预测创建单独的掩码，然后合并
-                    single_poly = poly[-1][j:j+1]
+            if poly_last is not None and poly_last.shape[0] > 0:
+                for j in range(poly_last.shape[0]):
+                    single_poly = poly_last[j:j+1]
                     single_mask = poly2mask(single_poly)
                     pred_mask_combined = np.maximum(pred_mask_combined, single_mask)
             
@@ -729,28 +773,37 @@ def TEST():
             iou_overall = cal_iou(pred_mask_combined, mask_gt_combined)
             # dice_overall = cal_dice(pred_mask_combined, mask_gt_combined)
             dice_overall = cal_dice(iou_overall)
-            mBoundF_agnostic = cal_mBoundF_agnostic(pred_mask_combined, mask_gt_combined)
+            mBoundF_agnostic = cal_boundary_dice(pred_mask_combined, mask_gt_combined)
             
             print(f"Overall IoU: {iou_overall:.4f}, Dice: {dice_overall:.4f}, mBoundF: {mBoundF_agnostic:.4f}")
             iousum += iou_overall
             dicesumm += dice_overall
             mBoundF_agnostic_sum += mBoundF_agnostic
-            
+
+            # 类别相关指标默认值，避免未赋值时日志写入报错
+            mean_iou = mean_dice = mBoundF = 0.0
+
             # 计算类别相关的指标
             # 构建预测掩码列表和类别列表
             pred_masks = []
             pred_classes = []
-            if poly[-1].shape[0] > 0:  # 确保有预测结果
-                for j in range(poly[-1].shape[0]):
-                    # 为每个预测创建单独的掩码
-                    single_poly = poly[-1][j:j+1]  # 取单个poly，形状 [1, num_points, 2]
+            if poly_last is not None and poly_last.shape[0] > 0:
+                for j in range(poly_last.shape[0]):
+                    single_poly = poly_last[j:j+1]
                     pred_mask = poly2mask(single_poly)
                     pred_masks.append(pred_mask)
-                    pred_classes.append(int(detection[0, j, 5])+1)
+                    if detection is not None:
+                        pred_classes.append(int(detection[0, j, 5]) + 1)
+                    else:
+                        if gt_masks:
+                            best = int(np.argmax([cal_iou(pred_mask, gm) for gm in gt_masks]))
+                            pred_classes.append(gt_classes[best])
+                        else:
+                            pred_classes.append(1)
 
             pred_masks_merged = []
             pred_classes_merged = []
-            if len(pred_mask) > 0:
+            if len(pred_masks) > 0:
                 merged_by_class = {}
                 for m, c in zip(pred_masks, pred_classes):
                     if c not in merged_by_class:

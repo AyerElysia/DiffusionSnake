@@ -1,6 +1,9 @@
 from collections import deque, defaultdict
 import torch
-from tensorboardX import SummaryWriter
+try:
+    from tensorboardX import SummaryWriter
+except ImportError:
+    from torch.utils.tensorboard import SummaryWriter
 import os
 
 # 这个文件没啥看的
@@ -56,9 +59,18 @@ class Recorder(object):
         else:
             self.processor = None
 
+    def close(self):
+        writer = getattr(self, 'writer', None)
+        if writer is not None:
+            writer.close()
+
     def update_loss_stats(self, loss_dict):
         for k, v in loss_dict.items():
-            self.loss_stats[k].update(v.detach().cpu())
+            if torch.is_tensor(v):
+                v = float(v.detach().cpu())
+            else:
+                v = float(v)
+            self.loss_stats[k].update(v)
 
     def update_image_stats(self, image_stats):
         if self.processor is None:
@@ -104,4 +116,3 @@ class Recorder(object):
 
 def make_recorder(cfg):
     return Recorder(cfg)
-

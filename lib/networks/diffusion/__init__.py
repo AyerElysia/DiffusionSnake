@@ -1,12 +1,36 @@
 from lib.utils.snake import snake_config
 from .ct_snake import get_network as get_ro
-from .pretrain_evolution import DiffusionEvolution
-from .grpo_evolution import GRPOEvolution
-from .dit_denoiser import DiTDenoiser
 
 _network_factory = {
     'ro': get_ro
 }
+
+
+def __getattr__(name):
+    """Lazily expose legacy diffusion classes without loading optional deps."""
+    if name == 'DiffusionEvolution':
+        from .pretrain_evolution import DiffusionEvolution
+        globals()[name] = DiffusionEvolution
+        return DiffusionEvolution
+    if name == 'GRPOEvolution':
+        from .grpo_evolution import GRPOEvolution
+        globals()[name] = GRPOEvolution
+        return GRPOEvolution
+    if name == 'DiTDenoiser':
+        from .dit_denoiser import DiTDenoiser
+        globals()[name] = DiTDenoiser
+        return DiTDenoiser
+    raise AttributeError("module {!r} has no attribute {!r}".format(__name__, name))
+
+
+__all__ = (
+    'DiffusionEvolution',
+    'GRPOEvolution',
+    'DiTDenoiser',
+    'make_evolution',
+    'get_network',
+)
+
 
 def make_evolution(use_grpo=False, **kwargs):
     """Factory function to create the appropriate evolution module.
@@ -32,7 +56,9 @@ def make_evolution(use_grpo=False, **kwargs):
             ode_steps=kwargs.get('flow_ode_steps', 10)
         )
     if use_grpo:
+        from .grpo_evolution import GRPOEvolution
         return GRPOEvolution(**kwargs)
+    from .pretrain_evolution import DiffusionEvolution
     diffusion_kwargs = dict(kwargs)
     diffusion_kwargs.pop('use_flow_matching', None)
     diffusion_kwargs.pop('flow_ode_steps', None)

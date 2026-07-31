@@ -31,6 +31,8 @@ from lib.datasets.collate_batch import make_collator
 from lib.datasets.make_dataset import make_dataset
 from lib.datasets.transforms import make_transforms
 from lib.networks import make_network
+from lib.train.per_point_fm_policy import PerPointFMScalePolicy
+from lib.train.rewards.region_reward import _calc_nsd
 from lib.train.trainers import make_trainer
 from lib.utils.snake import snake_config, snake_decode, snake_gcn_utils
 from lib.utils.snake.viz_colors import (
@@ -195,25 +197,191 @@ def compute_ordered_or_matched_metrics(pred_polys, gt_polys, height, width, matc
                 iou_mat[gi, :] = -1
                 iou_mat[:, pi] = -1
 
+    nsd_delta_px = float(os.environ.get('NSD_DELTA_PX', '2.0'))
     per_iou = []
     per_dice = []
     per_mboundf = []
+    per_nsd = []
     for gi, gt_mask in enumerate(gt_masks):
         pi = matched_pred[gi]
         if pi < 0 or pi >= len(pred_masks):
             per_iou.append(0.0)
             per_dice.append(0.0)
             per_mboundf.append(0.0)
+            per_nsd.append(0.0)
             continue
         iou = compute_iou(pred_masks[pi], gt_mask)
         per_iou.append(iou)
         per_dice.append(compute_dice_from_iou(iou))
         per_mboundf.append(compute_mboundf(pred_masks[pi], gt_mask))
+        per_nsd.append(float(_calc_nsd(pred_masks[pi], gt_mask, delta_px=nsd_delta_px)))
 
-    return per_iou, per_dice, per_mboundf, matched_pred
+    return per_iou, per_dice, per_mboundf, per_nsd, matched_pred
 
 
-def load_model(ckpt_path=None):
+_UNIFIED_POLICY_OUTER_STEPS = 5
+
+
+def _policy_cfg(name, default):
+    nested = getattr(cfg, 'rl_v4', None)
+    if nested is not None and name in nested:
+        return nested[name]
+    return getattr(cfg, f'rl_v4_{name}', default)
+
+
+def _normalize_rollout_fractions(fractions, outer_steps):
+    fractions = [float(v) for v in list(fractions)]
+    if not fractions:
+        fractions = [1.0 / (outer_steps - i) for i in range(outer_steps)]
+    if len(fractions) < outer_steps:
+        fractions.extend([1.0] * (outer_steps - len(fractions)))
+    return fractions[:outer_steps]
+
+
+def _resolve_active_policy_steps(checkpoint_metadata, outer_steps):
+    explicit = checkpoint_metadata.get('active_policy_step_indices')
+    if explicit is not None:
+        active_steps = sorted({int(v) for v in explicit})
+        if not active_steps or any(v < 0 or v >= outer_steps for v in active_steps):
+            raise RuntimeError(
+                f'Invalid active_policy_step_indices={explicit} for outer_steps={outer_steps}'
+            )
+        return active_steps, len(active_steps)
+
+    train_last_n_steps = int(
+        checkpoint_metadata.get(
+            'policy_train_last_n_steps',
+            _policy_cfg('policy_train_last_n_steps', outer_steps),
+        )
+    )
+    if not 1 <= train_last_n_steps <= outer_steps:
+        raise RuntimeError(
+            f'Invalid policy_train_last_n_steps={train_last_n_steps} for outer_steps={outer_steps}'
+        )
+    return list(range(outer_steps - train_last_n_steps, outer_steps)), train_last_n_steps
+
+
+def _build_rollout_metadata(
+    requested_mode,
+    effective_mode,
+    checkpoint_has_per_point_policy,
+    fractions,
+    actual_ode_steps,
+    active_step_indices,
+    zero_mean_local=False,
+    max_scale=None,
+    train_last_n_steps=0,
+    rollout_backend=None,
+    deterministic=None,
+):
+    fractions = [float(v) for v in fractions]
+    active_step_indices = [int(v) for v in active_step_indices]
+    unified = bool(checkpoint_has_per_point_policy)
+    if unified and len(fractions) != _UNIFIED_POLICY_OUTER_STEPS:
+        raise RuntimeError(
+            f'Per-point policy evaluation requires {_UNIFIED_POLICY_OUTER_STEPS} fractions, '
+            f'got {fractions}'
+        )
+    if rollout_backend is None:
+        rollout_backend = (
+            'unified_per_point_5step_deterministic' if unified else 'configured_native'
+        )
+    if deterministic is None:
+        deterministic = unified
+    return {
+        'requested_mode': requested_mode,
+        'effective_mode': effective_mode,
+        'checkpoint_has_per_point_policy': unified,
+        'loaded': False,
+        'deterministic': bool(deterministic),
+        'rollout_backend': str(rollout_backend),
+        'outer_steps': len(fractions),
+        'outer_step_indices': list(range(len(fractions))),
+        'actual_ode_steps': int(actual_ode_steps),
+        'fractions': fractions,
+        'train_last_n_steps': int(train_last_n_steps),
+        'active_step_indices': active_step_indices,
+        'scale_applied_step_indices': (
+            active_step_indices if effective_mode == 'mean' else []
+        ),
+        'max_scale': None if max_scale is None else float(max_scale),
+        'zero_mean_local': bool(zero_mean_local),
+    }
+
+
+def _configured_native_rollout_metadata(requested_mode, eval_ode_steps=None):
+    if bool(getattr(cfg, 'use_curve_inference', False)):
+        return _build_rollout_metadata(
+            requested_mode,
+            'off',
+            False,
+            [],
+            int(getattr(cfg, 'curve_steps', 20)),
+            [],
+            rollout_backend='configured_curve_sampling',
+        )
+
+    if not bool(getattr(cfg, 'use_iterative_refinement', False)):
+        actual_ode_steps = int(
+            getattr(cfg, 'flow_ode_steps', 10)
+            if eval_ode_steps is None
+            else eval_ode_steps
+        )
+        return _build_rollout_metadata(
+            requested_mode,
+            'off',
+            False,
+            [1.0],
+            actual_ode_steps,
+            [],
+            rollout_backend='configured_single_sampling',
+        )
+
+    iter_steps = int(getattr(cfg, 'iterative_num_steps', 3))
+    if bool(getattr(cfg, 'v4_9_use_rich_infer_schedule', False)):
+        targets = list(getattr(cfg, 'v4_9_infer_target_fractions', []))
+        if not targets:
+            targets = [0.3333, 0.5, 0.80, 0.97, 1.0]
+        fractions = []
+        previous = 0.0
+        for target in targets:
+            target = min(max(float(target), previous), 1.0)
+            fractions.append((target - previous) / max(1.0 - previous, 1e-6))
+            previous = target
+    else:
+        fractions = list(getattr(cfg, 'iterative_fractions', []))
+    fractions = _normalize_rollout_fractions(fractions, iter_steps)
+    actual_ode_steps = int(
+        getattr(
+            cfg,
+            'iterative_ode_steps',
+            getattr(cfg, 'iterative_ddim_steps', getattr(cfg, 'flow_ode_steps', 10)),
+        )
+    )
+    if actual_ode_steps <= 0:
+        actual_ode_steps = int(
+            getattr(cfg, 'flow_ode_steps', 10)
+            if eval_ode_steps is None
+            else eval_ode_steps
+        )
+    return _build_rollout_metadata(
+        requested_mode,
+        'off',
+        False,
+        fractions,
+        actual_ode_steps,
+        [],
+        rollout_backend='configured_iterative_sampling',
+    )
+
+
+def load_model(ckpt_path=None, return_policy=False, eval_ode_steps=None):
+    requested_mode = os.environ.get('EVAL_FM_POLICY', 'auto').strip().lower()
+    if requested_mode not in ('auto', 'off', 'mean'):
+        raise ValueError(
+            f'Invalid EVAL_FM_POLICY={requested_mode!r}; expected auto, off, or mean'
+        )
+
     network = make_network(cfg)
     trainer = make_trainer(cfg, network)
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
@@ -236,7 +404,110 @@ def load_model(ckpt_path=None):
     info = wrapper.load_state_dict(sd, strict=False)
     n_ok = len(sd) - len(info.missing_keys)
     print(f'[✔] Loaded {n_ok} / {len(sd)} keys (missing={len(info.missing_keys)}, unexpected={len(info.unexpected_keys)})')
-    return trainer.network.to(device).eval(), device, ckpt_path
+
+    policy_sd = ckpt_obj.get('fm_velocity_policy_state_dict') if isinstance(ckpt_obj, dict) else None
+    action_policy = str(_policy_cfg('action_policy', '')).strip().lower()
+    has_per_point_policy = (
+        isinstance(policy_sd, dict)
+        and action_policy == 'per_point_fm_scale'
+        and any(str(k).startswith('point_net.') for k in policy_sd)
+    )
+    if requested_mode == 'mean' and not has_per_point_policy:
+        raise RuntimeError(
+            'EVAL_FM_POLICY=mean requires a per_point_fm_scale policy checkpoint'
+        )
+    effective_mode = 'mean' if requested_mode != 'off' and has_per_point_policy else 'off'
+    checkpoint_metadata = (
+        ckpt_obj.get('experiment_metadata', {}) if isinstance(ckpt_obj, dict) else {}
+    )
+    if not isinstance(checkpoint_metadata, dict):
+        checkpoint_metadata = {}
+
+    policy = None
+    if has_per_point_policy:
+        outer_steps = int(_policy_cfg('outer_steps', _UNIFIED_POLICY_OUTER_STEPS))
+        state_outer_steps = int(policy_sd['step_embed.weight'].shape[0])
+        if outer_steps != _UNIFIED_POLICY_OUTER_STEPS or state_outer_steps != outer_steps:
+            raise RuntimeError(
+                'Unified per-point evaluation requires a 5-step policy; '
+                f'config outer_steps={outer_steps}, checkpoint outer_steps={state_outer_steps}'
+            )
+        fractions = _normalize_rollout_fractions(
+            _policy_cfg('fractions', getattr(cfg, 'iterative_fractions', [])),
+            outer_steps,
+        )
+        actual_ode_steps = int(
+            _policy_cfg(
+                'ode_steps',
+                getattr(cfg, 'iterative_ode_steps', getattr(cfg, 'flow_ode_steps', 10)),
+            )
+        )
+        if actual_ode_steps <= 0:
+            actual_ode_steps = int(getattr(cfg, 'flow_ode_steps', 10))
+        active_step_indices, train_last_n_steps = _resolve_active_policy_steps(
+            checkpoint_metadata, outer_steps
+        )
+        zero_mean_local = bool(
+            checkpoint_metadata.get(
+                'fm_velocity_zero_mean_local',
+                _policy_cfg('fm_velocity_zero_mean_local', False),
+            )
+        )
+        max_scale = float(
+            checkpoint_metadata.get(
+                'fm_velocity_max_scale',
+                _policy_cfg('fm_velocity_max_scale', 0.25),
+            )
+        )
+        policy_metadata = _build_rollout_metadata(
+            requested_mode,
+            effective_mode,
+            True,
+            fractions,
+            actual_ode_steps,
+            active_step_indices,
+            zero_mean_local=zero_mean_local,
+            max_scale=max_scale,
+            train_last_n_steps=train_last_n_steps,
+        )
+        if effective_mode == 'mean':
+            policy = PerPointFMScalePolicy(
+                outer_steps=outer_steps,
+                feature_dim=int(_policy_cfg('fm_velocity_feature_dim', 64)),
+                feature_embed_dim=int(_policy_cfg('fm_velocity_feature_embed_dim', 32)),
+                hidden_dim=int(_policy_cfg('fm_velocity_hidden_dim', 64)),
+                init_logstd=float(_policy_cfg('fm_velocity_init_logstd', -1.0)),
+                logstd_min=float(_policy_cfg('fm_velocity_logstd_min', -4.0)),
+                logstd_max=float(_policy_cfg('fm_velocity_logstd_max', 1.0)),
+                offset_scale=float(_policy_cfg('fm_velocity_offset_scale', 0.5)),
+                max_scale=max_scale,
+                zero_mean_local=zero_mean_local,
+            ).to(device)
+            policy.load_state_dict(policy_sd, strict=True)
+            policy.eval()
+            policy_metadata['loaded'] = True
+    else:
+        policy_metadata = _configured_native_rollout_metadata(
+            requested_mode, eval_ode_steps=eval_ode_steps
+        )
+
+    print(
+        '[*] FM policy: requested={} effective={} loaded={} backend={} '
+        'actual_ode_steps={} fractions={} active_steps={} scale_steps={}'.format(
+            requested_mode,
+            policy_metadata['effective_mode'],
+            policy_metadata['loaded'],
+            policy_metadata['rollout_backend'],
+            policy_metadata['actual_ode_steps'],
+            policy_metadata['fractions'],
+            policy_metadata['active_step_indices'],
+            policy_metadata['scale_applied_step_indices'],
+        )
+    )
+    result = (trainer.network.to(device).eval(), device, ckpt_path)
+    if return_policy:
+        return result + (policy, policy_metadata)
+    return result
 
 
 def get_extreme_points_torch(pts, thresh=0.02):
@@ -808,7 +1079,217 @@ def save_visual(
             cv2.imwrite(os.path.join(pair_dir, out_name), crop)
 
 
-def eval_sample(model, device, batch, ode_steps=10, save_visuals=False, sample_dir=None):
+def _flow_disp_from_zero_latent(
+    flow, cnn_feature, current, c_cur, py_ind, steps, return_context=False
+):
+    steps = max(int(steps), 1)
+    ctx = flow.prepare_sampling_context(cnn_feature, current, py_ind)
+    x = torch.zeros_like(current)
+    x_self_cond = torch.zeros_like(x) if getattr(flow, '_use_self_conditioning', False) else None
+    dt = 1.0 / float(steps)
+    for idx in range(steps):
+        x, _, _, _, next_self_cond = flow.step_with_logprob(
+            cnn_feature,
+            current,
+            c_cur,
+            py_ind,
+            x_t=x,
+            t_value=idx * dt,
+            step_index=idx,
+            total_steps=steps,
+            action_std=0.0,
+            prev_sample=None,
+            sampled_feat=ctx['sampled_feat'],
+            detail_feat=ctx['detail_feat'],
+            contour_scale=ctx['contour_scale'],
+            x_self_cond=x_self_cond,
+            step_mode='gaussian',
+        )
+        if getattr(flow, '_use_self_conditioning', False):
+            x_self_cond = next_self_cond
+    disp = flow.clamp_pred_disp(
+        flow.denormalize_pred_disp(x, ctx['contour_scale']), current
+    )
+    return (disp, ctx) if return_context else (disp, ctx['sampled_feat'])
+
+
+def _deterministic_unified_rollout(
+    gcn,
+    policy,
+    cnn_feature,
+    initial,
+    py_ind,
+    fractions,
+    ode_steps,
+    active_step_indices=None,
+    return_states=False,
+    return_step_records=False,
+):
+    fractions = [float(v) for v in fractions]
+    if len(fractions) != _UNIFIED_POLICY_OUTER_STEPS:
+        raise ValueError(
+            f'Unified rollout requires {_UNIFIED_POLICY_OUTER_STEPS} fractions, got {fractions}'
+        )
+    current = initial
+    active_steps = (
+        set(range(len(fractions)))
+        if active_step_indices is None
+        else {int(v) for v in active_step_indices}
+    )
+    states = [current]
+    step_records = []
+    for si, frac in enumerate(fractions):
+        c_cur = snake_gcn_utils.img_poly_to_can_poly(current)
+        raw_disp, ctx = _flow_disp_from_zero_latent(
+            gcn,
+            cnn_feature,
+            current,
+            c_cur,
+            py_ind,
+            ode_steps,
+            return_context=True,
+        )
+        mean = raw_disp * frac
+        action = mean
+        if policy is not None and si in active_steps:
+            mu, _ = policy(si, current, c_cur, mean, ctx['sampled_feat'], frac)
+            scale = torch.tanh(mu) * float(policy.max_scale)
+            action = mean * (1.0 + scale.unsqueeze(-1))
+        if return_step_records:
+            step_records.append({
+                'step_index': int(si),
+                'fraction': float(frac),
+                'state': current,
+                'canonical_state': c_cur,
+                'fm_velocity': raw_disp,
+                'mean_action': mean,
+                'sampled_feat': ctx['sampled_feat'],
+                'detail_feat': ctx.get('detail_feat'),
+                'contour_scale': ctx['contour_scale'],
+            })
+        current = current + action
+        states.append(current)
+    disp = current - initial
+    if return_step_records:
+        return disp, states, step_records
+    return (disp, states) if return_states else disp
+
+
+def _sample_identity(sample, index):
+    path = sample.get('img_path') if isinstance(sample, dict) else None
+    if isinstance(path, (list, tuple)):
+        path = path[0] if path else None
+    if isinstance(path, bytes):
+        path = path.decode('utf-8', errors='replace')
+    if path is not None:
+        path = str(path)
+    sample_id = os.path.splitext(os.path.basename(path))[0] if path else str(index)
+    return {
+        'sample_id': sample_id,
+        'sample_path': path,
+    }
+
+
+@torch.no_grad()
+def prepare_manual_gt_init_context(core, batch, device):
+    """Build the manual GT-init feature/contour context used by evaluation."""
+    gt_all = batch['i_gt_py']
+    if gt_all.numel() == 0:
+        raise RuntimeError('No GT polygons in batch')
+
+    batch_size, num_contours, num_points, _ = gt_all.shape
+    detector_backend = str(getattr(cfg, 'detector_backend', 'yolo')).strip().lower()
+    if detector_backend == 'yolo':
+        if not hasattr(core, 'yolo') or core.yolo is None:
+            raise RuntimeError('Manual YOLO eval path requested but yolo module is missing')
+        yolo_out = core.yolo(batch['inp'])
+        feat_list = yolo_out[1] if isinstance(yolo_out, (list, tuple)) and len(yolo_out) > 1 else None
+        feat_p2 = feat_list[0] if isinstance(feat_list, (list, tuple)) else yolo_out
+        if getattr(core, 'use_swin_snake_feature', False):
+            if not hasattr(core, 'swin_snake_feature') or core.swin_snake_feature is None:
+                raise RuntimeError('Swin feature evaluation requested but swin_snake_feature is missing')
+            cnn_feature = core.swin_snake_feature(batch['inp'])
+        else:
+            cnn_feature = core.cnn_proj(feat_p2)
+        if (
+            (not getattr(core, 'use_swin_snake_feature', False))
+            and getattr(core, 'use_p3_features', False)
+            and hasattr(core, 'cnn_proj_p3')
+            and isinstance(feat_list, (list, tuple))
+            and len(feat_list) > 1
+        ):
+            feat_p3 = feat_list[1]
+            feat_p3_up = torch.nn.functional.interpolate(
+                feat_p3, size=feat_p2.shape[-2:], mode='bilinear', align_corners=False
+            )
+            cnn_feature = cnn_feature + core.cnn_proj_p3(feat_p3_up)
+    elif (
+        detector_backend.startswith('heatmap_')
+        or detector_backend.startswith('convnext')
+        or detector_backend.startswith('moonvit')
+    ):
+        if not hasattr(core, 'heatmap_detector') or core.heatmap_detector is None:
+            raise RuntimeError(
+                f'Manual eval path requires heatmap_detector, got detector_backend={detector_backend}'
+            )
+        cnn_feature, _ct_hm, _wh, mask_logits = core.heatmap_detector(batch['inp'])
+        if mask_logits is not None:
+            mask_guidance_alpha = float(getattr(cfg, 'heatmap_mask_guidance_alpha', 0.0))
+            if mask_guidance_alpha > 0.0:
+                mask_guidance = torch.sigmoid(mask_logits).amax(dim=1, keepdim=True)
+                cnn_feature = cnn_feature * (1.0 + mask_guidance_alpha * mask_guidance)
+    else:
+        raise RuntimeError(f'Manual GT-init eval does not support detector_backend={detector_backend}')
+
+    locate_feat_stats = {}
+    if hasattr(core, 'apply_locate_feature_injection'):
+        cnn_feature, locate_feat_stats = core.apply_locate_feature_injection(cnn_feature, batch)
+    if hasattr(core, 'apply_locate_feature_replacement'):
+        cnn_feature, replace_stats = core.apply_locate_feature_replacement(cnn_feature, batch)
+        locate_feat_stats.update(replace_stats)
+
+    contour_init_method = str(getattr(cfg, 'contour_init_method', 'octagon')).strip().lower()
+    sam_prompt_source = str(getattr(cfg, 'sam_prompt_source', 'yolo_box')).strip().lower()
+    use_sam_gt_box_init = contour_init_method in ('sam', 'efficient_sam') and sam_prompt_source == 'gt_box'
+    if use_sam_gt_box_init:
+        i_it_py = build_sam_gt_box_init_polys(batch, gt_all, device)
+        if i_it_py is None:
+            i_it_py = build_init_polys(batch, gt_all)
+    else:
+        i_it_py = build_init_polys(batch, gt_all)
+    c_it_py = snake_gcn_utils.img_poly_to_can_poly(i_it_py)
+    if batch_size == 1:
+        py_ind = torch.zeros(i_it_py.size(0), dtype=torch.long, device=device)
+    else:
+        counts = (
+            batch['ct_01'].bool().sum(dim=1).tolist()
+            if 'ct_01' in batch
+            else [num_contours] * batch_size
+        )
+        py_ind = torch.cat([
+            torch.full((int(count),), i, dtype=torch.long, device=device)
+            for i, count in enumerate(counts)
+        ])
+
+    if 'ct_01' in batch:
+        gt_flat = gt_all[batch['ct_01'].bool()]
+    else:
+        gt_flat = gt_all.view(-1, num_points, 2)
+    count = min(i_it_py.size(0), gt_flat.size(0), py_ind.size(0))
+    if count <= 0:
+        raise RuntimeError('Manual GT-init context contains no valid contours')
+    return {
+        'cnn_feature': cnn_feature,
+        'i_it_py': i_it_py[:count],
+        'c_it_py': c_it_py[:count],
+        'i_gt_py': gt_flat[:count],
+        'py_ind': py_ind[:count],
+        'image_hw': (int(batch['inp'].shape[-2]), int(batch['inp'].shape[-1])),
+        'locate_feat_stats': locate_feat_stats,
+    }
+
+
+def eval_sample(model, device, batch, policy=None, policy_metadata=None, ode_steps=10, save_visuals=False, sample_dir=None):
     for k, v in batch.items():
         if k == 'locate_feat' or str(k).startswith('locate_feat_'):
             continue
@@ -832,6 +1313,15 @@ def eval_sample(model, device, batch, ode_steps=10, save_visuals=False, sample_d
         or detector_backend != 'yolo'
         or bool(getattr(cfg, 'eval_use_network_forward', False))
     )
+    use_unified_policy_rollout = bool(
+        policy_metadata
+        and policy_metadata.get('checkpoint_has_per_point_policy', False)
+    )
+    if use_unified_policy_rollout and use_full_forward:
+        raise RuntimeError(
+            'Unified per-point off/mean evaluation requires the explicit manual '
+            'contour rollout path; eval_use_network_forward must be false'
+        )
 
     with torch.no_grad():
         gt_all = batch['i_gt_py']
@@ -866,67 +1356,25 @@ def eval_sample(model, device, batch, ode_steps=10, save_visuals=False, sample_d
                     pred_labels = det_flat[:, 5].detach().cpu().numpy().astype(np.int32)
             match_by_iou = not bool(getattr(cfg, 'use_gt_det', False))
         else:
-            if detector_backend == 'yolo':
-                if not hasattr(core, 'yolo') or core.yolo is None:
-                    raise RuntimeError('Manual YOLO eval path requested but yolo module is missing')
-                yolo_out = core.yolo(batch['inp'])
-                feat_list = yolo_out[1] if isinstance(yolo_out, (list, tuple)) and len(yolo_out) > 1 else None
-                feat_p2 = feat_list[0] if isinstance(feat_list, (list, tuple)) else yolo_out
-                if getattr(core, 'use_swin_snake_feature', False):
-                    if not hasattr(core, 'swin_snake_feature') or core.swin_snake_feature is None:
-                        raise RuntimeError('Swin feature evaluation requested but swin_snake_feature is missing')
-                    cnn_feature = core.swin_snake_feature(batch['inp'])
-                else:
-                    cnn_feature = core.cnn_proj(feat_p2)
-                if (
-                    (not getattr(core, 'use_swin_snake_feature', False))
-                    and getattr(core, 'use_p3_features', False)
-                    and hasattr(core, 'cnn_proj_p3')
-                    and isinstance(feat_list, (list, tuple))
-                    and len(feat_list) > 1
-                ):
-                    feat_p3 = feat_list[1]
-                    feat_p3_up = torch.nn.functional.interpolate(
-                        feat_p3, size=feat_p2.shape[-2:], mode='bilinear', align_corners=False
-                    )
-                    cnn_feature = cnn_feature + core.cnn_proj_p3(feat_p3_up)
-            elif (
-                detector_backend.startswith('heatmap_')
-                or detector_backend.startswith('convnext')
-                or detector_backend.startswith('moonvit')
-            ):
-                if not hasattr(core, 'heatmap_detector') or core.heatmap_detector is None:
-                    raise RuntimeError(f'Manual eval path requires heatmap_detector, got detector_backend={detector_backend}')
-                cnn_feature, _ct_hm, _wh, mask_logits = core.heatmap_detector(batch['inp'])
-                if mask_logits is not None:
-                    mask_guidance_alpha = float(getattr(cfg, 'heatmap_mask_guidance_alpha', 0.0))
-                    if mask_guidance_alpha > 0.0:
-                        mask_guidance = torch.sigmoid(mask_logits).amax(dim=1, keepdim=True)
-                        cnn_feature = cnn_feature * (1.0 + mask_guidance_alpha * mask_guidance)
-            else:
-                raise RuntimeError(f'Manual GT-init eval does not support detector_backend={detector_backend}')
-
-            locate_feat_stats = {}
-            if hasattr(core, 'apply_locate_feature_injection'):
-                cnn_feature, locate_feat_stats = core.apply_locate_feature_injection(cnn_feature, batch)
-            if hasattr(core, 'apply_locate_feature_replacement'):
-                cnn_feature, replace_stats = core.apply_locate_feature_replacement(cnn_feature, batch)
-                locate_feat_stats.update(replace_stats)
-
-            if use_sam_gt_box_init:
-                i_it_py = build_sam_gt_box_init_polys(batch, gt_all, device)
-                if i_it_py is None:
-                    i_it_py = build_init_polys(batch, gt_all)
-            else:
-                i_it_py = build_init_polys(batch, gt_all)
-            c_it_py = snake_gcn_utils.img_poly_to_can_poly(i_it_py)
-            if batch_size == 1:
-                py_ind = torch.zeros(i_it_py.size(0), dtype=torch.long, device=device)
-            else:
-                py_ind = torch.cat([torch.full((num_contours,), i, dtype=torch.long, device=device) for i in range(batch_size)])
+            manual_context = prepare_manual_gt_init_context(core, batch, device)
+            cnn_feature = manual_context['cnn_feature']
+            i_it_py = manual_context['i_it_py']
+            c_it_py = manual_context['c_it_py']
+            py_ind = manual_context['py_ind']
 
             use_curve_path = bool(getattr(cfg, 'use_curve_inference', False))
-            if use_curve_path and hasattr(core.gcn, 'sample_disp_curve'):
+            if use_unified_policy_rollout:
+                disp = _deterministic_unified_rollout(
+                    core.gcn,
+                    policy,
+                    cnn_feature,
+                    i_it_py,
+                    py_ind,
+                    policy_metadata['fractions'],
+                    policy_metadata['actual_ode_steps'],
+                    active_step_indices=policy_metadata['active_step_indices'],
+                )
+            elif use_curve_path and hasattr(core.gcn, 'sample_disp_curve'):
                 curve_alpha = float(getattr(cfg, 'curve_alpha', 2.0))
                 curve_steps = int(getattr(cfg, 'curve_steps', 20))
                 curve_s_max = float(getattr(cfg, 'curve_s_max', 0.97))
@@ -993,10 +1441,11 @@ def eval_sample(model, device, batch, ode_steps=10, save_visuals=False, sample_d
                 disp = FlowMatchingEvolution.fourier_smooth(disp, fk)
 
             pred_polys = (i_it_py + disp).cpu().numpy() * dr
-            gt_polys = gt_all.view(-1, num_points, 2).cpu().numpy() * dr
+            gt_polys = manual_context['i_gt_py'].cpu().numpy() * dr
             init_polys = i_it_py.cpu().numpy() * dr
             if 'ct_cls' in batch:
-                gt_labels = batch['ct_cls'].view(-1).detach().cpu().numpy().astype(np.int32)
+                labels = batch['ct_cls'][batch['ct_01'].bool()] if 'ct_01' in batch else batch['ct_cls'].view(-1)
+                gt_labels = labels[:i_it_py.size(0)].detach().cpu().numpy().astype(np.int32)
                 pred_labels = gt_labels.copy()
             match_by_iou = False
 
@@ -1008,14 +1457,14 @@ def eval_sample(model, device, batch, ode_steps=10, save_visuals=False, sample_d
         img = np.zeros((512, 512, 3), dtype=np.uint8)
 
     height, width = img.shape[:2]
-    per_contour_iou, per_contour_dice, per_contour_mboundf, matched_pred = compute_ordered_or_matched_metrics(
+    per_contour_iou, per_contour_dice, per_contour_mboundf, per_contour_nsd, matched_pred = compute_ordered_or_matched_metrics(
         pred_polys,
         gt_polys,
         height,
         width,
         match_by_iou=match_by_iou,
     )
-    init_iou, init_dice, init_mboundf, _ = compute_ordered_or_matched_metrics(
+    init_iou, init_dice, init_mboundf, init_nsd, _ = compute_ordered_or_matched_metrics(
         init_polys,
         gt_polys,
         height,
@@ -1040,15 +1489,19 @@ def eval_sample(model, device, batch, ode_steps=10, save_visuals=False, sample_d
         'mean_iou': float(np.mean(per_contour_iou)) if per_contour_iou else 0.0,
         'mean_dice': float(np.mean(per_contour_dice)) if per_contour_dice else 0.0,
         'mean_mboundf': float(np.mean(per_contour_mboundf)) if per_contour_mboundf else 0.0,
+        'mean_nsd': float(np.mean(per_contour_nsd)) if per_contour_nsd else 0.0,
         'mean_init_iou': float(np.mean(init_iou)) if init_iou else 0.0,
         'mean_init_dice': float(np.mean(init_dice)) if init_dice else 0.0,
         'mean_init_mboundf': float(np.mean(init_mboundf)) if init_mboundf else 0.0,
+        'mean_init_nsd': float(np.mean(init_nsd)) if init_nsd else 0.0,
         'per_contour_iou': per_contour_iou,
         'per_contour_dice': per_contour_dice,
         'per_contour_mboundf': per_contour_mboundf,
+        'per_contour_nsd': per_contour_nsd,
         'per_contour_init_iou': init_iou,
         'per_contour_init_dice': init_dice,
         'per_contour_init_mboundf': init_mboundf,
+        'per_contour_init_nsd': init_nsd,
         'matched_pred': matched_pred,
         'num_pred_contours': int(pred_polys.shape[0]),
         'num_gt_contours': int(gt_polys.shape[0]),
@@ -1072,7 +1525,9 @@ def main():
     if save_visuals:
         os.makedirs(per_sample_root, exist_ok=True)
 
-    model, device, ckpt_path = load_model(ckpt)
+    model, device, ckpt_path, policy, policy_metadata = load_model(
+        ckpt, return_policy=True, eval_ode_steps=ode_steps
+    )
 
     dataset = make_dataset(cfg, cfg.test.dataset, make_transforms(cfg, False), False)
     collator = make_collator(cfg)
@@ -1085,13 +1540,17 @@ def main():
     sample_mean_ious = []
     sample_mean_dices = []
     sample_mean_mboundfs = []
+    sample_mean_nsds = []
     sample_mean_init_ious = []
     sample_mean_init_mboundfs = []
+    sample_mean_init_nsds = []
     all_contour_ious = []
     all_contour_dices = []
     all_contour_mboundfs = []
+    all_contour_nsds = []
     all_contour_init_ious = []
     all_contour_init_mboundfs = []
+    all_contour_init_nsds = []
     failed_indices = []
 
     print(f'[*] Evaluating {limit} / {dataset_size} samples from {cfg.test.dataset}')
@@ -1100,28 +1559,38 @@ def main():
     for index in range(limit):
         print(f'[{index + 1}/{limit}] sample {index}')
         sample_dir = os.path.join(per_sample_root, f'idx_{index:03d}') if save_visuals else ''
+        identity = _sample_identity(None, index)
         try:
-            batch = collator([dataset[index]])
+            sample = dataset[index]
+            identity = _sample_identity(sample, index)
+            batch = collator([sample])
             result = eval_sample(
                 model,
                 device,
                 batch,
+                policy=policy,
+                policy_metadata=policy_metadata,
                 ode_steps=ode_steps,
                 save_visuals=save_visuals,
                 sample_dir=sample_dir if save_visuals else None,
             )
             rows.append({
                 'index': index,
+                **identity,
                 'ok': True,
                 'mean_iou': result['mean_iou'],
                 'mean_dice': result['mean_dice'],
                 'mean_mboundf': result['mean_mboundf'],
+                'mean_nsd': result['mean_nsd'],
                 'mean_init_iou': result['mean_init_iou'],
                 'mean_init_mboundf': result['mean_init_mboundf'],
+                'mean_init_nsd': result['mean_init_nsd'],
                 'per_contour_iou': result['per_contour_iou'],
                 'per_contour_dice': result['per_contour_dice'],
                 'per_contour_mboundf': result['per_contour_mboundf'],
+                'per_contour_nsd': result['per_contour_nsd'],
                 'per_contour_init_iou': result['per_contour_init_iou'],
+                'per_contour_init_nsd': result['per_contour_init_nsd'],
                 'matched_pred': result['matched_pred'],
                 'num_pred_contours': result['num_pred_contours'],
                 'num_gt_contours': result['num_gt_contours'],
@@ -1130,17 +1599,22 @@ def main():
             sample_mean_ious.append(result['mean_iou'])
             sample_mean_dices.append(result['mean_dice'])
             sample_mean_mboundfs.append(result['mean_mboundf'])
+            sample_mean_nsds.append(result['mean_nsd'])
             sample_mean_init_ious.append(result['mean_init_iou'])
             sample_mean_init_mboundfs.append(result['mean_init_mboundf'])
+            sample_mean_init_nsds.append(result['mean_init_nsd'])
             all_contour_ious.extend(result['per_contour_iou'])
             all_contour_dices.extend(result['per_contour_dice'])
             all_contour_mboundfs.extend(result['per_contour_mboundf'])
+            all_contour_nsds.extend(result['per_contour_nsd'])
             all_contour_init_ious.extend(result['per_contour_init_iou'])
             all_contour_init_mboundfs.extend(result['per_contour_init_mboundf'])
+            all_contour_init_nsds.extend(result['per_contour_init_nsd'])
         except Exception as exc:
             failed_indices.append(index)
             rows.append({
                 'index': index,
+                **identity,
                 'ok': False,
                 'error': str(exc),
                 'dir': sample_dir,
@@ -1160,6 +1634,8 @@ def main():
         'diffusion_init_source': str(getattr(cfg, 'diffusion_init_source', 'extreme')),
         'eval_seed': eval_seed,
         'ode_steps': ode_steps,
+        'nsd_delta_px': float(os.environ.get('NSD_DELTA_PX', '2.0')),
+        'fm_policy': policy_metadata,
         'dataset': cfg.test.dataset,
         'test_img_path': getattr(cfg.test, 'img_path', ''),
         'dataset_size': dataset_size,
@@ -1172,17 +1648,23 @@ def main():
         'mean_dice_contour_avg': float(np.mean(all_contour_dices)) if all_contour_dices else 0.0,
         'mean_mboundf_sample_avg': float(np.mean(sample_mean_mboundfs)) if sample_mean_mboundfs else 0.0,
         'mean_mboundf_contour_avg': float(np.mean(all_contour_mboundfs)) if all_contour_mboundfs else 0.0,
+        'mean_nsd_sample_avg': float(np.mean(sample_mean_nsds)) if sample_mean_nsds else 0.0,
+        'mean_nsd_contour_avg': float(np.mean(all_contour_nsds)) if all_contour_nsds else 0.0,
         'mean_init_iou_sample_avg': float(np.mean(sample_mean_init_ious)) if sample_mean_init_ious else 0.0,
         'mean_init_iou_contour_avg': float(np.mean(all_contour_init_ious)) if all_contour_init_ious else 0.0,
         'mean_init_mboundf_sample_avg': float(np.mean(sample_mean_init_mboundfs)) if sample_mean_init_mboundfs else 0.0,
         'mean_init_mboundf_contour_avg': float(np.mean(all_contour_init_mboundfs)) if all_contour_init_mboundfs else 0.0,
+        'mean_init_nsd_sample_avg': float(np.mean(sample_mean_init_nsds)) if sample_mean_init_nsds else 0.0,
+        'mean_init_nsd_contour_avg': float(np.mean(all_contour_init_nsds)) if all_contour_init_nsds else 0.0,
         'median_iou_sample_avg': float(np.median(sample_mean_ious)) if sample_mean_ious else 0.0,
         'std_iou_sample_avg': float(np.std(sample_mean_ious)) if sample_mean_ious else 0.0,
         'sample_mean_ious': sample_mean_ious,
         'sample_mean_dices': sample_mean_dices,
         'sample_mean_mboundfs': sample_mean_mboundfs,
+        'sample_mean_nsds': sample_mean_nsds,
         'sample_mean_init_ious': sample_mean_init_ious,
         'sample_mean_init_mboundfs': sample_mean_init_mboundfs,
+        'sample_mean_init_nsds': sample_mean_init_nsds,
     }
 
     summary_path = os.path.join(save_dir, f'v3_7_full_test_iou_{ts}.json')
@@ -1199,6 +1681,9 @@ def main():
     print(f"mean_iou_contour_avg:  {summary['mean_iou_contour_avg']:.6f}")
     print(f"mean_dice_sample_avg:  {summary['mean_dice_sample_avg']:.6f}")
     print(f"mean_mboundf_sample_avg: {summary['mean_mboundf_sample_avg']:.6f}")
+    print(f"mean_nsd_sample_avg:   {summary['mean_nsd_sample_avg']:.6f}")
+    print(f"mean_nsd_contour_avg:  {summary['mean_nsd_contour_avg']:.6f}")
+    print(f"mean_init_nsd_sample_avg: {summary['mean_init_nsd_sample_avg']:.6f}")
     print(f"median_iou_sample_avg: {summary['median_iou_sample_avg']:.6f}")
     print(f"std_iou_sample_avg:    {summary['std_iou_sample_avg']:.6f}")
     print(f"failed_samples:        {summary['failed_samples']}")

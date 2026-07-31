@@ -55,7 +55,9 @@ def xywh_to_xyxy(boxes):
     return np.concatenate([x, y, x_max, y_max], axis=1)
 
 
-def augment(img, split, _data_rng, _eig_val, _eig_vec, mean, std, polys=None):
+def augment(
+        img, split, _data_rng, _eig_val, _eig_vec, mean, std, polys=None,
+        color_aug=True, lr_flip=True, random_crop=True):
     disable_aug = os.environ.get('SNAKE_DISABLE_AUG', '').strip().lower() in ('1', 'true', 'yes', 'on')
     disable_lr_flip = os.environ.get('SNAKE_DISABLE_LR_FLIP', '').strip().lower() in ('1', 'true', 'yes', 'on')
     if disable_aug and split == 'train':
@@ -71,15 +73,16 @@ def augment(img, split, _data_rng, _eig_val, _eig_vec, mean, std, polys=None):
     # random crop and flip augmentation
     flipped = False
     if split == 'train':
-        scale = scale * np.random.uniform(0.6, 1.4)
-        x, y = center
-        w_border = data_utils.get_border(width/4, scale[0]) + 1
-        h_border = data_utils.get_border(height/4, scale[0]) + 1
-        center[0] = np.random.randint(low=max(x - w_border, 0), high=min(x + w_border, width - 1))
-        center[1] = np.random.randint(low=max(y - h_border, 0), high=min(y + h_border, height - 1))
+        if random_crop:
+            scale = scale * np.random.uniform(0.6, 1.4)
+            x, y = center
+            w_border = data_utils.get_border(width/4, scale[0]) + 1
+            h_border = data_utils.get_border(height/4, scale[0]) + 1
+            center[0] = np.random.randint(low=max(x - w_border, 0), high=min(x + w_border, width - 1))
+            center[1] = np.random.randint(low=max(y - h_border, 0), high=min(y + h_border, height - 1))
 
         # flip augmentation
-        if (not disable_lr_flip) and np.random.random() < 0.5:
+        if lr_flip and (not disable_lr_flip) and np.random.random() < 0.5:
             flipped = True
             img = img[:, ::-1, :]
             center[0] = width - center[0] - 1
@@ -99,7 +102,7 @@ def augment(img, split, _data_rng, _eig_val, _eig_vec, mean, std, polys=None):
     # color augmentation
     orig_img = inp.copy()
     inp = (inp.astype(np.float32) / 255.)
-    if split == 'train':
+    if split == 'train' and color_aug:
         data_utils.color_aug(_data_rng, inp, _eig_val, _eig_vec)
         # blur_aug(inp)
 

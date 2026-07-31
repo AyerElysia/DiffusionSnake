@@ -71,6 +71,14 @@ except ImportError:
     thop = None
 
 
+def _load_checkpoint_file(path):
+    """Load trusted local YOLO checkpoints across PyTorch versions."""
+    try:
+        return torch.load(path, map_location="cpu", weights_only=False)
+    except TypeError:
+        return torch.load(path, map_location="cpu")
+
+
 class BaseModel(nn.Module):
     """The BaseModel class serves as a base class for all the models in the Ultralytics YOLO family."""
 
@@ -772,11 +780,10 @@ def torch_safe_load(weight):
         "ultralytics.nn.tasks": "lib.networks.YOLOV8.nn.tasks",
         "ultralytics.nn.modules": "lib.networks.YOLOV8.nn.modules",
         "ultralytics.utils": "lib.networks.YOLOV8.utils",
-        "ultralytics.data": "lib.networks.YOLOV8.data",
     }
     try:
         with temporary_modules(module_aliases):
-            ckpt = torch.load(file, map_location="cpu")
+            ckpt = _load_checkpoint_file(file)
 
     except ModuleNotFoundError as e:  # e.name is missing module name
         if e.name == "models":
@@ -797,7 +804,7 @@ def torch_safe_load(weight):
         )
         check_requirements(e.name)  # install missing module
         with temporary_modules(module_aliases):
-            ckpt = torch.load(file, map_location="cpu")
+            ckpt = _load_checkpoint_file(file)
 
     if not isinstance(ckpt, dict):
         # File is likely a YOLO instance saved with i.e. torch.save(model, "saved_model.pt")

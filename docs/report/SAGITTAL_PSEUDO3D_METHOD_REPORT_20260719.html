@@ -1,0 +1,1166 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="light">
+  <title>矢状位伪3D方法报告｜MoonViT 标准头｜2026-07-21</title>
+  <style>
+    :root {
+      --paper: #f6f7f5;
+      --surface: #ffffff;
+      --ink: #202927;
+      --muted: #5f6b67;
+      --line: #d7dedb;
+      --line-strong: #aebbb6;
+      --green: #286f66;
+      --green-soft: #e7f0ed;
+      --rust: #a24e32;
+      --rust-soft: #f4e9e4;
+      --gold: #b9821f;
+      --gold-soft: #f7f0df;
+      --blue: #3f7187;
+      --blue-soft: #e7eff2;
+      --danger: #8c3327;
+      --code: #17201e;
+      --radius: 6px;
+      --shadow: 0 1px 2px rgba(21, 33, 29, 0.08);
+    }
+
+    * { box-sizing: border-box; }
+
+    html {
+      scroll-behavior: smooth;
+      background: var(--paper);
+    }
+
+    body {
+      margin: 0;
+      color: var(--ink);
+      background: var(--paper);
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", "Noto Sans CJK SC", "Microsoft YaHei", Arial, sans-serif;
+      font-size: 16px;
+      line-height: 1.72;
+      letter-spacing: 0;
+    }
+
+    a { color: var(--green); }
+    a:hover { color: var(--rust); }
+
+    code, pre, .mono {
+      font-family: "SFMono-Regular", Consolas, "Liberation Mono", Menlo, monospace;
+      letter-spacing: 0;
+    }
+
+    code {
+      color: #24463f;
+      background: #edf1ef;
+      padding: 0.1em 0.32em;
+      border-radius: 3px;
+      overflow-wrap: anywhere;
+    }
+
+    .report-header {
+      border-top: 6px solid var(--green);
+      border-bottom: 1px solid var(--line);
+      background: var(--surface);
+    }
+
+    .header-inner {
+      max-width: 1260px;
+      margin: 0 auto;
+      padding: 40px 28px 32px;
+    }
+
+    .eyebrow {
+      margin: 0 0 8px;
+      color: var(--rust);
+      font-size: 0.78rem;
+      font-weight: 750;
+      text-transform: uppercase;
+    }
+
+    h1, h2, h3, h4 {
+      margin-top: 0;
+      color: var(--ink);
+      line-height: 1.28;
+      letter-spacing: 0;
+    }
+
+    h1 {
+      margin-bottom: 12px;
+      max-width: 920px;
+      font-size: 2.25rem;
+      font-weight: 760;
+    }
+
+    h2 {
+      margin-bottom: 18px;
+      font-size: 1.62rem;
+      font-weight: 740;
+    }
+
+    h3 {
+      margin-bottom: 10px;
+      font-size: 1.14rem;
+      font-weight: 730;
+    }
+
+    h4 {
+      margin-bottom: 6px;
+      font-size: 1rem;
+    }
+
+    p { margin: 0 0 14px; }
+
+    .definition {
+      max-width: 950px;
+      margin: 0 0 18px;
+      color: #34413d;
+      font-size: 1.1rem;
+    }
+
+    .status-row {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 8px;
+      align-items: center;
+    }
+
+    .tag {
+      display: inline-flex;
+      align-items: center;
+      min-height: 28px;
+      padding: 3px 9px;
+      border: 1px solid var(--line-strong);
+      border-radius: 4px;
+      background: #fff;
+      color: #43504c;
+      font-size: 0.79rem;
+      font-weight: 700;
+    }
+
+    .tag.stage { border-color: #c69079; background: var(--rust-soft); color: #713724; }
+    .tag.valid { border-color: #8fb3a9; background: var(--green-soft); color: #235c54; }
+    .tag.date { border-color: #c9b06f; background: var(--gold-soft); color: #725513; }
+
+    .report-layout {
+      display: grid;
+      grid-template-columns: 230px minmax(0, 1fr);
+      gap: 38px;
+      max-width: 1260px;
+      margin: 0 auto;
+      padding: 30px 28px 80px;
+    }
+
+    .toc {
+      position: sticky;
+      top: 18px;
+      align-self: start;
+      max-height: calc(100vh - 36px);
+      overflow: auto;
+      padding: 4px 18px 16px 0;
+      border-right: 1px solid var(--line);
+    }
+
+    .toc strong {
+      display: block;
+      margin-bottom: 10px;
+      color: var(--muted);
+      font-size: 0.75rem;
+      text-transform: uppercase;
+    }
+
+    .toc a {
+      display: block;
+      padding: 5px 0;
+      color: #4d5955;
+      font-size: 0.88rem;
+      text-decoration: none;
+    }
+
+    .toc a:hover { color: var(--green); }
+
+    main { min-width: 0; }
+
+    .section {
+      padding: 34px 0 38px;
+      border-bottom: 1px solid var(--line);
+      scroll-margin-top: 18px;
+    }
+
+    .section:first-child { padding-top: 4px; }
+    .section:last-child { border-bottom: 0; }
+
+    .section-kicker {
+      margin-bottom: 5px;
+      color: var(--green);
+      font-size: 0.77rem;
+      font-weight: 760;
+      text-transform: uppercase;
+    }
+
+    .lead {
+      max-width: 900px;
+      color: #3f4b47;
+      font-size: 1.04rem;
+    }
+
+    .callout {
+      margin: 20px 0;
+      padding: 16px 18px;
+      border-left: 4px solid var(--gold);
+      background: var(--gold-soft);
+      color: #3e392b;
+    }
+
+    .callout.critical {
+      border-left-color: var(--danger);
+      background: #f6e8e4;
+      color: #542b23;
+    }
+
+    .callout.good {
+      border-left-color: var(--green);
+      background: var(--green-soft);
+      color: #244a43;
+    }
+
+    .callout p:last-child { margin-bottom: 0; }
+
+    .metric-strip {
+      display: grid;
+      grid-template-columns: repeat(4, minmax(0, 1fr));
+      gap: 10px;
+      margin: 20px 0 8px;
+    }
+
+    .metric {
+      min-height: 98px;
+      padding: 14px;
+      border: 1px solid var(--line);
+      border-top: 3px solid var(--green);
+      border-radius: var(--radius);
+      background: var(--surface);
+      box-shadow: var(--shadow);
+    }
+
+    .metric:nth-child(2) { border-top-color: var(--rust); }
+    .metric:nth-child(3) { border-top-color: var(--gold); }
+    .metric:nth-child(4) { border-top-color: var(--blue); }
+
+    .metric .value {
+      display: block;
+      margin-bottom: 3px;
+      font-size: 1.35rem;
+      font-weight: 780;
+      line-height: 1.2;
+    }
+
+    .metric .label {
+      display: block;
+      color: var(--muted);
+      font-size: 0.82rem;
+      line-height: 1.45;
+    }
+
+    .compare-grid,
+    .two-col,
+    .three-col {
+      display: grid;
+      gap: 16px;
+      margin: 18px 0;
+    }
+
+    .compare-grid { grid-template-columns: repeat(3, minmax(0, 1fr)); }
+    .two-col { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+    .three-col { grid-template-columns: repeat(3, minmax(0, 1fr)); }
+
+    .plain-panel {
+      padding: 17px 18px;
+      border: 1px solid var(--line);
+      border-radius: var(--radius);
+      background: var(--surface);
+    }
+
+    .plain-panel p:last-child { margin-bottom: 0; }
+
+    .plain-panel .panel-tag {
+      display: inline-block;
+      margin-bottom: 8px;
+      color: var(--rust);
+      font-size: 0.74rem;
+      font-weight: 760;
+      text-transform: uppercase;
+    }
+
+    .table-wrap {
+      margin: 18px 0;
+      overflow-x: auto;
+      border: 1px solid var(--line);
+      border-radius: var(--radius);
+      background: var(--surface);
+    }
+
+    table {
+      width: 100%;
+      border-collapse: collapse;
+      font-size: 0.9rem;
+    }
+
+    th, td {
+      padding: 11px 13px;
+      border-bottom: 1px solid var(--line);
+      text-align: left;
+      vertical-align: top;
+    }
+
+    th {
+      background: #edf1ef;
+      color: #34403d;
+      font-weight: 730;
+      white-space: nowrap;
+    }
+
+    tr:last-child td { border-bottom: 0; }
+    td.num, th.num { text-align: right; font-variant-numeric: tabular-nums; }
+    .warn-row td { background: #fbf1ed; }
+    .ok-row td { background: #eef5f2; }
+
+    .flow {
+      display: flex;
+      align-items: stretch;
+      gap: 8px;
+      margin: 20px 0;
+      overflow-x: auto;
+      padding-bottom: 5px;
+    }
+
+    .flow-step {
+      flex: 1 0 132px;
+      min-height: 94px;
+      padding: 12px;
+      border: 1px solid var(--line-strong);
+      border-top: 3px solid var(--green);
+      border-radius: var(--radius);
+      background: var(--surface);
+    }
+
+    .flow-step:nth-of-type(4n+1) { border-top-color: var(--green); }
+    .flow-step:nth-of-type(4n+2) { border-top-color: var(--rust); }
+    .flow-step:nth-of-type(4n+3) { border-top-color: var(--gold); }
+    .flow-step:nth-of-type(4n+4) { border-top-color: var(--blue); }
+
+    .flow-step strong {
+      display: block;
+      margin-bottom: 5px;
+      font-size: 0.88rem;
+    }
+
+    .flow-step span {
+      display: block;
+      color: var(--muted);
+      font-size: 0.77rem;
+      line-height: 1.45;
+    }
+
+    .flow-arrow {
+      flex: 0 0 20px;
+      align-self: center;
+      color: #78837f;
+      font-size: 1.15rem;
+      text-align: center;
+    }
+
+    .formula {
+      margin: 18px 0;
+      padding: 18px 20px;
+      overflow-x: auto;
+      border: 1px solid #bcc9c4;
+      border-left: 4px solid var(--green);
+      background: #f0f4f2;
+      color: #1e3833;
+      font-family: "SFMono-Regular", Consolas, "Liberation Mono", Menlo, monospace;
+      font-size: 0.93rem;
+      line-height: 1.75;
+      white-space: nowrap;
+    }
+
+    .image-grid {
+      display: grid;
+      grid-template-columns: repeat(3, minmax(0, 1fr));
+      gap: 12px;
+      margin: 18px 0;
+    }
+
+    figure {
+      margin: 0;
+      min-width: 0;
+    }
+
+    .media-frame {
+      overflow: hidden;
+      border: 1px solid var(--line-strong);
+      border-radius: var(--radius);
+      background: #111817;
+    }
+
+    .media-frame img {
+      display: block;
+      width: 100%;
+      height: auto;
+    }
+
+    .slice-frame img {
+      aspect-ratio: 596 / 776;
+      object-fit: contain;
+      background: #111817;
+    }
+
+    figcaption {
+      padding: 8px 2px 0;
+      color: var(--muted);
+      font-size: 0.8rem;
+      line-height: 1.5;
+    }
+
+    .wide-figure { margin: 20px 0; }
+    .wide-figure .media-frame { background: #f5f7f6; }
+
+    .compact-list,
+    .check-list,
+    .next-list {
+      margin: 10px 0 16px;
+      padding-left: 1.25rem;
+    }
+
+    .compact-list li,
+    .next-list li { margin-bottom: 7px; }
+
+    .check-list {
+      list-style: none;
+      padding-left: 0;
+    }
+
+    .check-list li {
+      position: relative;
+      margin-bottom: 9px;
+      padding-left: 29px;
+    }
+
+    .check-list li::before {
+      content: "✓";
+      position: absolute;
+      left: 0;
+      top: 0.08em;
+      width: 20px;
+      height: 20px;
+      border: 1px solid #84a99f;
+      border-radius: 3px;
+      background: var(--green-soft);
+      color: var(--green);
+      font-size: 0.8rem;
+      font-weight: 800;
+      line-height: 18px;
+      text-align: center;
+    }
+
+    pre {
+      margin: 14px 0 20px;
+      padding: 16px 18px;
+      overflow: auto;
+      border: 1px solid #32403c;
+      border-radius: var(--radius);
+      background: var(--code);
+      color: #e3eae7;
+      font-size: 0.82rem;
+      line-height: 1.62;
+      white-space: pre;
+    }
+
+    pre code {
+      padding: 0;
+      background: transparent;
+      color: inherit;
+    }
+
+    .path-index {
+      display: grid;
+      grid-template-columns: 155px minmax(0, 1fr);
+      gap: 0;
+      margin: 18px 0;
+      border-top: 1px solid var(--line);
+    }
+
+    .path-index dt,
+    .path-index dd {
+      margin: 0;
+      padding: 11px 8px;
+      border-bottom: 1px solid var(--line);
+    }
+
+    .path-index dt {
+      color: var(--muted);
+      font-size: 0.82rem;
+      font-weight: 730;
+    }
+
+    .path-index dd {
+      min-width: 0;
+      overflow-wrap: anywhere;
+      font-family: "SFMono-Regular", Consolas, "Liberation Mono", Menlo, monospace;
+      font-size: 0.8rem;
+    }
+
+    .footnote {
+      color: var(--muted);
+      font-size: 0.83rem;
+    }
+
+    .report-footer {
+      border-top: 1px solid var(--line);
+      background: var(--surface);
+    }
+
+    .footer-inner {
+      max-width: 1260px;
+      margin: 0 auto;
+      padding: 22px 28px 28px;
+      color: var(--muted);
+      font-size: 0.8rem;
+    }
+
+    @media (max-width: 1000px) {
+      .report-layout { grid-template-columns: 1fr; gap: 16px; }
+      .toc {
+        position: static;
+        max-height: none;
+        padding: 0 0 18px;
+        border-right: 0;
+        border-bottom: 1px solid var(--line);
+        columns: 2;
+      }
+      .toc strong { column-span: all; }
+      .metric-strip { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+    }
+
+    @media (max-width: 720px) {
+      body { font-size: 15px; }
+      .header-inner { padding: 28px 18px 24px; }
+      .report-layout { padding: 22px 18px 55px; }
+      h1 { font-size: 1.78rem; }
+      h2 { font-size: 1.4rem; }
+      .toc { columns: 1; }
+      .compare-grid, .two-col, .three-col, .image-grid { grid-template-columns: 1fr; }
+      .metric-strip { grid-template-columns: 1fr 1fr; }
+      .metric { min-height: 90px; }
+      .flow { align-items: center; flex-direction: column; overflow: visible; }
+      .flow-step { width: 100%; flex-basis: auto; min-height: 0; }
+      .flow-arrow { transform: rotate(90deg); }
+      .path-index { grid-template-columns: 1fr; }
+      .path-index dt { padding-bottom: 2px; border-bottom: 0; }
+      .path-index dd { padding-top: 2px; }
+      .formula { font-size: 0.79rem; }
+    }
+
+    @media print {
+      body { background: white; font-size: 10pt; }
+      .toc { display: none; }
+      .report-layout { display: block; max-width: none; padding: 20px; }
+      .section { break-inside: avoid; }
+      .wide-figure, .image-grid, table, pre { break-inside: avoid; }
+      a { color: inherit; text-decoration: none; }
+    }
+  </style>
+</head>
+<body>
+  <header class="report-header">
+    <div class="header-inner">
+      <p class="eyebrow">Sagittal pseudo-3D · method &amp; engineering evidence</p>
+      <h1>矢状位伪3D轮廓分割方法报告</h1>
+      <p class="definition"><strong>一句话定义：</strong>对同一病例沿 canonical X 的中心切片 <code>x</code>，将 <code>[x-1, x, x+1]</code> 三张矢状位 uint8 灰度 PNG 堆叠为三个输入通道，仅用中心层 <code>x</code> 的 uint16 标签 mask 监督。</p>
+      <div class="status-row" aria-label="报告状态">
+        <span class="tag stage">当前阶段：冻结 MoonViT cache 的伪3D下游训练已结束（5,000 step）</span>
+        <span class="tag valid">全量 cache + validation 6,247张 / GT-box 条件系统诊断</span>
+        <span class="tag date">报告日期：2026-07-21</span>
+      </div>
+    </div>
+  </header>
+
+  <div class="report-layout">
+    <nav class="toc" aria-label="目录">
+      <strong>Contents</strong>
+      <a href="#conclusion">00 · 结论边界</a>
+      <a href="#definition">01 · 伪3D是什么</a>
+      <a href="#coordinates">02 · 数据与坐标语义</a>
+      <a href="#sample">03 · 真实三切片案例</a>
+      <a href="#algorithm">04 · 核心算法与安全约束</a>
+      <a href="#supervision">05 · mask与监督映射</a>
+      <a href="#preprocess">06 · 预处理与尺寸</a>
+      <a href="#stem">07 · stem对称初始化</a>
+      <a href="#model">08 · 模型路径</a>
+      <a href="#modes">09 · 训练与评估模式</a>
+      <a href="#gpu-smoke">10 · 训练健康与历史 smoke</a>
+      <a href="#validation">11 · validation与指标陷阱</a>
+      <a href="#ablation">12 · 严谨对照设计</a>
+      <a href="#limits">13 · 局限与下一步</a>
+      <a href="#index">14 · 文件与命令索引</a>
+      <a href="#checklist">15 · 验证清单</a>
+    </nav>
+
+    <main>
+      <section class="section" id="conclusion">
+        <p class="section-kicker">00 / Interpretation boundary</p>
+        <h2>先给结论：工程链路成立，当前分割效果仍弱</h2>
+        <div class="callout critical">
+          <p><strong>已结束的 run 是冻结 MoonViT <code>layer_18</code> cache 的5,000-step伪3D下游监督训练，不是 MoonViT 预训练，也不是大规模 run。</strong>它使用 GPU 0、batch size 1 和有放回的 <code>ForegroundBalancedSampler</code>；5,000 draws 相对14,384个名义 epoch positions 为34.76%，不能解释为唯一样本覆盖。全量 train / validation cache、checkpoint 严格恢复以及 GT-box / predicted-box 验证均已落盘，当前没有活动训练进程。</p>
+          <p>GT-box 条件下，整个下游系统在全 validation 6,247 张切片上的前景切片 mean Dice 为 <code>0.130474</code>、mean IoU 为 <code>0.0739995</code>。GT-box只移除了 proposal / box-localization 误差，仍包含 YOLO P2/P3、adapter、Snake/Flow、训练预算与监督，不能据此作单模块因果归因；也不能证明 MoonViT 伪3D优于单层2D。</p>
+        </div>
+        <div class="metric-strip" aria-label="有界下游训练证据摘要">
+          <div class="metric"><span class="value">20,631</span><span class="label">冻结 MoonViT cache：training + validation 全量文件</span></div>
+          <div class="metric"><span class="value">5,000</span><span class="label">单卡 batch-1 下游 optimizer step；日志连续且数值 finite</span></div>
+          <div class="metric"><span class="value">0.130474</span><span class="label">全 validation GT-box 条件下的前景切片 mean Dice</span></div>
+          <div class="metric"><span class="value">0.0739995</span><span class="label">全 validation GT-box 条件下的前景切片 mean IoU</span></div>
+        </div>
+      </section>
+
+      <section class="section" id="definition">
+        <p class="section-kicker">01 / Definition</p>
+        <h2>什么是伪3D，它不是什么</h2>
+        <p class="lead">伪3D在不引入完整3D网络的前提下，把中心层两侧的局部体数据上下文映射到普通三通道2D输入。监督目标仍严格属于中心层，因此输出与单张矢状位标签一一对应。</p>
+
+        <div class="compare-grid">
+          <article class="plain-panel">
+            <span class="panel-tag">2D baseline</span>
+            <h3>单层2D / <code>center_repeat</code></h3>
+            <p>输入是 <code>[I<sub>x</sub>, I<sub>x</sub>, I<sub>x</sub>]</code>。三通道接口不变，但没有邻层信息，是与 neighbors 配对的直接对照。</p>
+          </article>
+          <article class="plain-panel">
+            <span class="panel-tag">This method</span>
+            <h3>三切片伪3D / <code>neighbors</code></h3>
+            <p>输入是 <code>[I<sub>x-1</sub>, I<sub>x</sub>, I<sub>x+1</sub>]</code>。2D网络可在通道维读取局部 X 方向变化，只监督 <code>M<sub>x</sub></code>。</p>
+          </article>
+          <article class="plain-panel">
+            <span class="panel-tag">Not implemented here</span>
+            <h3>真正3D</h3>
+            <p>真正3D模型以体块为输入，使用3D卷积、体素注意力或体级算子，并输出体素级结果。本方案既不保留完整体积，也没有3D空间核。</p>
+          </article>
+        </div>
+
+        <div class="callout">
+          <p><strong>“伪3D”不等于把灰度图染成 RGB。</strong>模型输入的三个通道分别是三张真实相邻切片；本报告中的 pseudo-RGB 只是把它们映射到 R/G/B 以观察层间差异，不能作为医学颜色解释。</p>
+        </div>
+
+        <h3>如果改成体素3D，哪些能复用，哪些必须重做</h3>
+        <div class="table-wrap">
+          <table>
+            <thead><tr><th>模块</th><th>体素3D改造</th><th>判断</th></tr></thead>
+            <tbody>
+              <tr><td>数据与坐标</td><td>回到 NIfTI，统一 orientation、spacing、强度窗和体块采样；标签改为体素级25类 mask</td><td>必须新建3D数据管线，但现有病例 split、类别定义和坐标审计可复用</td></tr>
+              <tr><td>特征编码器</td><td>以3D CNN、3D Swin/UNETR 或2D MoonViT逐层编码后加跨层聚合器替代当前三通道 YOLO</td><td>核心 backbone 需要更换；MoonViT可作为2D初始化或切片特征教师，不能直接当原生3D编码器</td></tr>
+              <tr><td>检测与轮廓</td><td>2D box 与128点平面轮廓要改为3D proposal + 体素 mask，或3D mesh / surface point 表示</td><td>如果目标是体素分割，这部分属于大改，现有 Snake 输出头不能原样复用</td></tr>
+              <tr><td>训练框架</td><td>loss logging、checkpoint、optimizer、病例划分和 GT/predicted 双口径思想仍保留</td><td>工程骨架可复用，模型与数据契约需要重构</td></tr>
+            </tbody>
+          </table>
+        </div>
+        <div class="callout critical">
+          <p><strong>结论：</strong>改成真正的体素3D不是给当前模型再加一个开关。若目标是3D体素分割，数据 loader、backbone、检测/输出表示和 evaluator 都要更换，属于模型主干层面的“大换血”；但数据 split、MoonViT预训练知识、训练基础设施和评估纪律不必推倒重来。更稳妥的顺序是先证明三切片伪3D稳定增益，再做小体块3D基线，而不是直接扩成整卷模型。</p>
+        </div>
+      </section>
+
+      <section class="section" id="coordinates">
+        <p class="section-kicker">02 / Data coordinates</p>
+        <h2>从 NIfTI 到 sagittal PNG / manifest 的坐标语义</h2>
+        <p>上游体数据在 canonical 坐标系中组织；随后沿 <strong>canonical X</strong> 逐片导出矢状位 PNG，并由 manifest 固化病例、切片序号、图像路径、mask 路径及坐标含义。此报告只陈述 manifest 可验证的产物语义，不扩展未记录的 NIfTI 重采样细节。</p>
+
+        <div class="flow" aria-label="数据转换流程">
+          <div class="flow-step"><strong>NIfTI volume</strong><span>病例级三维医学体数据</span></div>
+          <div class="flow-arrow" aria-hidden="true">→</div>
+          <div class="flow-step"><strong>Canonical axes</strong><span>统一到 canonical X/Y/Z 语义</span></div>
+          <div class="flow-arrow" aria-hidden="true">→</div>
+          <div class="flow-step"><strong>Slice on X</strong><span><code>png_axis=sagittal_x</code></span></div>
+          <div class="flow-arrow" aria-hidden="true">→</div>
+          <div class="flow-step"><strong>Y-Z image plane</strong><span>width=Y，height=Z</span></div>
+          <div class="flow-arrow" aria-hidden="true">→</div>
+          <div class="flow-step"><strong>Manifest</strong><span><code>case_id + slice_idx + paths</code></span></div>
+        </div>
+
+        <div class="two-col">
+          <div class="plain-panel">
+            <h3>取片轴</h3>
+            <p><code>png_axis=sagittal_x</code></p>
+            <p>索引 <code>x</code> 沿 canonical X 改变，<code>x-1</code> 与 <code>x+1</code> 是同病例的前后相邻矢状位。</p>
+          </div>
+          <div class="plain-panel">
+            <h3>PNG 图面坐标</h3>
+            <p><code>width = original_Y_after_canonical</code></p>
+            <p><code>height = original_Z_after_canonical</code></p>
+            <p>因此屏幕上的横向为 Y，纵向为 Z。</p>
+          </div>
+        </div>
+
+        <h3>全量 manifest 审计</h3>
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr><th>split</th><th class="num">切片</th><th class="num">病例</th><th class="num">空中心层</th><th class="num">前景中心层</th></tr>
+            </thead>
+            <tbody>
+              <tr><td><code>training</code></td><td class="num">14,384</td><td class="num">80</td><td class="num">8,546</td><td class="num">5,838</td></tr>
+              <tr><td><code>validation</code></td><td class="num">6,247</td><td class="num">40</td><td class="num">3,345</td><td class="num">2,902</td></tr>
+              <tr><td><code>test</code></td><td class="num">5,958</td><td class="num">40</td><td class="num">3,292</td><td class="num">2,666</td></tr>
+              <tr><th>合计</th><th class="num">26,589</th><th class="num">160</th><th class="num">15,183</th><th class="num">11,406</th></tr>
+            </tbody>
+          </table>
+        </div>
+        <p class="footnote">病例集合在 training / validation / test 之间两两交集为 0。图像文件为 uint8；mask 文件为 uint16；逐文件检查标签范围严格位于 <code>0..25</code>。空层由 mask 前景像素实际统计，而不是由 manifest 的 <code>has_mask</code> 字段推断。</p>
+      </section>
+
+      <section class="section" id="sample">
+        <p class="section-kicker">03 / Real sample</p>
+        <h2>真实案例：validation / <code>sub-verse041</code> / 中心 <code>x=48</code></h2>
+        <p>三张图像均为真实 uint8 灰度切片，原始 shape 为 <code>(776, 596)</code>，按 <code>[x-1, x, x+1]</code> 顺序进入三个通道。</p>
+
+        <div class="image-grid">
+          <figure>
+            <div class="media-frame slice-frame"><img src="sagittal_pseudo3d_assets/sub-verse041_x0047_previous.png" alt="sub-verse041 的 x=47 前一张矢状位灰度切片" width="596" height="776"></div>
+            <figcaption>previous · <code>x=47</code> · channel 0</figcaption>
+          </figure>
+          <figure>
+            <div class="media-frame slice-frame"><img src="sagittal_pseudo3d_assets/sub-verse041_x0048_center.png" alt="sub-verse041 的 x=48 中心矢状位灰度切片" width="596" height="776"></div>
+            <figcaption>center · <code>x=48</code> · channel 1 · 唯一监督层</figcaption>
+          </figure>
+          <figure>
+            <div class="media-frame slice-frame"><img src="sagittal_pseudo3d_assets/sub-verse041_x0049_next.png" alt="sub-verse041 的 x=49 后一张矢状位灰度切片" width="596" height="776"></div>
+            <figcaption>next · <code>x=49</code> · channel 2</figcaption>
+          </figure>
+        </div>
+
+        <div class="three-col">
+          <figure>
+            <div class="media-frame slice-frame"><img src="sagittal_pseudo3d_assets/sub-verse041_x0048_pseudo_rgb.png" alt="将 x47 x48 x49 分别映射到红绿蓝通道的伪 RGB 可视化" width="596" height="776"></div>
+            <figcaption><strong>Pseudo-RGB 可视化</strong>：R=<code>x-1</code>，G=<code>x</code>，B=<code>x+1</code>；彩边表示邻层灰度变化，不是医学彩色成像。</figcaption>
+          </figure>
+          <figure>
+            <div class="media-frame slice-frame"><img src="sagittal_pseudo3d_assets/sub-verse041_x0048_label_color.png" alt="中心 x48 的 25 类离散色板标签 mask" width="596" height="776"></div>
+            <figcaption><strong>中心层 label mask</strong>：背景深色；1..25 使用固定离散色板。本例前景标签为 <code>7..24</code>，共18类。</figcaption>
+          </figure>
+          <figure>
+            <div class="media-frame slice-frame"><img src="sagittal_pseudo3d_assets/sub-verse041_x0048_overlay.png" alt="中心 x48 灰度切片与彩色标签 mask 的叠加图" width="596" height="776"></div>
+            <figcaption><strong>Center + mask overlay</strong>：仅用于核对标签位置；前景像素为 <strong>25,521</strong>。</figcaption>
+          </figure>
+        </div>
+
+        <figure class="wide-figure">
+          <div class="media-frame"><img src="sagittal_pseudo3d_assets/sub-verse041_x0048_neighbor_absdiff.png" alt="中心层与前后邻层的绝对灰度差分图" width="2310" height="900"></div>
+          <figcaption>邻层绝对差分，统一使用 uint8 的 <code>0..255</code> 色标。差异集中在组织边缘与局部结构变化处；它只说明邻层携带非重复信息，不等价于这些信息能提升精度。</figcaption>
+        </figure>
+      </section>
+
+      <section class="section" id="algorithm">
+        <p class="section-kicker">04 / Core algorithm</p>
+        <h2>核心算法、边界策略与病例安全约束</h2>
+        <p>Dataset 先按 <code>case_id</code> 分组，再按整数 <code>slice_idx</code> 排序。组内重复序号会被拒绝；对非边界层取样时，若 <code>x-1</code> 或 <code>x+1</code> 缺失，会立即报错。邻层查找只在当前病例的字典中完成，因此不会借用另一病例的末层或首层。</p>
+
+        <div class="formula" aria-label="伪3D输入公式">
+          prev(x) = I<sub>x</sub> if x = x<sub>first</sub>, else I<sub>x-1</sub><br>
+          next(x) = I<sub>x</sub> if x = x<sub>last</sub>, else I<sub>x+1</sub><br>
+          X<sub>neighbors</sub>(x) = Stack<sub>channel</sub>[prev(x), I<sub>x</sub>, next(x)] / 255<br>
+          X<sub>center_repeat</sub>(x) = Stack<sub>channel</sub>[I<sub>x</sub>, I<sub>x</sub>, I<sub>x</sub>] / 255<br>
+          supervision(x) = M<sub>x</sub>, &nbsp; M<sub>x</sub> ∈ {0, 1, ..., 25}<sup>H×W</sup>
+        </div>
+
+        <div class="flow" aria-label="Dataset 取样流程">
+          <div class="flow-step"><strong>Manifest rows</strong><span>读取目标 split</span></div>
+          <div class="flow-arrow" aria-hidden="true">→</div>
+          <div class="flow-step"><strong>Group by case</strong><span>绝不跨 <code>case_id</code></span></div>
+          <div class="flow-arrow" aria-hidden="true">→</div>
+          <div class="flow-step"><strong>Sort &amp; validate</strong><span>按 <code>slice_idx</code>；拒绝重复/内部缺层</span></div>
+          <div class="flow-arrow" aria-hidden="true">→</div>
+          <div class="flow-step"><strong>Read 3 images</strong><span>uint8；shape 必须一致</span></div>
+          <div class="flow-arrow" aria-hidden="true">→</div>
+          <div class="flow-step"><strong>Read center mask</strong><span>仅 <code>M<sub>x</sub></code>；uint16</span></div>
+        </div>
+
+        <div class="two-col">
+          <div class="plain-panel">
+            <h3>首尾复制</h3>
+            <p>病例首层输入索引为 <code>[first, first, first+1]</code>；末层为 <code>[last-1, last, last]</code>。这样维持三通道形状且不制造跨病例邻接。</p>
+          </div>
+          <div class="plain-panel">
+            <h3>内部连续性</h3>
+            <p>内部层必须能在同一 <code>case_id</code> 中精确找到 <code>x-1</code> 和 <code>x+1</code>。缺失不是静默复制，而是数据一致性错误。</p>
+          </div>
+        </div>
+
+        <div class="callout good">
+          <p><strong>安全不变量：</strong>三个输入通道来自同一病例；标签只来自中心层；图像与 mask shape 一致；图像 dtype 为 uint8；mask dtype 为 uint16；标签值只允许 <code>0..25</code>。</p>
+        </div>
+      </section>
+
+      <section class="section" id="supervision">
+        <p class="section-kicker">05 / Supervision mapping</p>
+        <h2>从中心 mask 到 Snake / YOLO 监督</h2>
+        <p>对中心 mask 的每个非零标签单独生成二值图，并调用 <code>cv2.findContours(..., cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_NONE)</code>。<code>RETR_EXTERNAL</code> 只提取该类别的外部轮廓；同类存在多个外部连通组件时，每个有效组件分别成为一个实例。</p>
+
+        <div class="table-wrap">
+          <table>
+            <thead><tr><th>语义层</th><th>类别范围</th><th>映射</th><th>用途</th></tr></thead>
+            <tbody>
+              <tr><td>uint16 mask</td><td><code>0..25</code></td><td><code>0</code> 背景，<code>1..25</code> 前景类别</td><td>中心层像素标签来源</td></tr>
+              <tr><td>Snake / heatmap</td><td><code>1..25</code></td><td>保持 mask 的 1-based <code>label</code></td><td><code>ct_hm</code> 共26通道，背景索引保留</td></tr>
+              <tr><td>YOLO</td><td><code>0..24</code></td><td><code>yolo_cls = label - 1</code></td><td>25类 box 检测监督</td></tr>
+            </tbody>
+          </table>
+        </div>
+
+        <p>每个外部轮廓进一步生成检测框、中心 heatmap、宽高、极值点、octagon/Snake 初始化多边形和128点演化目标。空中心 mask 返回合法的零实例张量，仍可被 collator 组成 batch；此时没有轮廓级 Flow Matching 监督，日志中的 <code>diff_loss=0</code>。</p>
+      </section>
+
+      <section class="section" id="preprocess">
+        <p class="section-kicker">06 / Preprocessing</p>
+        <h2>共享 affine、尺寸与 MoonViT 预处理</h2>
+        <p>YOLO/Snake 输入仍把三张邻层按 <code>[x-1,x,x+1]</code> 堆叠，再通过同一个 affine 变换进入 <code>512×512</code> 坐标；中心 mask 的多边形监督使用同一变换。真实 DataLoader 已验证 batch 为 <code>(2, 3, 512, 512)</code>，真实 MoonViT 融合张量为 <code>(2, 2304, 32, 29)</code>。</p>
+
+        <div class="table-wrap">
+          <table>
+            <thead><tr><th>项目</th><th>当前配置</th><th>目的</th></tr></thead>
+            <tbody>
+              <tr><td>YOLO/Snake 数值</td><td><code>uint8 / 255</code>，再按 <code>pseudo3d_mean=0</code>、<code>std=1</code></td><td>保持现有2D检测/轮廓输入契约</td></tr>
+              <tr><td>MoonViT 输入</td><td>每张灰度切片独立复制成 RGB；<code>(x-0.5)/0.5</code></td><td>符合 MoonViT 预训练图像规范</td></tr>
+              <tr><td>MoonViT 几何</td><td><code>448×448</code>，patch <code>14</code>；layer 18 grid</td><td>输出验证集样例 <code>1152×32×29</code></td></tr>
+              <tr><td>邻层融合</td><td><code>concat(F_center, mean(F_prev,F_next))</code></td><td>保留中心语义，并加入局部 X 方向上下文</td></tr>
+              <tr><td>Color augmentation</td><td><code>false</code></td><td>不把医疗灰度层当自然 RGB 独立扰动</td></tr>
+              <tr><td>Left-right flip / crop</td><td><code>false / false</code></td><td>首轮固定几何预处理，减少变量</td></tr>
+            </tbody>
+          </table>
+        </div>
+        <div class="callout">
+          <p><strong>关键区别：</strong>YOLO 的输入是三张邻层组成的伪3D三通道；MoonViT 不是把这三张图直接当 RGB，而是对每张切片单独做灰度到 RGB 的复制并提取特征，之后才进行中心/邻层特征融合。</p>
+        </div>
+        <p class="footnote">用于可视化的 <code>orig_img</code> 是 affine 后中心层重复到三通道，不是 pseudo-RGB，避免把层间通道差异误画成模型输出底图。</p>
+      </section>
+
+      <section class="section" id="stem">
+        <p class="section-kicker">07 / Symmetric initialization</p>
+        <h2>YOLO stem 三通道对称初始化</h2>
+        <p>加载官方 YOLO 预训练权重后，对第一层 stem 卷积做通道对称化。对每个输出通道与空间核位置，先求原 RGB 三个输入通道权重的平均，再把平均核复制到三个伪3D通道。</p>
+
+        <div class="formula" aria-label="YOLO stem 对称初始化公式">
+          W̄<sub>o,u,v</sub> = (W<sub>o,0,u,v</sub> + W<sub>o,1,u,v</sub> + W<sub>o,2,u,v</sub>) / 3<br>
+          W′<sub>o,0,u,v</sub> = W′<sub>o,1,u,v</sub> = W′<sub>o,2,u,v</sub> = W̄<sub>o,u,v</sub><br>
+          For [I, I, I]: &nbsp; Σ<sub>c</sub> W′<sub>o,c</sub> * I = Σ<sub>c</sub> W<sub>o,c</sub> * I
+        </div>
+
+        <div class="two-col">
+          <div class="plain-panel">
+            <h3>保持预训练响应</h3>
+            <p>当输入是 <code>center_repeat=[I,I,I]</code> 时，对称化前后的 stem 卷积响应相同，不破坏预训练网络对重复灰度输入的起始行为。</p>
+          </div>
+          <div class="plain-panel">
+            <h3>不给邻层先验偏置</h3>
+            <p>三个通道以完全相同的核开始训练，避免把自然图像 RGB 通道差异错误地解释为 previous / center / next 的重要性差异。</p>
+          </div>
+        </div>
+        <p>对应开关为 <code>pseudo3d_symmetric_stem_init=true</code>；实现位于 <code>Network.make_symmetric_stem_weight</code>，并有响应保持单元测试。</p>
+      </section>
+
+      <section class="section" id="model">
+        <p class="section-kicker">08 / Model path</p>
+        <h2>模型路径：YOLO-P2/P3 + MoonViT → Snake → Flow Matching</h2>
+        <p>本次有界下游训练使用 <code>configs/sagittal_2d_pseudo3d_moonvit_train.yaml</code>。YOLOv8s 保留25类检测和 P2/P3 特征；MoonViT-SO-400M 只离线提取冻结的 <code>layer_18</code>，将中心特征与前后邻层均值拼接为2304通道，通过 zero-init residual adapter 注入 Snake feature。MoonViT 参数不进入在线训练图；AdamW优化所有下游 <code>requires_grad=True</code> 参数及 adapter。detail context、最终头 MoE 和 DiT FFN-MoE 均关闭。</p>
+
+        <div class="flow" aria-label="当前 MoonViT 模型推理路径">
+          <div class="flow-step"><strong>Input</strong><span><code>3×512×512</code><br>真实 <code>x-1,x,x+1</code></span></div>
+          <div class="flow-arrow" aria-hidden="true">→</div>
+          <div class="flow-step"><strong>YOLO P2 / P3</strong><span>25类检测 + detector feature</span></div>
+          <div class="flow-arrow" aria-hidden="true">→</div>
+          <div class="flow-step"><strong>Frozen MoonViT</strong><span><code>layer_18</code>：1152×32×grid</span></div>
+          <div class="flow-arrow" aria-hidden="true">→</div>
+          <div class="flow-step"><strong>Fusion</strong><span><code>concat(center, mean(prev,next))</code><br>2304 channels</span></div>
+          <div class="flow-arrow" aria-hidden="true">→</div>
+          <div class="flow-step"><strong>Residual injection</strong><span>adapter zero-init；不替换 YOLO</span></div>
+          <div class="flow-arrow" aria-hidden="true">→</div>
+          <div class="flow-step"><strong>Standard head</strong><span>无 detail context<br>无 MoE</span></div>
+          <div class="flow-arrow" aria-hidden="true">→</div>
+          <div class="flow-step"><strong>Contour</strong><span>GT / predicted box 两种评估</span></div>
+        </div>
+
+        <div class="table-wrap">
+          <table>
+            <thead><tr><th>关键配置</th><th>当前值</th></tr></thead>
+            <tbody>
+              <tr><td>YOLO</td><td><code>yolov8s.pt</code>，<code>yolo_num_classes=25</code>，P2/P3 path，首层对称初始化</td></tr>
+              <tr><td>MoonViT</td><td>冻结 MoonViT-SO-400M；离线 <code>layer_18</code>，hidden 1152，patch 14，输入448</td></tr>
+              <tr><td>预训练 provenance</td><td>当前项目指定 <code>Eagle/Embodied/work_dirs/1232_final_locany_full_more10000/checkpoint-3000</code>；<code>global_step=3000</code>，训练配置上限10000步。它是当前代码链路的标准来源，不把其他实验分支直接称为更优。</td></tr>
+              <tr><td>伪3D融合</td><td><code>concat(F_center, mean(F_prev,F_next))</code>；<code>locate_feat_dim=2304</code></td></tr>
+              <tr><td>Feature injection</td><td><code>locate_feat_inject=true</code>，<code>locate_feat_replace=false</code>；zero-init residual</td></tr>
+              <tr><td>Flow Matching</td><td><code>use_flow_matching=true</code>，<code>flow_ode_steps=10</code>，V4.1</td></tr>
+              <tr><td>Detail / MoE</td><td><code>v4_1_use_detail_context=false</code>；final head <code>standard</code>；DiT FFN-MoE=false</td></tr>
+              <tr><td>Rich-state sampling</td><td>保留 <code>v4_9_use_rich_state_sampling=true</code>；仅改变训练时轮廓状态/难度的采样分布，不增加专家、detail context 或额外特征分支</td></tr>
+            </tbody>
+          </table>
+        </div>
+      </section>
+
+      <section class="section" id="modes">
+        <p class="section-kicker">09 / Train and evaluation contracts</p>
+        <h2>training、inference、GT-box 与 predicted-box 的区别</h2>
+        <div class="table-wrap">
+          <table>
+            <thead><tr><th>模式</th><th>box 来源</th><th>回答的问题</th><th>不能回答的问题</th></tr></thead>
+            <tbody>
+              <tr><td><strong>Training</strong></td><td>GT box，因 <code>use_gt_det=true</code> 且 <code>use_gt_det_train_only=true</code></td><td>检测损失与以 GT 框初始化的轮廓路径能否联合反传</td><td>真实预测框下的端到端可用性</td></tr>
+              <tr><td><strong>GT-box conditional eval</strong></td><td>验证 mask 派生的 GT box</td><td>给定正确框时整个下游系统的分割结果；移除 proposal / box-localization 误差</td><td>检测器是否能找到目标；YOLO P2/P3、adapter、Snake/Flow等任一模块的单独因果贡献</td></tr>
+              <tr><td><strong>Predicted-box eval</strong></td><td>YOLO 预测，经阈值与 NMS</td><td>input → detector → contour 的完整端到端表现</td><td>若没有框，无法单独归因轮廓模块质量</td></tr>
+              <tr><td><strong>Inference</strong></td><td>正常部署应使用 predicted box</td><td>未知标签样本上的实际输出</td><td>不能在部署时使用 GT box</td></tr>
+            </tbody>
+          </table>
+        </div>
+        <div class="callout">
+          <p>GT-box conditional 与 predicted-box end-to-end 应同时报告。前者缩小了 proposal / box-localization 误差的影响范围，后者保留完整检测路径；两者不是可互换的“两个精度数字”，GT-box 也不能被表述为只测量轮廓模块。</p>
+        </div>
+        <div class="callout good">
+          <p><strong>评估架构必须严格一致：</strong><code>tools/eval_sagittal_2d_fixed.py</code> 默认加载当前 MoonViT 配置，并要求 checkpoint 为 <code>missing=0, unexpected=0</code>。若误用旧 detail+MoE 配置或不匹配的 checkpoint，评估会直接失败，不再带随机初始化模块继续产出无效指标。</p>
+        </div>
+      </section>
+
+      <section class="section" id="gpu-smoke">
+        <p class="section-kicker">10 / Bounded downstream training health</p>
+        <h2>冻结 MoonViT cache 的5,000-step下游训练与健康监控</h2>
+        <p>产物位于 <code>data/outputs/sagittal_2d_pseudo3d_moonvit_train/</code>，使用 <code>configs/sagittal_2d_pseudo3d_moonvit_train.yaml</code>。训练使用 GPU 0、batch size 1，完成5,000个 optimizer step / sampler draw；采样器有放回，5,000相对训练集14,384个名义 epoch positions 为34.76%，不表示唯一样本覆盖。MoonViT 只提供离线冻结的 <code>layer_18</code> cache，没有参数更新。训练日志连续覆盖 step 1–5000，所有记录中的 loss、gradient 与 CUDA 数值均 finite，进程以 returncode 0 正常退出。</p>
+
+        <div class="metric-strip">
+          <div class="metric"><span class="value">20,631 / 20,631</span><span class="label">training + validation 冻结 MoonViT cache 完整</span></div>
+          <div class="metric"><span class="value">5,000 / 5,000</span><span class="label">单卡 batch-1 有放回下游训练 step / draw</span></div>
+          <div class="metric"><span class="value">20.86%</span><span class="label">loss：首500与末500窗口下降</span></div>
+          <div class="metric"><span class="value">1</span><span class="label">一次 transient stall，随后恢复</span></div>
+        </div>
+
+        <div class="table-wrap">
+          <table>
+            <thead><tr><th>运行检查</th><th>实测结果</th><th>解释</th></tr></thead>
+            <tbody>
+              <tr><td>Cache precheck</td><td><code>npz_count=20631</code>，<code>expected_count=20631</code>，errors=0</td><td>training 14,384 + validation 6,247 个文件全部可用</td></tr>
+              <tr><td>Foreground-balanced sampler</td><td>epoch0：7,192 foreground / 7,192 empty；前5,000 draws 重建比例0.5064</td><td>采样器目标比例0.5且有放回；这不表示5,000个唯一样本，也不等同于 transform 后轮廓出现率</td></tr>
+              <tr><td>Loss / gradient</td><td>loss mean=9.289567；首500=10.715324；末500=8.480024；pre-clip grad L2 max=1446.818</td><td>5,000步均启用 norm=1.0 的 gradient clipping；无 NaN / Inf；loss下降不等同于验证提升</td></tr>
+              <tr><td>MoonViT adapter</td><td>5个参数；非零梯度2169步；weight absmax 1.000000→1.003073</td><td>adapter参与反传；MoonViT编码器保持离线冻结且没有参数更新</td></tr>
+              <tr><td>GPU / disk</td><td>CUDA allocated peak 2.595 GiB；reserved peak 3.100 GiB；最高温度56°C；最终余量227.77 GiB</td><td>未出现 OOM 或温度/磁盘阈值告警</td></tr>
+              <tr><td>Checkpoint</td><td><code>step_4000.pt</code>、<code>step_4500.pt</code>、<code>step_5000.pt</code>、<code>latest.pt</code>、<code>validated_latest.pt</code></td><td>format v2，包含 optimizer / scheduler / RNG 与5个 adapter key</td></tr>
+            </tbody>
+          </table>
+        </div>
+
+        <div class="callout critical">
+          <p><strong>唯一健康告警：</strong>step 4174 后出现约10.5分钟暂停，monitor 记录一次 <code>stall</code> health_alert（最大 age 632秒，阈值300秒）；随后在 step 4180 恢复，训练正常完成。共有1个 health_alert event、2条带 alert 的 heartbeat、3个 alert instances，因此不能称为“零告警”或“全程无停顿”。</p>
+        </div>
+
+        <h3>历史 10-step GPU smoke：保留为链路证据，不作为正式结果</h3>
+        <p>历史产物位于 <code>data/outputs/sagittal_2d_pseudo3d_moonvit_smoke10/</code>，仅使用 <code>sub-verse004</code> 的61张切片。10个 step 用于验证真实 cache、forward / backward、adapter 梯度与 checkpoint 写入；其 step 10 total loss=14.096936，不能代表全量训练收敛，也不参与当前 validation 结论。</p>
+        <div class="callout">
+          <p><strong>严格恢复验证：</strong>从 <code>checkpoints/validated_latest.pt</code> 恢复时，checkpoint 已处于 step 5000，strict load 的 missing / unexpected keys 均为0，未额外执行 optimizer step。</p>
+        </div>
+      </section>
+
+      <section class="section" id="validation">
+        <p class="section-kicker">11 / Validation</p>
+        <h2>全量 validation：GT-box 条件系统结果，predicted-box 作为端到端补充</h2>
+        <p>终点 checkpoint <code>validated_latest.pt</code> 已在 validation 全部 <strong>6,247</strong> 张切片上评估，其中2,902张为前景中心层、3,345张为空中心层。下面先报告 GT 检测框条件下的分割性能：它移除了 proposal 与 box-localization 误差，但没有移除其余下游可训练路径。</p>
+
+        <div class="callout good">
+          <p><strong>GT-box 口径：</strong>每张切片的输入框由真实 mask 派生。它回答的是“给定正确框时，这个包含 YOLO P2/P3 特征、adapter、Snake/Flow、训练预算与监督的下游系统表现如何”；它不是检测性能、不是部署端到端结果，也不是 Snake / Flow Matching 的单独测量。</p>
+        </div>
+
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr><th>step5000 / GT-box 分割</th><th class="num">foreground Dice</th><th class="num">foreground IoU</th><th class="num">class mean Dice</th><th class="num">class mean IoU</th><th>覆盖情况</th></tr>
+            </thead>
+            <tbody>
+              <tr class="ok-row"><td>全 validation / GT-box oracle</td><td class="num">0.130474</td><td class="num">0.0739995</td><td class="num">0.0496532</td><td class="num">0.0261889</td><td>6,247 slices；2,902 foreground；2,624 张前景切片有轮廓；26,417 contours</td></tr>
+            </tbody>
+          </table>
+        </div>
+
+        <h3>为什么主看 foreground-slice 指标</h3>
+        <div class="table-wrap">
+          <table>
+            <thead><tr><th>GT-box 指标</th><th class="num">数值</th><th>解释</th></tr></thead>
+            <tbody>
+              <tr><td>foreground-slice mean Dice</td><td class="num">0.130474</td><td>只在真实 mask 有前景的2,902张切片上平均，是当前分割主指标。</td></tr>
+              <tr><td>foreground-slice mean IoU</td><td class="num">0.0739995</td><td>与前景 Dice 同一切片集合，反映区域重叠。</td></tr>
+              <tr><td>all-slice mean Dice</td><td class="num">0.596068</td><td>包含3,345张空层；空对空会抬高数值，不作为主结论。</td></tr>
+              <tr><td>all-slice mean IoU</td><td class="num">0.569833</td><td>同样受到空层影响，只作完整性参考。</td></tr>
+            </tbody>
+          </table>
+        </div>
+
+        <h3>predicted-box：保留为端到端补充，不与 GT-box 混读</h3>
+        <div class="table-wrap">
+          <table>
+            <thead><tr><th>step5000 / predicted-box</th><th class="num">foreground Dice</th><th class="num">foreground IoU</th><th class="num">class mean Dice</th><th class="num">class mean IoU</th><th>预测情况</th></tr></thead>
+            <tbody>
+              <tr class="warn-row"><td>全 validation / predicted-box</td><td class="num">0.073996</td><td class="num">0.0419194</td><td class="num">0.00134317</td><td class="num">0.000687465</td><td>2,009 张有预测；1,344 张前景切片有预测；7,756 boxes</td></tr>
+            </tbody>
+          </table>
+        </div>
+
+        <div class="callout critical">
+          <p><strong>当前分割判断：</strong>GT-box 条件下的前景切片 Dice 仍只有 <code>0.130474</code>，说明给定正确框后的整体下游系统结果仍弱，不能把问题只解释为 proposal / box-localization 失败。但该评估仍包含 YOLO P2/P3、adapter、Snake/Flow、训练预算和监督，不能把低分唯一归因给 Snake/Flow。它也不能证明 MoonViT 特征或三切片伪3D带来提升；后续需要同预算、同 seed 的2D对照与必要模块消融。</p>
+        </div>
+        <p class="footnote">GT 与 predicted 两份 <code>slices.json</code> 均含6,247条唯一的 <code>(case_id, slice_idx)</code> 记录，summary 与逐切片结果均通过 finite 数值检查。</p>
+      </section>
+
+      <section class="section" id="ablation">
+        <p class="section-kicker">12 / Controlled comparison</p>
+        <h2><code>neighbors</code> vs <code>center_repeat</code>：现有证据与严谨对照</h2>
+        <p>已有 CPU 短程 smoke 对两条输入链各运行100 step，并固定为50个前景样本与50个空样本。它验证两种输入模式都能完成 forward / backward 与参数更新，但不构成 accuracy 对照。</p>
+
+        <div class="table-wrap">
+          <table>
+            <thead><tr><th>输入模式</th><th class="num">total first-10 mean</th><th class="num">total last-10 mean</th><th>可得结论</th></tr></thead>
+            <tbody>
+              <tr><td><code>neighbors</code></td><td class="num">14.9624</td><td class="num">6.7204</td><td>100-step CPU 链路稳定</td></tr>
+              <tr><td><code>center_repeat</code></td><td class="num">14.2402</td><td class="num">6.7196</td><td>100-step CPU 链路稳定</td></tr>
+            </tbody>
+          </table>
+        </div>
+
+        <div class="callout">
+          <p><strong>不能从这四个 loss 均值推断邻层有效。</strong>现阶段没有同一训练 checkpoint 预算下的正式 validation accuracy 配对结果，也没有多 seed 置信区间。</p>
+        </div>
+
+        <h3>推荐的正式 A/B 协议</h3>
+        <ol class="next-list">
+          <li>只改变 <code>pseudo3d_input_mode</code>；其他 YAML、预训练权重、stem 对称初始化、优化器和增强完全一致。</li>
+          <li>使用同一病例 split、同一 seed、同一前景/空层采样序列；两组均采用 balanced sampling。</li>
+          <li>给予相同的 optimizer step 预算、学习率日程、batch size 和 checkpoint 频率，先完成 <code>5k–10k</code> step。</li>
+          <li>在相同步数 checkpoint 上分别运行 GT-box oracle 与 predicted-box end-to-end；主指标为 foreground-slice Dice / IoU，同时报告 class mean 和 <code>n_pred</code>。</li>
+          <li>至少运行多个 seed，报告 paired difference 与波动范围；不得用每组最优 checkpoint 做非配对比较。</li>
+        </ol>
+      </section>
+
+      <section class="section" id="limits">
+        <p class="section-kicker">13 / Limitations and next steps</p>
+        <h2>局限与下一步</h2>
+        <div class="two-col">
+          <div class="plain-panel">
+            <h3>当前局限</h3>
+            <ul class="compact-list">
+              <li>已结束的是单卡 batch-1、5,000-draw的有界下游训练，不是 MoonViT 预训练或大规模训练；有放回抽样不能单独证明收敛、泛化或数据覆盖。</li>
+              <li>原始 training manifest 中8,546 / 14,384为空中心层；balanced sampler 将采样目标固定为前景/空层各50%，前5,000 draws 重建为2,532 / 2,468，但 transform 后实际轮廓监督为2,170 / 5,000步。</li>
+              <li>GT-box 条件系统指标 Dice=0.130474 仍较弱；它排除了 proposal / box-localization 误差，但不能唯一归因任一剩余模块。</li>
+              <li>训练中出现一次约10.5分钟 transient stall，已恢复并正常完成；后续长训仍需保留 heartbeat 与 checkpoint 监控。</li>
+              <li>暂无同预算、同 seed 的 <code>neighbors</code> / <code>center_repeat</code> accuracy 对照，也没有针对 YOLO P2/P3、adapter、Snake/Flow 的模块消融，不能宣称 MoonViT 提升。</li>
+            </ul>
+          </div>
+          <div class="plain-panel">
+            <h3>下一步顺序</h3>
+            <ol class="compact-list">
+              <li>以当前 GT-box 条件系统指标为基线，先做同预算、同 seed、同 sampling sequence 的 <code>center_repeat</code> 对照。</li>
+              <li>在相同步数 checkpoint 上同时报告 GT-box 条件指标和 predicted-box 端到端指标。</li>
+              <li>为 YOLO P2/P3特征、MoonViT adapter与 Snake/Flow 分别设计消融，避免把 GT-box 分数当作模块级诊断。</li>
+              <li>仅在多 seed 的三切片相对2D baseline 存在稳定 paired 增益后，再测试5切片或真正体素3D模型。</li>
+            </ol>
+          </div>
+        </div>
+        <p>决策门槛应建立在 foreground-slice accuracy、类别覆盖、检测召回和多 seed 稳定性上，而不是 all-slice Dice 或短程训练 loss。</p>
+      </section>
+
+      <section class="section" id="index">
+        <p class="section-kicker">14 / Reproducibility index</p>
+        <h2>代码、数据、checkpoint 与结果索引</h2>
+        <dl class="path-index">
+          <dt>Dataset 实现</dt><dd>lib/datasets/sagittal_2d_fixed/snake.py</dd>
+          <dt>采样器与健康监控</dt><dd>lib/datasets/samplers.py；scripts/monitor_sagittal_moonvit_train.py</dd>
+          <dt>MoonViT 提取脚本</dt><dd>scripts/extract_sagittal_moonvit_features.py</dd>
+          <dt>有界下游训练配置</dt><dd>configs/sagittal_2d_pseudo3d_moonvit_train.yaml</dd>
+          <dt>模型与注入</dt><dd>lib/networks/snake/ct_snake.py</dd>
+          <dt>评估入口</dt><dd>tools/eval_sagittal_2d_fixed.py</dd>
+          <dt>Manifest</dt><dd>/home/medteam/Zhrch/detect_3D_lgz2/datasets/sagittal_2d_fixed/manifests/slice_manifest.csv</dd>
+          <dt>MoonViT cache</dt><dd>data/sagittal_moonvit_cache/（20,631个 NPZ）</dd>
+          <dt>有界下游训练日志</dt><dd>data/outputs/sagittal_2d_pseudo3d_moonvit_train/logs.jsonl</dd>
+          <dt>训练健康日志</dt><dd>data/outputs/sagittal_2d_pseudo3d_moonvit_train/monitor.jsonl</dd>
+          <dt>健康总结</dt><dd>data/outputs/sagittal_2d_pseudo3d_moonvit_train/health_summary.json</dd>
+          <dt>最终可恢复 checkpoint</dt><dd>data/outputs/sagittal_2d_pseudo3d_moonvit_train/checkpoints/validated_latest.pt</dd>
+          <dt>GT-box summary</dt><dd>data/outputs/sagittal_2d_pseudo3d_moonvit_eval_gt_step5000/summary.json</dd>
+          <dt>Predicted-box summary</dt><dd>data/outputs/sagittal_2d_pseudo3d_moonvit_eval_predicted_step5000/summary.json</dd>
+        </dl>
+
+        <h3>有界下游训练与监控</h3>
+        <pre><code>cd /home/medteam/Zhrch/DiffusionSnake-12-30
+WANDB_MODE=disabled ONE_SAMPLE_VIZ_INTERVAL=0 \
+PYTORCH_CUDA_ALLOC_CONF=max_split_size_mb:128 \
+/home/medteam/miniconda3/envs/snake1/bin/python -u \
+scripts/monitor_sagittal_moonvit_train.py \
+  --cfg-file configs/sagittal_2d_pseudo3d_moonvit_train.yaml \
+  --gpu 0 --interval 30</code></pre>
+
+        <h3>全量 validation：GT-box 分割</h3>
+        <pre><code>cd /home/medteam/Zhrch/DiffusionSnake-12-30
+CUDA_VISIBLE_DEVICES=0 \
+CFG_FILE=configs/sagittal_2d_pseudo3d_moonvit_train.yaml \
+/home/medteam/miniconda3/envs/snake1/bin/python tools/eval_sagittal_2d_fixed.py \
+  --cfg_file configs/sagittal_2d_pseudo3d_moonvit_train.yaml \
+  --ckpt data/outputs/sagittal_2d_pseudo3d_moonvit_train/checkpoints/validated_latest.pt \
+  --split val --box-mode gt --device cuda \
+  --result-dir data/outputs/sagittal_2d_pseudo3d_moonvit_eval_gt_step5000
+
+# 将 --box-mode gt 改为 predicted 可得到端到端补充结果。</code></pre>
+
+        <h3>语法与健康单元测试</h3>
+        <pre><code>cd /home/medteam/Zhrch/DiffusionSnake-12-30
+/home/medteam/miniconda3/envs/snake1/bin/python -m py_compile \
+  diffusion_train.py \
+  lib/datasets/sagittal_2d_fixed/snake.py \
+  lib/datasets/samplers.py \
+  lib/datasets/make_dataset.py \
+  lib/evaluators/sagittal_2d_fixed/snake.py \
+  scripts/monitor_sagittal_moonvit_train.py
+/home/medteam/miniconda3/envs/snake1/bin/python -m unittest \
+  tests.test_foreground_sampling_scope \
+  tests.test_training_health -v</code></pre>
+      </section>
+
+      <section class="section" id="checklist">
+        <p class="section-kicker">15 / Verification checklist</p>
+        <h2>当前验证清单</h2>
+        <div class="two-col">
+          <div>
+            <h3>数据与输入</h3>
+            <ul class="check-list">
+              <li>manifest 共26,589张，病例80 / 40 / 40，split 无病例交叉。</li>
+              <li>相邻层按同病例 <code>slice_idx</code> 构造；首尾复制；内部缺层报错。</li>
+              <li>图像 uint8，mask uint16，标签范围严格 <code>0..25</code>。</li>
+              <li>有界下游训练的名义 training positions 为14,384，validation 为6,247张；实际训练为5,000次有放回 draws。</li>
+              <li>MoonViT cache 实际校验 <strong>20,631 / 20,631</strong> 个 NPZ，training 与 validation 均 pending=0。</li>
+              <li>融合契约为 center 1152 + neighbor mean 1152，得到2304通道；输入448、patch14、layer18。</li>
+            </ul>
+          </div>
+          <div>
+            <h3>模型、训练与验证</h3>
+            <ul class="check-list">
+              <li>detail context、final-head MoE、DiT FFN-MoE 均关闭；rich-state sampling 保留。</li>
+              <li>ForegroundBalancedSampler epoch0 恰好7,192 foreground / 7,192 empty；前5,000有放回 draws 比例0.5064，不表示唯一样本覆盖。</li>
+              <li>有界下游训练5,000步连续 finite，returncode=0；loss 首500到末500下降20.86%，不等同于验证提升。</li>
+              <li><code>validated_latest.pt</code> 严格恢复 missing=0、unexpected=0，恢复到 step5000且未多跑一步。</li>
+              <li>全 validation GT-box 条件系统的前景切片 Dice=0.130474、IoU=0.0739995；不构成 Snake/Flow 的单独指标。</li>
+              <li>监控记录一次 transient stall，之后恢复；无持续 NaN、OOM 或 cache 缺失。</li>
+            </ul>
+          </div>
+        </div>
+
+        <div class="callout good">
+          <p><strong>审计结论：</strong>MoonViT 伪3D数据契约、全量冻结 cache、中心层监督、balanced sampling、5,000次有放回下游训练、checkpoint 恢复和 GT-box / predicted-box 双口径评估均已落盘。工程链路可复现，但不是 MoonViT 预训练或大规模 run；当前 GT-box 条件系统分割仍弱，且没有同预算同 seed 的2D对照或模块消融，因此不宣称 MoonViT 或三切片伪3D已带来提升。</p>
+        </div>
+      </section>
+    </main>
+  </div>
+
+  <footer class="report-footer">
+    <div class="footer-inner">
+      离线研究报告 · 更新于 2026-07-21 · 不依赖 CDN、网络字体或外部 JavaScript · 医学图像均来自指定的真实 validation 样本。
+    </div>
+  </footer>
+</body>
+</html>

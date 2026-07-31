@@ -5,42 +5,32 @@ import os
 class JsonLogger:
     def __init__(self, path: str):
         self.path = path
-        os.makedirs(os.path.dirname(path), exist_ok=True)
-        # line-buffered append
+        os.makedirs(os.path.dirname(path) or '.', exist_ok=True)
+        # line-buffered append; write/flush failures are deliberate fail-fast errors.
         self._f = open(self.path, 'a', buffering=1, encoding='utf-8')
 
     def log(self, obj: dict):
-        try:
-            self._f.write(json.dumps(obj, ensure_ascii=False) + "\n")
-            self._f.flush()
-        except Exception:
-            pass
+        payload = json.dumps(obj, ensure_ascii=False, allow_nan=False)
+        self._f.write(payload + "\n")
+        self._f.flush()
 
     def close(self):
-        try:
-            self._f.close()
-        except Exception:
-            pass
+        self._f.close()
 
     def tell(self):
-        try:
-            self._f.flush()
-            return os.path.getsize(self.path)
-        except Exception:
-            return None
+        self._f.flush()
+        return os.path.getsize(self.path)
 
     def truncate(self, pos):
         if pos is None:
             return
-        try:
-            self._f.flush()
-            pos = int(pos)
-            current_size = os.path.getsize(self.path)
-            if pos < 0 or pos > current_size:
-                return
-            self._f.truncate(pos)
-        except Exception:
-            pass
+        self._f.flush()
+        pos = int(pos)
+        current_size = os.path.getsize(self.path)
+        if pos < 0 or pos > current_size:
+            raise ValueError(f'invalid JSONL truncate position {pos} for size {current_size}')
+        self._f.truncate(pos)
+        self._f.flush()
 
 
 class NullLogger:

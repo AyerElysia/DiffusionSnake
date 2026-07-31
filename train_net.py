@@ -171,8 +171,8 @@ def train_traditional(cfg, network, trainer):
     scheduler = make_lr_scheduler(cfg, optimizer)
     recorder = make_recorder(cfg)
 
-    # 梯度累积设置 - 由于batch_size=1，需要累积4步来达到等效batch_size=4
-    gradient_accumulation_steps = 4
+    # 梯度累积步数从config读取，默认1（不累积）
+    gradient_accumulation_steps = int(getattr(cfg.train, 'gradient_accumulation_steps', 1))
     print(f"🔄 使用梯度累积: {gradient_accumulation_steps} 步")
 
     # 使用非严格加载以支持ClinicalBERT参数
@@ -184,14 +184,16 @@ def train_traditional(cfg, network, trainer):
 
     for epoch in range(begin_epoch, cfg.train.epoch):
         print(f"第 {epoch} 轮···")
-        # if epoch > 50:
-        #     break
         recorder.epoch = epoch
         trainer.train(epoch, train_loader, optimizer, recorder)
         scheduler.step()
 
         if (epoch + 1) % cfg.train.save_ep == 0:
             save_model(network, optimizer, scheduler, recorder, epoch, cfg.model_dir)
+
+        # 每个epoch结束后主动释放显存，防止跨epoch内存累积
+        import torch
+        torch.cuda.empty_cache()
 
     return network
 

@@ -42,6 +42,8 @@ class MemFlowDiTSnake(nn.Module):
             distance_scale=distance_scale,
         )
         self.memory_capacity = int(memory_capacity)
+        self.mask_channels = int(mask_channels)
+        self.memory_pool_size = int(memory_pool_size)
 
     def new_banks(self, volume_ids: Sequence[str]) -> List[SliceMemoryBank]:
         banks = []
@@ -84,6 +86,7 @@ class MemFlowDiTSnake(nn.Module):
         self,
         loss: torch.Tensor,
         banks: Sequence[SliceMemoryBank],
+        prediction_evidence_fraction: float = 0.0,
     ) -> Dict[str, torch.Tensor]:
         return {
             "volmem_memory_size": loss.detach().new_tensor(
@@ -95,7 +98,97 @@ class MemFlowDiTSnake(nn.Module):
             "memflow_active_states": loss.detach().new_tensor(
                 float(self.memflow_controller.active_state_count)
             ),
+            "volmem_prediction_evidence_fraction": loss.detach().new_tensor(
+                float(prediction_evidence_fraction)
+            ),
         }
+
+    def _prediction_memory_masks(
+        self,
+        output: Dict[str, object],
+        batch: Dict[str, object],
+    ):
+        contours = output.get("pred_contours")
+        py_ind = output.get("py_ind")
+        if not torch.is_tensor(contours) or not torch.is_tensor(py_ind):
+            return None
+        contours = contours.detach().to(dtype=torch.float32)
+        py_ind = py_ind.detach().to(device=contours.device, dtype=torch.long)
+        ct_cls = batch.get("ct_cls")
+        ct_01 = batch.get("ct_01")
+        if not torch.is_tensor(ct_cls) or not torch.is_tensor(ct_01):
+            return None
+        class_ids = ct_cls[ct_01.bool()].detach().to(
+            device=contours.device,
+            dtype=torch.long,
+        )
+        if (
+            contours.dim() != 3
+            or contours.size(-1) != 2
+            or int(contours.size(0)) != int(py_ind.numel())
+            or int(contours.size(0)) != int(class_ids.numel())
+        ):
+            return None
+
+        batch_size = int(batch["inp"].size(0))
+        source_h, source_w = batch["ct_hm"].shape[-2:]
+        pool = self.memory_pool_size
+        yy, xx = torch.meshgrid(
+            (torch.arange(pool, device=contours.device, dtype=contours.dtype) + 0.5)
+            * (float(source_h) / float(pool)),
+            (torch.arange(pool, device=contours.device, dtype=contours.dtype) + 0.5)
+            * (float(source_w) / float(pool)),
+            indexing="ij",
+        )
+        evidence = contours.new_zeros(
+            (batch_size, self.mask_channels, pool, pool)
+        )
+        x0 = contours[..., 0].clamp(0, max(float(source_w - 1), 0.0))
+        y0 = contours[..., 1].clamp(0, max(float(source_h - 1), 0.0))
+        x1 = torch.roll(x0, shifts=-1, dims=1)
+        y1 = torch.roll(y0, shifts=-1, dims=1)
+        denominator = y1 - y0
+        denominator = torch.where(
+            denominator.abs() < 1e-6,
+            torch.full_like(denominator, 1e-6),
+            denominator,
+        )
+        crosses = (
+            (y0[:, :, None, None] > yy)
+            != (y1[:, :, None, None] > yy)
+        )
+        x_at_y = (
+            (x1 - x0)[:, :, None, None]
+            * (yy - y0[:, :, None, None])
+            / denominator[:, :, None, None]
+            + x0[:, :, None, None]
+        )
+        inside_masks = (
+            (crosses & (xx < x_at_y)).sum(dim=1) % 2 == 1
+        )
+        sample_indices = py_ind.detach().cpu().tolist()
+        memory_classes = (
+            class_ids.detach().cpu().tolist()
+            if self.mask_channels > 1
+            else [0] * len(sample_indices)
+        )
+        for inside, sample_index, class_id in zip(
+            inside_masks, sample_indices, memory_classes
+        ):
+            sample_index = int(sample_index)
+            class_id = int(class_id)
+            if (
+                sample_index < 0
+                or sample_index >= batch_size
+                or class_id < 0
+                or class_id >= self.mask_channels
+            ):
+                continue
+            evidence[sample_index, class_id] = torch.maximum(
+                evidence[sample_index, class_id],
+                inside.to(dtype=evidence.dtype),
+            )
+        return [item.unsqueeze(0) for item in evidence]
 
     def forward_step(
         self,
@@ -103,15 +196,34 @@ class MemFlowDiTSnake(nn.Module):
         metas: Sequence[SliceSequenceMeta],
         memory_masks: Sequence[torch.Tensor],
         banks: Sequence[SliceMemoryBank],
+        prediction_evidence_probability: float = 0.0,
     ) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
         raw_features = self._raw_features(batch)
         if len(raw_features) != len(banks):
             raise ValueError("locate feature count must match memory bank count")
         self.memflow_controller.set_slice_memory(banks, metas)
-        loss, slice_stats = self.contour_adapter(batch)
-        self.write_step(raw_features, memory_masks, metas, banks)
+        output, loss, slice_stats = self.contour_adapter.forward_with_output(batch)
+        write_masks = list(memory_masks)
+        prediction_fraction = 0.0
+        prediction_probability = min(
+            max(float(prediction_evidence_probability), 0.0),
+            1.0,
+        )
+        if prediction_probability > 0.0:
+            predicted_masks = self._prediction_memory_masks(output, batch)
+            if predicted_masks is not None and len(predicted_masks) == len(write_masks):
+                selected = 0
+                for index, predicted in enumerate(predicted_masks):
+                    if float(torch.rand((), device=predicted.device).item()) < prediction_probability:
+                        write_masks[index] = predicted.to(
+                            device=memory_masks[index].device,
+                            dtype=memory_masks[index].dtype,
+                        )
+                        selected += 1
+                prediction_fraction = float(selected) / float(max(len(write_masks), 1))
+        self.write_step(raw_features, write_masks, metas, banks)
         stats = dict(slice_stats)
-        stats.update(self._stats(loss, banks))
+        stats.update(self._stats(loss, banks, prediction_fraction))
         return loss, stats
 
     def forward_2d(

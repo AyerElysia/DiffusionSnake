@@ -1,0 +1,703 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="light">
+  <title>冻结 MoonViT 特征的伪3D下游训练审计</title>
+  <style>
+    :root {
+      --ink: #17252b;
+      --muted: #52656c;
+      --rule: #ccd8d8;
+      --paper: #f5f8f7;
+      --panel: #ffffff;
+      --teal: #087f7b;
+      --teal-dark: #045a58;
+      --teal-pale: #e2f0ee;
+      --amber: #b77918;
+      --amber-pale: #fbf1db;
+      --red: #a44340;
+      --red-pale: #f8e7e6;
+      --blue: #315d7c;
+      --blue-pale: #e7eff5;
+      --mono: "SFMono-Regular", Consolas, "Liberation Mono", monospace;
+      --sans: Inter, "Noto Sans CJK SC", "Microsoft YaHei", Arial, sans-serif;
+    }
+
+    * { box-sizing: border-box; }
+    html { scroll-behavior: smooth; }
+    body {
+      margin: 0;
+      color: var(--ink);
+      background: var(--paper);
+      font-family: var(--sans);
+      font-size: 16px;
+      line-height: 1.68;
+    }
+    a { color: var(--teal-dark); text-decoration-color: #91bbb8; text-underline-offset: 3px; }
+    a:hover { color: var(--teal); }
+    code, pre { font-family: var(--mono); }
+    code {
+      padding: 0.08em 0.3em;
+      color: #1d4544;
+      background: #edf4f3;
+      border: 1px solid #d4e4e2;
+      border-radius: 3px;
+      overflow-wrap: anywhere;
+    }
+
+    .masthead {
+      color: #f4fbfa;
+      background: #123a3c;
+      border-bottom: 5px solid #c98b27;
+    }
+    .masthead-inner {
+      width: min(1220px, calc(100% - 48px));
+      margin: 0 auto;
+      padding: 54px 0 44px;
+    }
+    .eyebrow {
+      margin: 0 0 10px;
+      color: #b9dad5;
+      font-family: var(--mono);
+      font-size: 12px;
+      letter-spacing: 0.08em;
+      text-transform: uppercase;
+    }
+    h1, h2, h3, h4 { color: var(--ink); line-height: 1.24; }
+    h1 {
+      max-width: 920px;
+      margin: 0;
+      color: #ffffff;
+      font-size: clamp(34px, 4vw, 58px);
+      font-weight: 760;
+      letter-spacing: 0;
+    }
+    .subhead {
+      max-width: 880px;
+      margin: 16px 0 0;
+      color: #d9eeea;
+      font-size: 18px;
+    }
+    .badges {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 8px;
+      margin-top: 25px;
+    }
+    .badge {
+      display: inline-flex;
+      align-items: center;
+      min-height: 30px;
+      padding: 4px 10px;
+      color: #eef9f7;
+      border: 1px solid #4a7777;
+      background: #1d4d4f;
+      border-radius: 4px;
+      font-size: 13px;
+      white-space: nowrap;
+    }
+    .badge.amber { color: #fff3d9; border-color: #b5812d; background: #74551d; }
+
+    .layout {
+      display: grid;
+      grid-template-columns: 235px minmax(0, 1fr);
+      width: min(1280px, calc(100% - 48px));
+      margin: 0 auto;
+      gap: 34px;
+      align-items: start;
+    }
+    .toc {
+      position: sticky;
+      top: 22px;
+      margin-top: 34px;
+      padding: 18px 0;
+      border-top: 3px solid var(--teal);
+      border-bottom: 1px solid var(--rule);
+    }
+    .toc strong {
+      display: block;
+      margin-bottom: 10px;
+      color: var(--muted);
+      font-family: var(--mono);
+      font-size: 12px;
+      letter-spacing: 0.08em;
+      text-transform: uppercase;
+    }
+    .toc a {
+      display: block;
+      padding: 5px 0;
+      color: #385159;
+      font-size: 13px;
+      text-decoration: none;
+    }
+    .toc a:hover { color: var(--teal); }
+    main { min-width: 0; padding: 34px 0 70px; }
+    section {
+      scroll-margin-top: 18px;
+      padding: 38px 0;
+      border-bottom: 1px solid var(--rule);
+    }
+    section:first-child { padding-top: 0; }
+    .section-label {
+      margin: 0 0 5px;
+      color: var(--teal);
+      font-family: var(--mono);
+      font-size: 12px;
+      font-weight: 700;
+      letter-spacing: 0.09em;
+      text-transform: uppercase;
+    }
+    h2 { margin: 0 0 12px; font-size: clamp(25px, 3vw, 36px); }
+    h3 { margin: 25px 0 9px; font-size: 21px; }
+    h4 { margin: 0 0 7px; font-size: 15px; }
+    p { margin: 0 0 14px; }
+    .lead { max-width: 900px; color: #365159; font-size: 18px; }
+    .small { color: var(--muted); font-size: 13px; }
+    .mono { font-family: var(--mono); }
+
+    .callout {
+      margin: 22px 0;
+      padding: 16px 18px;
+      border-left: 4px solid var(--teal);
+      background: var(--teal-pale);
+    }
+    .callout p:last-child { margin-bottom: 0; }
+    .callout.warn { border-left-color: var(--amber); background: var(--amber-pale); }
+    .callout.critical { border-left-color: var(--red); background: var(--red-pale); }
+    .callout.blue { border-left-color: var(--blue); background: var(--blue-pale); }
+
+    .metrics {
+      display: grid;
+      grid-template-columns: repeat(4, minmax(0, 1fr));
+      gap: 10px;
+      margin: 24px 0 8px;
+    }
+    .metric {
+      min-height: 126px;
+      padding: 16px;
+      background: var(--panel);
+      border: 1px solid var(--rule);
+      border-top: 4px solid var(--teal);
+      border-radius: 5px;
+    }
+    .metric.amber { border-top-color: var(--amber); }
+    .metric.red { border-top-color: var(--red); }
+    .metric.blue { border-top-color: var(--blue); }
+    .metric .value {
+      display: block;
+      color: #143a3c;
+      font-family: var(--mono);
+      font-size: clamp(24px, 2.8vw, 34px);
+      font-weight: 700;
+      line-height: 1.15;
+      overflow-wrap: anywhere;
+    }
+    .metric .caption { display: block; margin-top: 8px; color: var(--muted); font-size: 13px; line-height: 1.45; }
+
+    .grid-2, .grid-3 { display: grid; gap: 16px; }
+    .grid-2 { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+    .grid-3 { grid-template-columns: repeat(3, minmax(0, 1fr)); }
+    .panel {
+      padding: 18px;
+      background: var(--panel);
+      border: 1px solid var(--rule);
+      border-radius: 5px;
+    }
+    .panel.teal { border-top: 3px solid var(--teal); }
+    .panel.amber { border-top: 3px solid var(--amber); }
+    .panel.red { border-top: 3px solid var(--red); }
+    .panel p:last-child, .panel ul:last-child { margin-bottom: 0; }
+
+    .pipeline {
+      display: grid;
+      grid-template-columns: repeat(7, minmax(85px, 1fr));
+      gap: 8px;
+      align-items: stretch;
+      margin: 22px 0;
+    }
+    .node {
+      display: flex;
+      flex-direction: column;
+      justify-content: center;
+      min-height: 112px;
+      padding: 13px 10px;
+      background: #ffffff;
+      border: 1px solid #bdd2d0;
+      border-top: 4px solid var(--teal);
+      border-radius: 4px;
+      text-align: center;
+    }
+    .node strong { font-size: 14px; }
+    .node span { margin-top: 6px; color: var(--muted); font-size: 11.5px; line-height: 1.42; }
+    .arrow { display: flex; align-items: center; justify-content: center; color: var(--teal); font-size: 24px; font-weight: 700; }
+
+    .evidence-figure {
+      margin: 24px 0 0;
+      padding: 12px;
+      background: #ffffff;
+      border: 1px solid var(--rule);
+      border-radius: 5px;
+    }
+    .evidence-figure img { display: block; width: 100%; height: auto; border: 1px solid #e1e8e7; }
+    figcaption { margin: 10px 2px 2px; color: var(--muted); font-size: 13px; }
+    .image-pair { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; margin-top: 18px; }
+    .image-pair figure { margin: 0; }
+    .image-pair img { display: block; width: 100%; max-height: 390px; object-fit: contain; background: #18242a; border: 1px solid var(--rule); }
+
+    .table-wrap { overflow-x: auto; margin: 18px 0; background: var(--panel); border: 1px solid var(--rule); border-radius: 5px; }
+    table { width: 100%; border-collapse: collapse; min-width: 690px; }
+    th, td { padding: 11px 12px; border-bottom: 1px solid #dce5e4; text-align: left; vertical-align: top; }
+    th { color: #244348; background: #edf4f3; font-size: 13px; font-weight: 700; }
+    td { font-size: 13px; }
+    tr:last-child td { border-bottom: 0; }
+    td.num, th.num { text-align: right; font-family: var(--mono); font-variant-numeric: tabular-nums; }
+    .primary-row td { background: #f1f8f7; }
+    .supplemental-row td { background: #fffaf0; }
+
+    .timeline { position: relative; margin: 22px 0 4px; padding-left: 30px; }
+    .timeline::before { content: ""; position: absolute; left: 8px; top: 8px; bottom: 8px; width: 2px; background: #a8c5c3; }
+    .event { position: relative; padding: 0 0 22px 12px; }
+    .event::before { content: ""; position: absolute; left: -26px; top: 7px; width: 10px; height: 10px; background: var(--teal); border: 2px solid var(--paper); border-radius: 50%; }
+    .event.alert::before { background: var(--red); }
+    .event strong { display: block; font-size: 14px; }
+    .event p { margin: 4px 0 0; color: var(--muted); font-size: 13px; }
+
+    .command {
+      margin: 16px 0;
+      padding: 14px 15px;
+      overflow-x: auto;
+      color: #d8efec;
+      background: #1d3034;
+      border: 1px solid #183033;
+      border-radius: 4px;
+      font-size: 12px;
+      line-height: 1.6;
+      white-space: pre-wrap;
+    }
+    .path-list { margin: 0; }
+    .path-list dt { margin-top: 12px; color: #355158; font-weight: 700; }
+    .path-list dd { margin: 2px 0 0; color: var(--muted); font-family: var(--mono); font-size: 12px; overflow-wrap: anywhere; }
+    ul, ol { padding-left: 22px; }
+    li { margin-bottom: 7px; }
+    .checklist { list-style: none; padding-left: 0; }
+    .checklist li { position: relative; padding-left: 25px; }
+    .checklist li::before { content: "✓"; position: absolute; left: 0; color: var(--teal); font-weight: 800; }
+    .checklist li.caution::before { content: "!"; color: var(--amber); }
+
+    .footer {
+      padding: 26px 0 38px;
+      color: #63767b;
+      background: #e6edeb;
+      border-top: 1px solid #cbd8d5;
+      font-size: 13px;
+    }
+    .footer-inner { width: min(1220px, calc(100% - 48px)); margin: 0 auto; }
+
+    @media (max-width: 980px) {
+      .layout { display: block; width: min(100% - 32px, 900px); }
+      .toc { position: static; display: flex; flex-wrap: wrap; gap: 0 14px; margin: 20px 0 4px; padding: 12px 0; }
+      .toc strong { width: 100%; }
+      .toc a { padding: 2px 0; }
+      main { padding-top: 22px; }
+      .metrics { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+      .pipeline { grid-template-columns: repeat(4, minmax(0, 1fr)); }
+      .arrow { display: none; }
+    }
+    @media (max-width: 620px) {
+      .masthead-inner, .footer-inner { width: min(100% - 28px, 900px); }
+      .masthead-inner { padding: 38px 0 32px; }
+      body { font-size: 15px; }
+      .subhead { font-size: 16px; }
+      .metrics, .grid-2, .grid-3, .image-pair { grid-template-columns: 1fr; }
+      .pipeline { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+      .metric { min-height: 108px; }
+      section { padding: 30px 0; }
+    }
+
+    @media print {
+      body { background: #fff; }
+      .masthead { background: #fff; color: #000; border-bottom-color: #000; }
+      h1, .subhead { color: #000; }
+      .toc { display: none; }
+      .layout { display: block; width: 100%; }
+      main { padding: 20px 0; }
+      section, .panel, .metric, .table-wrap, .evidence-figure { break-inside: avoid; }
+      a { color: #000; text-decoration: none; }
+    }
+  </style>
+</head>
+<body>
+  <header class="masthead">
+    <div class="masthead-inner">
+      <p class="eyebrow">DiffusionSnake-12-30 / Bounded Downstream Run Audit / 2026-07-21</p>
+      <h1>冻结 MoonViT 特征的伪3D<br>5,000-step 下游训练审计</h1>
+      <p class="subhead">面向矢状位三切片伪3D轮廓分割的执行记录：离线冻结特征缓存、平衡采样、5,000次有放回抽样的训练健康、严格恢复，以及 GT-box / predicted-box 全量 validation 分割评估。</p>
+      <div class="badges" aria-label="报告状态">
+        <span class="badge">run_id: 375ee8e262e94a46b378b907aa5b5df9</span>
+        <span class="badge">run ended; no active process</span>
+        <span class="badge">frozen MoonViT cache; no encoder update</span>
+        <span class="badge amber">1 recovered transient stall</span>
+      </div>
+    </div>
+  </header>
+
+  <div class="layout">
+    <nav class="toc" aria-label="目录">
+      <strong>Report sections</strong>
+      <a href="#executive">00 · 执行结论</a>
+      <a href="#scope">01 · 任务边界</a>
+      <a href="#architecture">02 · 最终方案</a>
+      <a href="#cache">03 · 全量特征缓存</a>
+      <a href="#sampling">04 · 数据与平衡采样</a>
+      <a href="#training">05 · 训练过程证据</a>
+      <a href="#health">06 · 健康监控与告警</a>
+      <a href="#checkpoint">07 · Checkpoint 与恢复</a>
+      <a href="#validation">08 · 全量分割验证</a>
+      <a href="#artifacts">09 · 产物与复现</a>
+      <a href="#next">10 · 结论与下一步</a>
+    </nav>
+
+    <main>
+      <section id="executive">
+        <p class="section-label">00 / Executive conclusion</p>
+        <h2>有界下游实验已结束；当前 GT-box 分割效果仍弱</h2>
+        <p class="lead">本次完成的是使用冻结 MoonViT <code>layer_18</code> 离线 cache 的三切片伪3D下游监督训练，而不是 MoonViT 预训练。该 run 使用单张 GPU、batch size 1 和5,000次有放回 sampler draw；相对于14,384个名义 epoch positions 为34.76%，不能解释为唯一样本覆盖，更不能称为大规模训练。缓存、训练、监控、checkpoint、严格恢复和双口径验证均已落盘；当前没有活动训练进程。</p>
+
+        <div class="metrics" aria-label="关键结果">
+          <article class="metric">
+            <span class="value">20,631</span>
+            <span class="caption">MoonViT cache 文件。training 14,384 + validation 6,247，预检 errors=0、pending=0。</span>
+          </article>
+          <article class="metric blue">
+            <span class="value">5,000</span>
+            <span class="caption">单卡、batch 1 的连续 optimizer step；有放回抽样，不代表5,000个唯一样本。日志从1到5000无缺号，数值 finite，进程 returncode=0。</span>
+          </article>
+          <article class="metric">
+            <span class="value">0.130474</span>
+            <span class="caption">GT-box 条件下的前景切片 mean Dice。GT-box只移除了 proposal / box-localization 误差，不能单独测量 Snake/Flow。</span>
+          </article>
+          <article class="metric amber">
+            <span class="value">0.0739995</span>
+            <span class="caption">GT-box 前景切片 mean IoU。完整 validation 共6,247张、前景切片2,902张。</span>
+          </article>
+        </div>
+
+        <div class="callout critical">
+          <p><strong>解释边界：</strong>MoonViT仅作为离线冻结 <code>layer_18</code> cache 使用，训练期间没有更新 MoonViT 参数；AdamW优化的是所有 <code>requires_grad=True</code> 的下游网络参数和 adapter。当前没有同预算、同随机种子、同采样序列的 <code>center_repeat</code> 2D对照，因此不能声称 MoonViT 或三切片伪3D优于2D baseline；Dice=0.130474 也不能称为收敛质量。</p>
+        </div>
+      </section>
+
+      <section id="scope">
+        <p class="section-label">01 / Work scope</p>
+        <h2>这次实际完成了什么</h2>
+        <div class="grid-3">
+          <article class="panel teal">
+            <h4>有界下游训练</h4>
+            <p>在 training split 上运行 <code>SagittalPseudo3DTrain</code>：GPU 0、batch size 1、AdamW、5,000 step 上限和每500 step checkpoint。采样器有放回；5,000 draws 仅为14,384个名义 epoch positions 的34.76%，不能等同于数据集覆盖。</p>
+          </article>
+          <article class="panel teal">
+            <h4>可观测性</h4>
+            <p>训练前检查 cache；训练中记录 loss、gradient、MoonViT adapter、CUDA、GPU温度、磁盘与 checkpoint；训练后输出结构化健康总结。</p>
+          </article>
+          <article class="panel teal">
+            <h4>分割评估</h4>
+            <p>完成 validation 全量6,247张的 GT-box 与 predicted-box 两套结果。本文先以 GT-box 作为分割能力的主解释口径。</p>
+          </article>
+        </div>
+        <div class="callout blue">
+          <p><strong>配套材料：</strong>方法、坐标与伪3D输入语义请参见 <a href="SAGITTAL_PSEUDO3D_METHOD_REPORT_20260719.html">矢状位伪3D轮廓分割方法报告</a>。本文重点是本次有界下游训练、审计证据和结果解释。</p>
+        </div>
+      </section>
+
+      <section id="architecture">
+        <p class="section-label">02 / Final architecture</p>
+        <h2>最终执行方案：三切片输入 + 冻结 MoonViT 特征注入</h2>
+        <p>对同一病例的中心矢状位切片 <code>x</code>，输入三张真实灰度图 <code>[x-1, x, x+1]</code>；只使用中心层的 uint16 标签 mask 监督。模型不把它视为原生体素3D，而是在2D网络中用相邻层提供局部跨层上下文。</p>
+
+        <div class="pipeline" aria-label="模型流程图">
+          <div class="node"><strong>Three slices</strong><span><code>[x-1,x,x+1]</code><br>同病例相邻矢状位</span></div>
+          <div class="arrow">→</div>
+          <div class="node"><strong>YOLOv8s P2/P3</strong><span>25类检测与2D feature<br>首层对称初始化</span></div>
+          <div class="arrow">→</div>
+          <div class="node"><strong>Frozen MoonViT</strong><span><code>layer_18</code><br>每切片1152通道</span></div>
+          <div class="arrow">→</div>
+          <div class="node"><strong>2304 fusion</strong><span><code>concat(center,<br>mean(prev,next))</code></span></div>
+          <div class="arrow">→</div>
+          <div class="node"><strong>Snake + Flow</strong><span>zero-init residual adapter<br>标准 V4.1 head</span></div>
+        </div>
+
+        <div class="grid-2">
+          <article class="panel">
+            <h4>保留的关键设计</h4>
+            <ul>
+              <li>YOLOv8s P2/P3，25类，预训练 <code>yolov8s.pt</code>。</li>
+              <li>MoonViT-SO-400M 离线 cache，<code>layer_18</code>，输入448、patch14、每层1152通道。</li>
+              <li><code>concat(F_center, mean(F_prev, F_next))</code>，得到2304通道的定位特征。</li>
+              <li>zero-init residual adapter 注入，不替换 YOLO detector feature。</li>
+              <li>rich-state sampling 保留，用于训练时轮廓状态/难度分布。</li>
+            </ul>
+          </article>
+          <article class="panel amber">
+            <h4>明确关闭的复杂分支</h4>
+            <ul>
+              <li><code>v4_1_use_detail_context=false</code></li>
+              <li><code>v4_1_final_head_type=standard</code></li>
+              <li><code>v4_10_use_dit_ffn_moe=false</code></li>
+              <li>不启用 final-head MoE、不启用 DiT FFN-MoE。</li>
+              <li>当前目标是验证 MoonViT伪3D主路径，不把 detail context / MoE 混入结论。</li>
+            </ul>
+          </article>
+        </div>
+
+        <div class="image-pair" aria-label="真实伪3D输入与中心监督样例">
+          <figure>
+            <img src="sagittal_pseudo3d_assets/sub-verse041_x0048_center.png" alt="真实中心矢状位切片 sub-verse041 x48">
+            <figcaption>真实中心切片：<code>sub-verse041 / x=48</code>。三切片输入中，中心层是唯一直接监督层。</figcaption>
+          </figure>
+          <figure>
+            <img src="sagittal_pseudo3d_assets/sub-verse041_x0048_overlay.png" alt="中心矢状位切片与标签叠加">
+            <figcaption>中心层与标签叠加：仅展示监督的空间语义；伪3D并不把三个切片的标签拼成3D体素监督。</figcaption>
+          </figure>
+        </div>
+      </section>
+
+      <section id="cache">
+        <p class="section-label">03 / Feature cache</p>
+        <h2>全量 MoonViT feature cache 已提取并逐 split 核验</h2>
+        <p>MoonViT 本体在训练中保持冻结。为了避免每个 step 重复运行大模型，先离线提取每张切片的 <code>layer_18</code> 特征，再由 dataset 根据相邻切片构建 center-plus-neighbor-mean 融合特征。</p>
+        <div class="table-wrap">
+          <table>
+            <thead><tr><th>split</th><th class="num">切片 / NPZ</th><th class="num">磁盘占用</th><th>校验状态</th><th>来源日志</th></tr></thead>
+            <tbody>
+              <tr><td>training</td><td class="num">14,384</td><td class="num">22.00 GiB</td><td><code>pending=0</code></td><td><code>validate_train.log</code></td></tr>
+              <tr><td>validation</td><td class="num">6,247</td><td class="num">9.91 GiB</td><td><code>pending=0</code></td><td><code>validate_validation.log</code></td></tr>
+              <tr class="primary-row"><td><strong>total</strong></td><td class="num"><strong>20,631</strong></td><td class="num"><strong>31.91 GiB</strong></td><td><strong>monitor precheck: expected=actual=20,631, errors=[]</strong></td><td><code>monitor.jsonl</code></td></tr>
+            </tbody>
+          </table>
+        </div>
+        <div class="grid-2">
+          <article class="panel teal">
+            <h4>缓存契约</h4>
+            <p><code>input=448</code>，<code>layer_18</code>，hidden=1152，<code>moonvit_pretrained_rgb_mean_std</code>，来自项目指定的 <code>checkpoint-3000</code> preprocessor 配置。</p>
+          </article>
+          <article class="panel">
+            <h4>为何重要</h4>
+            <p>该有界 run 在启动前就验证全量文件数。若 cache 缺失，训练不会进入中途才失败；本 run 的 cache precheck 通过且 errors 为空。</p>
+          </article>
+        </div>
+      </section>
+
+      <section id="sampling">
+        <p class="section-label">04 / Dataset and sampling</p>
+        <h2>平衡采样解决空层占多数的问题，但不应误读运行时轮廓比例</h2>
+        <p>原始 training manifest 有14,384张中心切片，其中5,838张含前景、8,546张为空层，原始前景比例约40.59%。如果不干预，batch size 1 的训练将较频繁遇到空层，轮廓与扩散监督会偏稀疏。</p>
+        <div class="table-wrap">
+          <table>
+            <thead><tr><th>统计层级</th><th class="num">前景</th><th class="num">空层 / 无轮廓</th><th class="num">比例</th><th>解释</th></tr></thead>
+            <tbody>
+              <tr><td>原始 training manifest</td><td class="num">5,838</td><td class="num">8,546</td><td class="num">40.59%</td><td>数据自然分布。</td></tr>
+              <tr class="primary-row"><td>epoch 0 sampler positions</td><td class="num">7,192</td><td class="num">7,192</td><td class="num">50.00%</td><td><code>ForegroundBalancedSampler</code> 按标签池有放回采样。</td></tr>
+              <tr><td>前5,000个确定性重建位置</td><td class="num">2,532</td><td class="num">2,468</td><td class="num">50.64%</td><td>与0.5目标一致的有限前缀波动。</td></tr>
+              <tr class="supplemental-row"><td>训练日志中的 contour supervision</td><td class="num">2,170</td><td class="num">2,830</td><td class="num">43.40%</td><td>变换后实际出现轮廓的 step；<strong>不是</strong> sampler 标签比例。</td></tr>
+            </tbody>
+          </table>
+        </div>
+        <div class="callout warn">
+          <p><strong>解释边界：</strong>采样器平衡的是 dataset 的 foreground flag，而训练日志里的 <code>contour_count</code> 是经过 transform 和运行时监督映射后的实际状态。因此 50% 与43.4%不是矛盾数据，不能互相替代。</p>
+        </div>
+      </section>
+
+      <section id="training">
+        <p class="section-label">05 / Bounded downstream training evidence</p>
+        <h2>5,000-step 下游训练正常结束，但不以 loss 代替分割性能</h2>
+        <p>配置使用 AdamW，初始学习率 <code>5e-6</code>，warmup 100 step，gradient clip norm=1.0，<code>max_steps=5000</code>。MoonViT 不在在线训练图中；训练读取冻结的 <code>layer_18</code> cache，并更新下游 <code>requires_grad=True</code> 参数与 adapter。日志包含5,000条记录，step 从1连续到5000；loss、gradient 和 CUDA 字段均通过 finite 检查。</p>
+
+        <figure class="evidence-figure">
+          <img src="moonvit_pseudo3d_formal_training_assets/training_health_evidence.png" alt="5,000-step 下游训练的损失窗口、采样、有条件验证对比和健康时间线">
+          <figcaption>由 <code>logs.jsonl</code>、<code>monitor.jsonl</code> 和两个 validation summary 直接生成。图中明确标注：这是冻结 MoonViT cache 的下游监督训练，不是 MoonViT 预训练。</figcaption>
+        </figure>
+
+        <div class="table-wrap">
+          <table>
+            <thead><tr><th>训练信号</th><th class="num">实测值</th><th>含义</th></tr></thead>
+            <tbody>
+              <tr><td>overall mean total loss</td><td class="num">9.289567</td><td>5,000步全程平均。</td></tr>
+              <tr><td>first 500 / last 500 mean loss</td><td class="num">10.715324 → 8.480024</td><td>窗口均值下降20.86%；说明训练目标仍在变化，但不等同于验证精度提升。</td></tr>
+              <tr><td>mean detection / diffusion loss</td><td class="num">9.035771 / 0.253796</td><td>总损失主要由检测部分构成；两者均为 finite。</td></tr>
+              <tr><td>pre-clip gradient L2</td><td class="num">median 8.337961; max 1446.818237</td><td>5,000步均启用 clipping，防止极端梯度直接破坏参数。</td></tr>
+              <tr><td>MoonViT adapter</td><td class="num">5 params; 2,169 nonzero-grad steps</td><td>zero-init adapter 参与反传；weight absmax 1.000000 → 1.003073。</td></tr>
+              <tr><td>residual / final adapter peak</td><td class="num">3.358522 / 0.004163</td><td>记录特征注入的运行时幅度，供后续异常诊断。</td></tr>
+            </tbody>
+          </table>
+        </div>
+      </section>
+
+      <section id="health">
+        <p class="section-label">06 / Health monitoring</p>
+        <h2>训练无持续性故障，但不是“零告警”</h2>
+        <p>监控器记录了75条事件：1条 cache precheck、1条 train start、71条 heartbeat、1条 health alert 和1条 train exited。训练最终 returncode 为0，GPU最高温度56°C，监控采样中的最高显存占用4,656 MiB，最终磁盘余量227.77 GiB。</p>
+        <div class="grid-2">
+          <article class="panel teal">
+            <h4>健康通过的条件</h4>
+            <ul class="checklist">
+              <li>5000条训练日志连续；loss、gradient、CUDA数值均 finite。</li>
+              <li>未记录持续性 NaN、OOM、cache 缺失或进程失败。</li>
+              <li>cache precheck 通过：<code>expected_count=actual_count=20631</code>。</li>
+              <li>训练结束后可读取最终 checkpoint 并完成严格恢复。</li>
+            </ul>
+          </article>
+          <article class="panel red">
+            <h4>必须保留的告警事实</h4>
+            <ul class="checklist">
+              <li class="caution">step 4174 后暂停约10.5分钟。</li>
+              <li class="caution">最大 alert age=632.14秒，阈值300秒。</li>
+              <li class="caution">共1个 <code>health_alert</code> event、2条带 alert heartbeat、3个 alert instances。</li>
+              <li class="caution">随后在step 4180观察到恢复，run 正常完成到5000。</li>
+            </ul>
+          </article>
+        </div>
+        <div class="timeline" aria-label="训练监控时间线">
+          <article class="event"><strong>启动前：cache precheck 通过</strong><p>training 与 validation 的20,631个NPZ文件数量与manifest期望数一致，errors=[]。</p></article>
+          <article class="event"><strong>step 1–4174：持续训练并写入周期 checkpoint</strong><p>loss、梯度、adapter与资源指标持续记录；无非有限数值。</p></article>
+          <article class="event alert"><strong>step 4174 后：监控触发一次 stall</strong><p>heartbeat 发现 step 未前进超过阈值。该事件被保留在健康总结中，而未被掩盖。</p></article>
+          <article class="event"><strong>step 4180：训练自行恢复</strong><p>monitor 再次观察到 step 前进，后续未持续报告 stall。</p></article>
+          <article class="event"><strong>step 5000：正常结束</strong><p>最终 heartbeat 读取到 checkpoint step=5000，train_exited returncode=0。</p></article>
+        </div>
+      </section>
+
+      <section id="checkpoint">
+        <p class="section-label">07 / Checkpoint and strict resume</p>
+        <h2>定期 checkpoint 已验证可恢复，终点恢复不会重复优化</h2>
+        <div class="table-wrap">
+          <table>
+            <thead><tr><th>checkpoint</th><th class="num">step</th><th>关键完整性</th></tr></thead>
+            <tbody>
+              <tr><td><code>step_4000.pt</code></td><td class="num">4,000</td><td>format v2；run_id / cfg_hash一致；含 optimizer、scheduler、RNG、5个 adapter key。</td></tr>
+              <tr><td><code>step_4500.pt</code></td><td class="num">4,500</td><td>同一有界下游 run 的可恢复周期点。</td></tr>
+              <tr><td><code>step_5000.pt</code></td><td class="num">5,000</td><td>终点周期 checkpoint。</td></tr>
+              <tr class="primary-row"><td><code>validated_latest.pt</code></td><td class="num">5,000</td><td>CPU 结构与有限性验证后生成；作为本报告和评估使用的终点 checkpoint。</td></tr>
+            </tbody>
+          </table>
+        </div>
+        <div class="callout">
+          <p><strong>严格恢复证据：</strong>以 <code>validated_latest.pt</code> 启动恢复验证，模型严格加载的 missing keys=0、unexpected keys=0，恢复元数据为 <code>epoch=0, step=5000, step_in_epoch=5000</code>。训练入口明确输出“Checkpoint already reached stop_step=5000; no optimization steps are required.”，恢复运行未写入额外训练日志行。</p>
+        </div>
+      </section>
+
+      <section id="validation">
+        <p class="section-label">08 / Full validation</p>
+        <h2>先看 GT-box：它是带条件的系统级分割测量</h2>
+        <p>validation 全量包含6,247张切片，其中2,902张具有真实前景。GT-box 评估从真实 mask 派生每张切片的输入框，移除了 proposal 与 box-localization 误差；但 YOLO P2/P3 特征路径、adapter、Snake/Flow、训练预算和监督仍参与结果。因此它测量的是“给定正确框时的整个下游系统”，不能单独回答某一模块的因果贡献。</p>
+        <div class="table-wrap">
+          <table>
+            <thead><tr><th>评估口径</th><th class="num">foreground Dice</th><th class="num">foreground IoU</th><th class="num">class mean Dice</th><th class="num">class mean IoU</th><th>预测覆盖</th></tr></thead>
+            <tbody>
+              <tr class="primary-row"><td><strong>GT-box / 分割主结果</strong></td><td class="num"><strong>0.130474</strong></td><td class="num"><strong>0.0739995</strong></td><td class="num">0.0496532</td><td class="num">0.0261889</td><td>前景2,902张中2,624张有轮廓；总26,417个轮廓。</td></tr>
+              <tr class="supplemental-row"><td>Predicted-box / 端到端补充</td><td class="num">0.073996</td><td class="num">0.0419194</td><td class="num">0.00134317</td><td class="num">0.000687465</td><td>前景2,902张中1,344张有预测；总7,756个box。</td></tr>
+            </tbody>
+          </table>
+        </div>
+        <div class="grid-2">
+          <article class="panel teal">
+            <h4>为什么 all-slice 不作主指标</h4>
+            <p>GT-box all-slice Dice=0.596068、IoU=0.569833，但其中包含3,345张空层。空预测与空标注的一致会抬高均值，因此不应把这些数字当作前景分割能力。</p>
+          </article>
+          <article class="panel amber">
+            <h4>可作与不可作的归因</h4>
+            <p>GT-box 下 Dice=0.130474 表明给定正确框后的整体下游结果仍弱，也说明不能只把低分解释为找框失败；但该口径未冻结或移除 YOLO P2/P3 特征、adapter、Snake/Flow、预算和监督，不能把低分唯一归因给 Snake/Flow。</p>
+          </article>
+        </div>
+        <div class="callout critical">
+          <p><strong>结果解释：</strong>该实验可复现，但只是一个有界的单卡下游训练结果；质量上，分割重叠仍弱。GT-box分数未证明 MoonViT改善，也没有证明三切片邻层上下文优于只复制中心层。下一步需要配对的2D baseline 与模块消融，而不是根据单一 run 作性能或模块因果结论。</p>
+        </div>
+      </section>
+
+      <section id="artifacts">
+        <p class="section-label">09 / Artifacts and reproducibility</p>
+        <h2>关键产物、命令和验证记录</h2>
+        <div class="grid-2">
+          <article class="panel">
+            <h4>审计产物</h4>
+            <dl class="path-list">
+              <dt>有界下游训练健康总结</dt>
+              <dd>data/outputs/sagittal_2d_pseudo3d_moonvit_train/health_summary.json</dd>
+              <dt>有界下游训练日志</dt>
+              <dd>data/outputs/sagittal_2d_pseudo3d_moonvit_train/logs.jsonl</dd>
+              <dt>监控事件日志</dt>
+              <dd>data/outputs/sagittal_2d_pseudo3d_moonvit_train/monitor.jsonl</dd>
+              <dt>最终 checkpoint</dt>
+              <dd>data/outputs/sagittal_2d_pseudo3d_moonvit_train/checkpoints/validated_latest.pt</dd>
+              <dt>GT-box validation</dt>
+              <dd>data/outputs/sagittal_2d_pseudo3d_moonvit_eval_gt_step5000/summary.json</dd>
+              <dt>Predicted-box validation</dt>
+              <dd>data/outputs/sagittal_2d_pseudo3d_moonvit_eval_predicted_step5000/summary.json</dd>
+            </dl>
+          </article>
+          <article class="panel">
+            <h4>已执行的验证</h4>
+            <ul class="checklist">
+              <li>cache precheck：20,631 expected / actual，errors=[]。</li>
+              <li>训练日志：5,000行，step 1..5000连续，所有数值 finite。</li>
+              <li>GT 与 predicted 的 <code>slices.json</code> 均为6,247条唯一 <code>(case_id,slice_idx)</code>。</li>
+              <li>健康总结、两份 summary 和两份 slices 文件均通过 NaN / Infinity 递归检查。</li>
+              <li><code>py_compile</code> 覆盖训练、dataset、sampler、evaluator 和 monitor。</li>
+              <li>12个 <code>unittest</code> 通过：foreground sampling scope 与 training health。</li>
+            </ul>
+          </article>
+        </div>
+
+        <h3>有界下游训练命令</h3>
+        <pre class="command">WANDB_MODE=disabled ONE_SAMPLE_VIZ_INTERVAL=0 \
+PYTORCH_CUDA_ALLOC_CONF=max_split_size_mb:128 \
+/home/medteam/miniconda3/envs/snake1/bin/python -u \
+scripts/monitor_sagittal_moonvit_train.py \
+  --cfg-file configs/sagittal_2d_pseudo3d_moonvit_train.yaml \
+  --gpu 0 --interval 30</pre>
+
+        <h3>GT-box 全量分割评估命令</h3>
+        <pre class="command">CUDA_VISIBLE_DEVICES=0 \
+CFG_FILE=configs/sagittal_2d_pseudo3d_moonvit_train.yaml \
+/home/medteam/miniconda3/envs/snake1/bin/python tools/eval_sagittal_2d_fixed.py \
+  --cfg_file configs/sagittal_2d_pseudo3d_moonvit_train.yaml \
+  --ckpt data/outputs/sagittal_2d_pseudo3d_moonvit_train/checkpoints/validated_latest.pt \
+  --split val --box-mode gt --device cuda \
+  --result-dir data/outputs/sagittal_2d_pseudo3d_moonvit_eval_gt_step5000</pre>
+      </section>
+
+      <section id="next">
+        <p class="section-label">10 / Decision and next experiment</p>
+        <h2>结论：保留这条工程链路，下一步做严格 paired A/B</h2>
+        <div class="grid-2">
+          <article class="panel teal">
+            <h4>本次已验证</h4>
+            <ul>
+              <li>全量 MoonViT cache 与三切片伪3D数据契约可用，MoonViT本体保持冻结。</li>
+              <li>单卡 batch-1、有放回采样的5,000-step下游训练、健康监控和 checkpoint 恢复可用。</li>
+              <li>GT-box / predicted-box 双口径全量 validation 可以稳定落盘。</li>
+              <li>GT-box 可缩小 proposal/box-localization 的影响范围，但不产生模块级因果定位。</li>
+            </ul>
+          </article>
+          <article class="panel amber">
+            <h4>下一实验必须控制的变量</h4>
+            <ol>
+              <li>只改变 <code>pseudo3d_input_mode</code>：<code>neighbors</code> 对 <code>center_repeat</code>。</li>
+              <li>固定同一病例 split、seed、平衡采样序列、优化器、学习率和5,000 step预算。</li>
+              <li>同一步数 checkpoint 上先比较 GT-box foreground Dice / IoU，再单列 predicted-box 端到端结果。</li>
+              <li>至少多 seed，报告 paired difference，而不是比较两组独立最优 checkpoint。</li>
+            </ol>
+          </article>
+        </div>
+        <div class="callout">
+          <p><strong>推荐判断门槛：</strong>在相同预算、seed 与 sampling sequence 下，以 GT-box foreground-slice Dice / IoU 作为三切片对2D的主要比较，并配合 predicted-box 端到端结果与必要模块消融。只有出现多 seed 的稳定 paired 增益后，才考虑5切片或真正体素3D；不能仅因 loss 下降、all-slice 分数较高或单个有界 run 而作提升判断。</p>
+        </div>
+      </section>
+    </main>
+  </div>
+
+  <footer class="footer">
+    <div class="footer-inner">离线工作报告 · 数据均来自本地有界下游训练与 validation 产物 · 无外部 CDN、字体或脚本依赖 · companion: <a href="SAGITTAL_PSEUDO3D_METHOD_REPORT_20260719.html">方法报告</a></div>
+  </footer>
+</body>
+</html>

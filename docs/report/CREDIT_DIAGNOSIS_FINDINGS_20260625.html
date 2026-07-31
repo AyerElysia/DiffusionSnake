@@ -1,0 +1,483 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<title>RL 反馈信号问题：诊断报告 — Credit-Assignment Findings</title>
+<style>
+:root {
+  --bg: #0e1116; --panel: #161b22; --panel2: #1c2230; --text: #e6edf3;
+  --muted: #8b949e; --accent: #58a6ff; --red: #f87171; --green: #34d399;
+  --orange: #fb923c; --purple: #a78bfa; --yellow: #fbbf24; --border: #2d333b;
+}
+* { box-sizing: border-box; }
+body { background: var(--bg); color: var(--text);
+  font-family: -apple-system, "Segoe UI", "PingFang SC", "Microsoft YaHei",
+    "Helvetica Neue", Arial, sans-serif; margin: 0; line-height: 1.65;
+  font-size: 15px; }
+.wrap { max-width: 1180px; margin: 0 auto; padding: 28px 22px 80px; }
+header { border-bottom: 1px solid var(--border); padding-bottom: 18px; margin-bottom: 26px; }
+h1 { margin: 0 0 6px; font-size: 26px; font-weight: 700; letter-spacing: -0.01em; }
+h2 { margin: 36px 0 14px; font-size: 21px; padding-bottom: 8px;
+  border-bottom: 1px solid var(--border); }
+h3 { margin: 24px 0 10px; font-size: 17px; color: #c9d1d9; }
+h4 { margin: 18px 0 8px; font-size: 15px; color: var(--accent); }
+.subtitle { color: var(--muted); font-size: 14px; }
+.meta { color: var(--muted); font-size: 13px; margin-top: 6px; }
+code { background: var(--panel2); padding: 2px 6px; border-radius: 4px;
+  font-family: "SFMono-Regular", Consolas, "Liberation Mono", monospace;
+  font-size: 13px; color: #f0b072; }
+pre { background: var(--panel2); padding: 14px 16px; border-radius: 8px;
+  border: 1px solid var(--border); overflow:auto; font-size: 13px;
+  font-family: "SFMono-Regular", Consolas, monospace; }
+.hl { background: #3b2e40; color: #d8b4fe; padding: 1px 4px; border-radius: 3px; }
+.hl-red { color: var(--red); font-weight: 600; }
+.hl-green { color: var(--green); font-weight: 600; }
+.hl-yellow { color: var(--yellow); font-weight: 600; }
+.panel { background: var(--panel); border: 1px solid var(--border);
+  border-radius: 10px; padding: 18px 20px; margin: 14px 0; }
+.tldr { background: linear-gradient(135deg, #1c2230 0%, #25162a 100%);
+  border-left: 4px solid var(--accent); }
+.callout { border-left: 4px solid var(--orange); background: #20180f;
+  padding: 12px 16px; border-radius: 6px; margin: 14px 0; }
+.danger { border-left: 4px solid var(--red); background: #241519;
+  padding: 12px 16px; border-radius: 6px; margin: 14px 0; }
+table { border-collapse: collapse; width: 100%; margin: 12px 0;
+  font-size: 14px; }
+th, td { padding: 9px 12px; text-align: left; border-bottom: 1px solid var(--border); }
+th { background: var(--panel2); color: var(--accent); font-weight: 600; }
+td.num { font-family: "SFMono-Regular", Consolas, monospace; text-align:right; }
+tr:hover td { background: rgba(88,166,255,0.06); }
+.big-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(240px, 1fr));
+  gap: 14px; margin: 16px 0; }
+.kpi { background: var(--panel); border: 1px solid var(--border);
+  border-radius: 10px; padding: 16px 18px; }
+.kpi .v { font-size: 28px; font-weight: 700; color: var(--accent); font-family: "SFMono-Regular", monospace; }
+.kpi .v.bad { color: var(--red); }
+.kpi .v.warn { color: var(--orange); }
+.kpi .v.good { color: var(--green); }
+.kpi .lbl { color: var(--muted); font-size: 13px; margin-top: 4px; }
+.kpi .sub { color: var(--muted); font-size: 12px; margin-top: 2px; }
+svg { display:block; margin: 16px auto; max-width: 100%; height: auto; }
+.chart-wrap { background: var(--panel); border:1px solid var(--border);
+  border-radius: 10px; padding: 14px 16px 8px; margin: 16px 0; }
+.chart-title { color: var(--accent); font-size: 14px; font-weight: 600;
+  margin-bottom: 8px; }
+.legend { font-size: 12px; color: var(--muted); text-align: center;
+  margin-top: 6px; }
+.chip { display: inline-block; padding: 2px 8px; border-radius: 12px;
+  font-size: 12px; margin-right: 4px; }
+.chip.bad { background: #3a1c1c; color: #f87171; }
+.chip.ok   { background: #16241c; color: #34d399; }
+.chip.warn { background: #2e2110; color: #fbbf24; }
+.tag { display:inline-block; padding: 1px 7px; border-radius: 4px;
+  font-size: 12px; background: var(--panel2); color: var(--muted);
+  border: 1px solid var(--border); }
+.foot { margin-top: 50px; padding-top: 18px; border-top: 1px solid var(--border);
+  color: var(--muted); font-size: 13px; }
+ol, ul { padding-left: 22px; }
+li { margin: 4px 0; }
+</style>
+</head>
+<body>
+<div class="wrap">
+
+<header>
+<h1>RL 反馈信号问题：诊断报告（首个发现阶段）</h1>
+<div class="subtitle">第一层 Reward 计算 &nbsp;✕&nbsp; 第二层 轨迹问责 —— 两层耦合的真根定位</div>
+<div class="meta">日期 2026-06-25 &nbsp;·&nbsp; 项目 DiffusionSnake / V5 geom-action 后训练 &nbsp;·&nbsp; 实验基线 <code>1232_final_v5_geom8_baseline_bs6_gpu2</code>（峰 0.8604）<br>
+作者 Claude（编排+实验）&nbsp;·&nbsp; 范围：20 batch × K=8 × 5 step = 4000 条 step-wise 评估，纯离线诊断，不污染训练</div>
+</header>
+
+<div class="panel tldr">
+<h2 style="margin-top:0;border:0;padding:0;font-size:18px;">🎯 TL;DR — 一句话结论</h2>
+<p>两个层面的反馈信号问题<b>都成立</b>，<b>且是耦合的</b>。不是 reward 公式本身不行，也不是单凭动作空间不够——而是：</p>
+<p style="margin:10px 0 4px;">
+<span class="hl-red">reward 在终端算一次 → advantage 平均给 5 步 → 早期 25% 的更新方向反了 → explorer 学不动</span>
+</p>
+<p style="margin:0;color:var(--muted);font-size:13px;">把 <code>adv_ri</code> 一个标量**复制**给 5 个共享 step（<code>grpo_train_v5_geom_action.py:2078-2079</code>），就是真根机制。我把它单独抽出来跑了 4000 条 step-wise 截断评分，给了下面的硬证据。</p>
+</div>
+
+<div class="big-grid">
+  <div class="kpi"><div class="v bad">−0.0204</div><div class="lbl">terminal quality 均值</div>
+    <div class="sub">K=8 sampled vs det，平均负 2%</div></div>
+  <div class="kpi"><div class="v bad">31.25%</div><div class="lbl">group 被完全 gate 掉</div>
+    <div class="sub">31% 的 contour K=8 里一条都不超 baseline</div></div>
+  <div class="kpi"><div class="v bad">25%</div><div class="lbl">step-1 advantage 方向错</div>
+    <div class="sub">sign_agree(step1, terminal) 仅 75%</div></div>
+  <div class="kpi"><div class="v warn">0.34</div><div class="lbl">step-1 ↔ terminal 相关</div>
+    <div class="sub">spearman ≈ 0.34，近独立</div></div>
+  <div class="kpi"><div class="v bad">5%</div><div class="lbl">information ratio @ step1</div>
+    <div class="sub">早期 step dispersion 被 terminal std 吃掉</div></div>
+  <div class="kpi"><div class="v">0.69</div><div class="lbl">gate_active_frac 均值</div>
+    <div class="sub">即过 gate 的 contour 比例</div></div>
+</div>
+
+<h2>1. 背景与问题定义</h2>
+
+<p>用户的提问把 RL 反馈信号问题拆成两个层面，这个拆分经过这次实验验证是对的：</p>
+
+<table>
+<tr><th>层面</th><th>问题</th><th>粗略对应</th></tr>
+<tr><td><b>第一层 · Reward 计算</b></td>
+    <td>reward 函数本身写的是不是想优化的东西？baseline 是不是过强？K=8 能采到正收益吗？</td>
+    <td><code>_quality_score</code> + <code>_burr_penalty</code> + <code>gate</code> + <code>baseline_score</code></td></tr>
+<tr><td><b>第二层 · 轨迹问责</b></td>
+    <td>5 段 outer refinement 的动作里，到底哪一步有贡献？应该反馈给哪一个？</td>
+    <td>terminal-only reward → <code>adv_ri</code> 复制给 5 step → PPO loss</td></tr>
+</table>
+
+<p>之前 worklog 里 V5 学习型探索的随机对照跑 1000 步只到 0.861 就平台化，<code>explorer net.4 absmax ≈ 0</code>，<code>reward</code> 字段全程负。这次实验是为了在<b>不动训练</b>的情况下拿到因果证据。</p>
+
+<div class="callout">
+<b>为什么必须先做实验证明？</b> 我之前的初步分析（看代码+worklog）虽然把方向指对了，但你 worklog 里反复记录过"短跑必误判"（<code>v5_exploration_ceiling_858</code>），同样适用于 credit-assignment 改法：<b>不先用数据坐实问题真根，直接动改造改反方向的可能性是真实的</b>。这次 20 batch×K=8×5 step = 4000 条打分能在 ~4 分钟内跑完、不污染训练、可复现，是这个问题最小可证明实验。
+</div>
+
+<h2>2. 实验方法（默认关闭的离线探针）</h2>
+
+<h3>2.1 在哪挂钩</h3>
+
+<p>诊断 hook 加在主训练循环里、rollout 采完后、advantage 计算前（<code>grpo_train_v5_geom_action.py</code>，json 文件 line 2051 之后的 <code>"CREDIT-ASSIGNMENT DIAGNOSTIC"</code> 块）。由环境变量 <code>RL_V4_CREDIT_DIAG=1</code> 触发，若同时 <code>RL_V4_CREDIT_DIAG_STOP=1</code> 则跑完探针后跳过 PPO 更新循环——<b>不改 checkpoint、不污染训练</b>。</p>
+
+<h3>2.2 探针每个 batch 算什么</h3>
+
+<ul>
+  <li><b>每条 K=8 rollout</b> 在 5 step 每个截断位置 <code>polys[t]</code> 上算 partial score（复用同 <code>_quality_score</code>），<b>5 步</b>独立的 <code>score_t</code> 全部记下来。</li>
+  <li><b>deterministic 三步均值</b>的截断 <code>polys[t]</code> 也对应算 5 个 partial，作为 <b>per-step baseline</b>。</li>
+  <li>每步动作的范数 <code>actions_norm_px</code>、每步 old_log_prob 的均值，一并 dump。</li>
+  <li>终端 reward / quality / gate / adv 重新算一份镜像（与主计算一致），保证 JSON 自成体系。</li>
+  <li>输出 <code>credit_diag_step{N}.json</code> 到输出目录。</li>
+</ul>
+
+<h3>2.3 跑的什么基线</h3>
+
+<table>
+<tr><th>项</th><th>值</th></tr>
+<tr><td>config</td><td><code>configs/1232_final_v5_geom8_baseline_bs6_gpu2.yaml</code></td></tr>
+<tr><td>resume_path</td><td><code>data/outputs/1232_final_diffusion_dit_v4_6c_mlp_shared_moe_nodet_continue_gpu3/checkpoints/epoch_3500.pt</code></td></tr>
+<tr><td>outer_steps</td><td>5 &nbsp;<span class="tag">frac=[0.2, 0.25, 0.3333, 0.5, 1.0]</span></td></tr>
+<tr><td>geom_modes</td><td>8（低频法向 Fourier 基）</td></tr>
+<tr><td>geom_sigma_px</td><td>[0.8, 0.7, 0.6, 0.5, 0.4]</td></tr>
+<tr><td>k_rollouts</td><td>8</td></tr>
+<tr><td>KL / burr / detail 权重</td><td><code>kl_beta=0.01</code> &nbsp; <code>reward_burr_weight=0.06</code> &nbsp; <code>reward_detail_weight=0</code></td></tr>
+<tr><td>诊断跑步数</td><td>20 batch（够稳，可复现）</td></tr>
+</table>
+
+<h3>2.4 复现命令</h3>
+
+<pre><code>cd /home/medteam/Zhrch/DiffusionSnake-12-30
+conda activate snake1
+RL_V4_CREDIT_DIAG=1 RL_V4_CREDIT_DIAG_STOP=1 RL_V4_STEPS=20 \
+    CUDA_VISIBLE_DEVICES=2 CFG_FILE=configs/1232_final_v5_geom8_baseline_bs6_gpu2.yaml \
+    python -u grpo_train_v5_geom_action.py --cfg_file "$CFG_FILE"
+
+# 分析
+python scripts/analyze_credit_diag.py
+python scripts/plot_credit_diag.py</code></pre>
+
+<h2>3. 第一层：Reward 计算层面的证据</h2>
+
+<div class="big-grid">
+  <div class="kpi"><div class="v bad">−0.0204</div><div class="lbl">terminal quality 均值（20 batch）</div>
+    <div class="sub">sampled 与 det 三步均值之差，平均每个 batch −2%</div></div>
+  <div class="kpi"><div class="v bad">0.69</div><div class="lbl">gate_active_frac 均值</div>
+    <div class="sub">31% 的 contour 没有一条 rollout 超 det</div></div>
+  <div class="kpi"><div class="v warn">5%</div><div class="lbl">gate 失活严重的 batch</div>
+    <div class="sub">5% 的 batch 里 "失活 contour" 超过半数</div></div>
+  <div class="kpi"><div class="v bad">33%</div><div class="lbl">正面 rollout 占比</div>
+    <div class="sub">20 batch × K 平均只见 1/3 的 rollout 终端>0</div></div>
+</div>
+
+<p>关键观察：</p>
+
+<ul>
+  <li><b>K=8 探索系统性地在低频法向上伤害 contour</b>。平均 −2%（同样的 contour、同样的 deterministic mean 上叠加噪声，平均是负值）。这与 §13 "动作空间表达上限" 闭环：baseline 已压住所有有收益方向，剩余 8 个低频方向的随机扰动平均下来只会走更差附近。</li>
+  <li><b>31% 的 contour 整组被 gate = 0 杀掉</b>——PPO 对它们不做任何更新。这等于"学习信号在 PPO 之前就被 reward+baseline 杠掉"。</li>
+  <li><b>动作幅度后期反而更大</b>：<code>actions_norm_px = [0.79, 0.87, 0.98, 1.09, 1.09]</code>。后期 sigma 已经衰减到 0.4px 但动作范数不降（因为 FM 末段 mean 大），后期却恰恰是"伤害"集中段——见下一节。</li>
+</ul>
+
+<h3>3.1 每 batch 的 terminal quality 与正收益 rollout 比例</h3>
+
+<svg id="bars1" width="980" height="270" viewBox="0 0 980 270"></svg>
+<div class="legend">20 个 batch：蓝色 = 终端 quality 均值（K=8 平均）；红色 = K=8 中终端 quality &gt;0 的比例。<br>注意只有 step1（batch 序号 1）和稀少几个 batch 的 K≤16% 有正 reward 贡献——这是"reward 几乎全员负"的直接体现。</div>
+
+<h2>4. 第二层：轨迹问责层面的证据（这次实验的核心产出）</h2>
+
+<div class="danger">
+<b>这是问题真根。</b>即使 K=8 里挑出某条 rollout 终局 >0，PPO 也只把它当作一个标量 advantage (<code>adv_ri</code>)，<code>for si, action in enumerate(traj['actions']):</code> 循环里<b>给 5 个 step 复制同一个 adv</b>。step1 的动作和 step5 的修手领同样大的梯度——但它们对最终结果的贡献<b>强非对称</b>，下面用数据说话。
+</div>
+
+<h4>4.1 每步 partial 与 det 截断的偏离（mono 上升）</h4>
+
+<p>把每条 rollout 的截断 <code>polys[t]</code> 打分，减去同截断的 det partial，得到"sampled 在这一截断比 det 好多少"。注意：这个量越后期越负！</p>
+
+<table>
+<tr><th>outer step</th><th>mean(sampled_partial − det_partial)</th><th>group 内 K std</th><th>信号/噪声比 (std/terminal_std)</th><th>K=8 里 >det 的占比</th></tr>
+<tr><td>1 (frac=0.20, σ=0.8)</td><td class="num hl-red">−0.0037</td><td class="num">0.0042</td><td class="num hl-red">4.2%</td><td class="num">28.8%</td></tr>
+<tr><td>2 (frac=0.25, σ=0.7)</td><td class="num hl-red">−0.0067</td><td class="num">0.0054</td><td class="num hl-red">5.4%</td><td class="num">22.5%</td></tr>
+<tr><td>3 (frac=0.33, σ=0.6)</td><td class="num hl-red">−0.0093</td><td class="num">0.0064</td><td class="num hl-red">6.4%</td><td class="num">15.6%</td></tr>
+<tr><td>4 (frac=0.50, σ=0.5)</td><td class="num hl-red">−0.0105</td><td class="num">0.0075</td><td class="num hl-red">7.5%</td><td class="num">15.0%</td></tr>
+<tr><td>5 (frac=1.00, σ=0.4)</td><td class="num hl-red">−0.0117</td><td class="num">0.0081</td><td class="num hl-red">8.1%</td><td class="num">13.8%</td></tr>
+</table>
+
+<p>直观说：</p>
+<ul>
+  <li><b>step1 sampled 与 det 几乎平齐</b>（−0.0037）：早期 step 的"低频法向扰动"总体上小幅伤害。</li>
+  <li><b>偏离单调恶化</b>到 step5 的 −0.0117——伤害主要在末段累积出来。</li>
+  <li><b>但 PPO 给 5 步同样一个 adv</b>。→ 早期 step 的负评语约是 −0.0037，理论上 step1 该领 <b>0.1 鞭</b>，<span class="hl-red">实际它领的是 1.0 鞭</span>（adv 是按 terminal std=0.1 floor 归一化的）。</li>
+  <li><b>更重要</b>：早期 step(28.8% 正收益) 与"整个 K=8 全员剩 13.8%"反过来——early step 赢家更多，<b>early step 的"样本里其实有可学信号"</b>。terminal-only disc filter 正好把这部分扔了。</li>
+</ul>
+
+<h4>4.2 终端 advantage 与每步 partial 的方向一致性（25% 错配）</h4>
+
+<p>把"按 terminal advantage 的 sign"当作 PPO 给的更新方向，把它与"该 step partial 与 det 截断之差的 sign"比较：</p>
+
+<table>
+<tr><th>outer step</th><th>sign_agree(step_adv, terminal_adv)</th><th>spearman(step_partial, terminal_partial)</th></tr>
+<tr><td>1 (σ=0.8)</td><td class="num hl-red">75%</td><td class="num hl-red">0.34</td></tr>
+<tr><td>2 (σ=0.7)</td><td class="num">77.5%</td><td class="num">0.37</td></tr>
+<tr><td>3 (σ=0.6)</td><td class="num">80.6%</td><td class="num">0.52</td></tr>
+<tr><td>4 (σ=0.5)</td><td class="num">87.5%</td><td class="num">0.65</td></tr>
+<tr><td>5 (σ=0.4)</td><td class="num hl-green">100%</td><td class="num hl-green">1.00</td></tr>
+</table>
+
+<div class="danger">
+<b>关键证据：</b> 25% 的 step1 动作所领 advantage 的符号与该 step 实际 partial 贡献方向<b>正好相反</b>。step1 的 spearman 与终端只 <b>0.34</b>——两者近独立。<br>
+这数学上是 GRPO/DAgger / RLHF 经典的 "lagging credit" 问题：因为 adv 在终端 std=0.1 上 floor 后，给到 step1 的学习信号 <b>≈ 75% 的真实方向加 25% 噪声</b>。
+</div>
+
+<h4>4.3 信号-噪声：early step 的 dispersion 全被吃了</h4>
+
+<p><code>per_step_std_K_dispersion</code> 是 K=8 在每步 partial 真分布的 std。它和 terminal std 的比值：</p>
+
+<table>
+<tr><th>step</th><td>1</td><td>2</td><td>3</td><td>4</td><td>5</td></tr>
+<tr><td>info_ratio</td><td class="num">4.2%</td><td class="num">5.4%</td><td class="num">6.4%</td><td class="num">7.5%</td><td class="num">8.1%</td></tr>
+</table>
+
+<p>解释：</p>
+<ul>
+  <li>advantage 计算用的是 terminal std <code>std=quality.std(dim=0,unbiased=False).clamp_min(0.1)</code>。20 batch 平均 terminal std = 0.100（被 floor 到 0.1）。</li>
+  <li>但 early step 的 true dispersion 是 0.0042—— <b>它只是终端 std 的 4.2%</b>。terminal 标准→ adv 维持在 ±2 的 clip；step1 真信号 0.0042 全部被吃。</li>
+  <li>结合 4.2 的 spearman 0.34 让 step1 的梯度方向主流方向是终局方向，但参杂 25% 噪声、且幅度被 floor 到 ~terminal scale——<b>学习信号噪声比 SNR ≈ 0.34 × 100/4.2 ≈ 8</b>，给早期 step 的 PPO 内积梯度方向 1 几乎是瞎打鞭。</li>
+</ul>
+
+<h4>4.4 整体演化图（partial score vs det score）</h4>
+
+<svg id="line1" width="980" height="320" viewBox="0 0 980 320"></svg>
+<div class="legend">实线 = K=8 平均 partial score；阴影 = ±1 std；蓝色 = deterministic 截断。</div>
+
+<h2>5. 两层是如何耦合在一起的</h2>
+
+<div class="panel">
+<ol>
+  <li><b>Reward 几乎全员打负</b>（1.1-1.3 → terminal q_mean=−0.02）<br>
+    <span class="muted" style="color:var(--muted)">→ K=8 大多采不到正收益方向（动作空间表达问题 + gate 失活）</span></li>
+  <li><b>越后期偏离越恶化</b>（4.1 单调从 −0.0037 变到 −0.0117）<br>
+    <span class="muted" style="color:var(--muted)">→ 终局 reward 是晚期伤害的代名词</span></li>
+  <li><b>terminal advantage 是一个标量复制给 5 步</b>（line 2078-2079）<br>
+    <span class="muted" style="color:var(--muted)">→ 25% 的早期 step 更新方向反了（4.2 sign_agree=0.75）</span></li>
+  <li><b>早期 step 的真 dispersion 只有 terminal 的 4-5%</b>（4.3）<br>
+    <span class="muted" style="color:var(--muted)">→ 用 terminal std clamp floor=0.1 归一化，提前把早期 step 的真信号平均掉</span></li>
+</ol>
+<p style="margin-top:14px">闭环机制：</p>
+<pre style="margin-top:6px"><b>reward 系统性负 → adv 一负到底 → 复制给 5 步 → 早期 25% 反向 → explorer (lr=5e-5) 想学但梯度有 1/4 是反的 → net.4 absmax 长不到位 → policy mean 不敢动（加上 KL 钳）→ 训练日志 reward 永远负 → 平台 0.860</b></pre>
+<p style="margin-top:10px">这连环效应解释了之前<b>几个独立负结果</b>为什么都收敛到同一面墙：</p>
+<ul>
+  <li>16 模态 vs 8 模态：本质是 dispersion 规模变 × √2，但 terminal 归一照样压死 → <b>探索变更大不代表 reward 穿透</b>。</li>
+  <li>detail reward 加 0.15：reward 端想奖励细节，但 advantage 复制给 5 步把信号平到每步 → <b>curv_match 纹丝不动</b>。</li>
+  <li>adaptive explorer (lr=5e-5)：explorer 想学，但 PPO 给的梯度 25% 反向 → <b>logstd 几乎是 zero-init 不偏离</b>。</li>
+</ul>
+<p>之前定位成"动作空间表达上限"是对的（§13），但<b>那只是 reward 端的表达极限</b>。如果只修一层，另一层会继续拦住信号。这就是为什么之前每一次单层改动都"没反应"——不是改动无效，是被另一层吃掉了。</p>
+</div>
+
+<h2>6. 关键代码位置</h2>
+
+<pre><code><b># 终端唯一 advantage 计算（line 2059-2062）：5 step 共享 */
+quality = final_scores_reward_t - baseline_score_adj.unsqueeze(0)
+gate = (quality.max(dim=0, keepdim=True).values > gate_margin).float()
+adv = quality / quality.std(dim=0, unbiased=False, keepdim=True).clamp_min(0.1)
+adv = adv.clamp(-adv_clip_max, adv_clip_max) * gate
+
+<b># PPO 更新（line 2077-2079）：把这一个 adv 复制给所有 step */
+for ri, traj in enumerate(rollouts):
+    adv_ri = adv[ri].detach()                       # 标量！(K, n_contours)
+    for si, action in enumerate(traj['actions']):  # 5 个 step
+        ...
+        unclipped = -adv_ri * ratio                 # line 2214 — 整条 adv_ri 一样</code></pre>
+
+<h2>7. 产物清单</h2>
+
+<table>
+<tr><th>类别</th><th>路径</th><th>用途</th></tr>
+<tr><td>诊断探针</td><td><code>grpo_train_v5_geom_action.py</code> 中 <code>RL_V4_CREDIT_DIAG</code> 块</td><td>不改训练、可重跑</td></tr>
+<tr><td>启动器</td><td><code>test/run_credit_diag_gpu2.sh</code></td><td>一键复现</td></tr>
+<tr><td>原始数据</td><td><code>data/outputs/1232_final_v5_geom8_baseline_bs6_gpu2/credit_diag_step{1..20}.json</code></td><td>每 batch 全 K×N step partial</td></tr>
+<tr><td>汇总</td><td><code>data/analysis/credit_diag/summary.json</code></td><td>20 batch 平均的统计量</td></tr>
+<tr><td>分析脚本</td><td><code>scripts/analyze_credit_diag.py</code></td><td>从 JSON 重算一切</td></tr>
+<tr><td>图脚本</td><td><code>scripts/plot_credit_diag.py</code></td><td>四面板证据图 (PNG)</td></tr>
+<tr><td>已写正式报告</td><td><code>report/CREDIT_DIAGNOSIS_FINDINGS_20260625.md</code></td><td>完整 markdown 版</td></tr>
+</table>
+
+<h2>8. 下一步可改方案（先等你拍，不自己动）</h2>
+
+<table>
+<tr><th>方案</th><th>改什么</th><th>对应证据</th><th>工程量</th><th>风险</th></tr>
+<tr><td><b>A. Per-step shaped reward</b><br><span class="chip ok">推荐</span></td>
+    <td>把 reward 拆成 per-step partial-vs-det delta 的折现和 + terminal bonus；<code>adv_ri</code> 改为 <code>adv[ri, si]</code></td>
+    <td>2.1-2.5 全条证</td><td>中（动 reward/adv/PPO 索引）</td><td>需调 shaping 系数</td></tr>
+<tr><td>B. Per-step gate</td>
+    <td>gate 张量化，不修 reward</td>
+    <td>1.2 + 部分 2.2</td><td>小</td><td>不解决 sign 错配</td></tr>
+<tr><td>C. Value head + GAE</td>
+    <td>加 V(s_t)、δ 更新</td>
+    <td>全部</td><td>大（新网络）</td><td>增加精度依赖</td></tr>
+</table>
+
+<p>下次任一方案上完后，可在新训练里<b>开启同一个诊断探针</b>，对比改前后：</p>
+
+<ul>
+  <li><code>sign_agree_per_step[0]</code> 是否从 0.75 走到 → 1.0</li>
+  <li><code>spearman_per_step[0]</code> 是否从 0.34 走到 → 1.0</li>
+  <li><code>info_ratio_per_step[0]</code> 是否从 4.2% 走到 → 接近 terminal std 真值</li>
+</ul>
+
+<p>这三个数字直接量化早期 step 是否拿到了真反馈，而非等慢爬后再判定（避免 <code>v5_exploration_ceiling_858</code> 的短跑误判陷阱再次出现）。</p>
+
+<div class="callout">
+<b>对方案 A 的最小子集</b>：用 "per-step partial − det_partial" 作为额外 shaped reward 叠加到终端 reward 上（<b>不替换</b>原 terminal reward），把 <code>adv_ri</code> 改成 per-step 张量在 PPO inner loop 用 <code>adv[ri, si]</code>。改后开探针签应在前 step 几个 batch 内就看到 <code>sign_agree[0]</code> 升到 → 100%，这是"早期 step 的 feedback 已恢复"的客观证明，可在短步内判是非——这样就能**跳过短跑必误判的陷阱**。
+</div>
+
+<h2>9. 重新审视已记录的反直觉现象</h2>
+
+<p>以前 worklog 里几个"为什么 X 不动"的问题，这次证据让它们能闭环解释：</p>
+
+<table>
+<tr><th>原现象</th><th>原归因</th><th>新证据下的统一解释</th></tr>
+<tr><td>adaptive_explorer 一直没人用出效果</td><td>lr=4e-8 太小（已 fix 到 5e-5）</td>
+    <td><b>lr 修了仍不动</b>：PPO 给 explorer 的梯度 25% 是反向、再加 KL 钳，logstd 几乎是被锁在 zero-init</td></tr>
+<tr><td>16 模态 vs 8 模态：略输</td><td>采样到噪声高频方向</td>
+    <td>对——且 early step dispersion 比例 (info_ratio) 还降，<b>放大探索 × mini 真信号</b>，并没给早期 step 更可学的方向</td></tr>
+<tr><td>detail reward 加大但 curv_match 不动</td><td>动作空间够不着高频</td>
+    <td>对——而且即便想推 mean 方向，5 步 adv 共享把 reward 增量噪声化到全部 step 上，每步 effective signal 几乎 0</td></tr>
+<tr><td>explorer_lr=4e-8 时 net.4 absmax 在 zero 起。</td><td>lr 太小</td>
+    <td>主要机理不是 lr——是 25% 反向梯度反向抵消×</td></tr>
+<tr><td>reward 持续全负、gate 频繁 &lt;1.0</td>
+    <td>探索动作空间表达上限</td>
+    <td>对——但不是全部根因。<b>gate 失活的 contour 里 step1 部分正收益 (28.8% 优于 det)，因为 header 失活两次也被全部抹掉</b>。terminal gate 的副作用比原以为还重</td></tr>
+</table>
+
+<div class="foot">
+<b>复现 门票</b>：20 batch×K=8×5 step = 4000 条 step-wise 评分 ≈ 4 分钟单 RTX 3090 GPU。<br>
+本报告由 Claude 编排与实验制作，所有数据可由 <code>scripts/analyze_credit_diag.py</code> 一行从原始 JSON 重算，图由 <code>scripts/plot_credit_diag.py</code> 重渲。<br>
+诊断探针默认关闭；不影响主训训练。
+</div>
+
+</div>
+
+<script>
+// 1) Bars (per-batch terminal quality + positive-share)
+const qp = [0.38,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.12,0.0,0.0,0.12,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0];
+const qm = [-0.005,-0.0278,-0.0237,-0.0177,-0.0212,-0.02,-0.017,-0.0115,-0.0177,-0.0211,-0.0396,-0.0103,-0.0144,-0.01,-0.0271,-0.0149,-0.0146,-0.0422,-0.0163,-0.0353];
+
+(function() {
+  const svg = document.getElementById('bars1');
+  const W=980,H=270,M={l:60,r:20,t:42,b:48};
+  const pw = W-M.l-M.r, ph = H-M.t-M.b;
+  const n = qp.length;
+  const x = i => M.l + (i+0.5) * pw / n;
+  const yScale = (vmax) => M.t + ph - (v / vmax) * ph;
+  const ymin = - Math.max(...qm.map(Math.abs));
+  let path = '';
+  // axis
+  path += `<line x1="${M.l}" y1="${M.t}" x2="${M.l}" y2="${M.t+ph}" stroke="#2d333b"/>`;
+  path += `<line x1="${M.l}" y1="${M.t+ph}" x2="${M.l+pw}" y2="${M.t+ph}" stroke="#2d333b"/>`;
+  // grid
+  for (let g=0; g<=5; g++) {
+    const y = M.t + ph * g/5;
+    path += `<line x1="${M.l}" y1="${y}" x2="${W-M.r}" y2="${y}" stroke="#1c2230"/>`;
+    const lv = -0.05 + g*0.01;
+    path += `<text x="${M.l-10}" y="${y+4}" fill="#8b949e" font-size="11" text-anchor="end">${lv.toFixed(2)}</text>`;
+  }
+  // bars2 positive-share (right scale 0..1)
+  const bW = pw/n*0.62;
+  for (let i=0;i<n;i++) {
+    const cx = x(i);
+    // quality bars (left scale)
+    const val = qm[i];
+    const hq = (Math.abs(val) / 0.05) * ph;
+    const yq = (val < 0) ? M.t + ph - hq : M.t + ph - hq;
+    path += `<rect x="${cx-bW/2}" y="${yq}" width="${bW*0.55}" height="${hq}" fill="#58a6ff" opacity="0.85" rx="2"/>`;
+    // positive share (right scale 0..1)
+    const hq2 = (qp[i]) * ph * 0.9;
+    const yy2 = M.t + ph - hq2;
+    path += `<rect x="${cx-bW/2 + bW*0.55}" y="${yy2}" width="${bW*0.4}" height="${hq2}" fill="#f87171" opacity="0.85" rx="2"/>`;
+  }
+  // x labels (1..20)
+  for (let i=0;i<n;i++) {
+    if (i%2===0) path += `<text x="${x(i)}" y="${M.t+ph+16}" fill="#8b949e" font-size="10" text-anchor="middle">${i+1}</text>`;
+  }
+  path += `<text x="${M.l+pw/2}" y="${H-8}" fill="#8b949e" font-size="12" text-anchor="middle">batch index</text>`;
+  // y label left
+  path += `<text x="14" y="${M.t+ph/2}" fill="#8b949e" font-size="12" text-anchor="middle" transform="rotate(-90 14 ${M.t+ph/2})">terminal quality (左)</text>`;
+  // legend
+  path += `<rect x="${M.l}" y="14" width="12" height="10" fill="#58a6ff" rx="2"/>`;
+  path += `<text x="${M.l+18}" y="23" fill="#c9d1d9" font-size="11">terminal quality 均值 (左)</text>`;
+  path += `<rect x="${M.l+200}" y="14" width="12" height="10" fill="#f87171" rx="2"/>`;
+  path += `<text x="${M.l+218}" y="23" fill="#c9d1d9" font-size="11">K=8 中 quality&gt;0 占比 (右)</text>`;
+  path += `<text x="${W-M.r}" y="${M.t-12}" fill="#8b949e" font-size="11" text-anchor="end">20 batches</text>`;
+  svg.innerHTML = path;
+})();
+
+// 2) Line (per-step partial vs det)
+(function() {
+  const svg = document.getElementById('line1');
+  const W=980,H=320,M={l:60,r:24,t:36,b:48};
+  const pw=W-M.l-M.r, ph=H-M.t-M.b;
+  const steps=[1,2,3,4,5];
+  const det=[0.7047,0.7316,0.7638,0.7947,0.8119];
+  const part=[0.7009,0.7249,0.7546,0.7841,0.8001];
+  const std=[0.0042,0.0054,0.0064,0.0075,0.0081];
+  const allv=[...det,...part,...part.map((v,i)=>v+std[i]),...part.map((v,i)=>v-std[i])];
+  const vmin=Math.min(...allv) - 0.005, vMax=Math.max(...allv) + 0.005;
+  const xs = i => M.l + (i/4) * pw;
+  const ys = v => M.t + ph - (v - vmin)/(vMax-vmin)*ph;
+  let path = '';
+  // grid
+  for (let g=0; g<=5; g++) {
+    const y = M.t + ph * g/5;
+    path += `<line x1="${M.l}" y1="${y}" x2="${W-M.r}" y2="${y}" stroke="#1c2230"/>`;
+    const lv = vMax - (g/5)*(vMax-vmin);
+    path += `<text x="${M.l-10}" y="${y+4}" fill="#8b949e" font-size="11" text-anchor="end">${lv.toFixed(3)}</text>`;
+  }
+  // det line
+  let p1 = steps.map((s,i)=>`${xs(i)},${ys(det[i])}`).join(' ');
+  path += `<polyline points="${p1}" fill="none" stroke="#58a6ff" stroke-width="2.5"/>`;
+  steps.forEach((s,i)=>{
+    path += `<circle cx="${xs(i)}" cy="${ys(det[i])}" r="4" fill="#58a6ff"/>`;
+  });
+  // part line with std band
+  let upper = steps.map((s,i)=>`${xs(i)},${ys(part[i]+std[i])}`).join(' ');
+  let lower = steps.slice().reverse().map((s,i)=>`${xs(steps.length-1-i)},${ys(part[steps.length-1-i]-std[steps.length-1-i])}`).join(' ');
+  path += `<polygon points="${upper} ${lower}" fill="#f87171" opacity="0.18"/>`;
+  let p2 = steps.map((s,i)=>`${xs(i)},${ys(part[i])}`).join(' ');
+  path += `<polyline points="${p2}" fill="none" stroke="#f87171" stroke-width="2.5"/>`;
+  steps.forEach((s,i)=>{
+    path += `<circle cx="${xs(i)}" cy="${ys(part[i])}" r="4" fill="#f87171"/>`;
+  });
+  // axes
+  path += `<line x1="${M.l}" y1="${M.t}" x2="${M.l}" y2="${M.t+ph}" stroke="#2d333b"/>`;
+  path += `<line x1="${M.l}" y1="${M.t+ph}" x2="${W-M.r}" y2="${M.t+ph}" stroke="#2d333b"/>`;
+  steps.forEach((s,i)=>{
+    path += `<text x="${xs(i)}" y="${M.t+ph+20}" fill="#8b949e" font-size="11" text-anchor="middle">step ${i+1}</text>`;
+  });
+  path += `<text x="${M.l+pw/2}" y="${H-8}" fill="#8b949e" font-size="12" text-anchor="middle">outer refinement step</text>`;
+  path += `<text x="14" y="${M.t+ph/2}" fill="#8b949e" font-size="12" text-anchor="middle" transform="rotate(-90 14 ${M.t+ph/2})">partial score</text>`;
+  // legend
+  path += `<rect x="${M.l}" y="14" width="14" height="10" fill="#58a6ff"/>`;
+  path += `<text x="${M.l+20}" y="23" fill="#c9d1d9" font-size="11">deterministic (5-step truncation)</text>`;
+  path += `<rect x="${M.l+220}" y="14" width="14" height="10" fill="#f87171"/>`;
+  path += `<text x="${M.l+240}" y="23" fill="#c9d1d9" font-size="11">sampled rollout (K=8 mean ± 1σ)</text>`;
+  svg.innerHTML = path;
+})();
+</script>
+</body></html>

@@ -42,7 +42,14 @@ from lib.datasets.transforms import make_transforms
 from lib.networks import make_network
 from lib.networks.diffusion.pretrain_evolution import remap_legacy_state_dict
 from lib.train import make_optimizer
+from lib.train.grpo_experiment_controls import group_ids_for_update, network_training_enabled
 from lib.train.grpo_v2_utils import EMA, freeze_bn_running_stats, freeze_ref_flow, percentiles
+from lib.train.per_point_fm_policy import PerPointFMScalePolicy
+from lib.train.continuous_boundary_credit import continuous_boundary_quality_delta
+from lib.train.per_point_ppo import (
+    masked_pointwise_ppo_loss,
+    per_point_squashed_gaussian_logprob,
+)
 from lib.train.rewards.curvature_detail_reward import compute_curvature_detail_score
 from lib.train.rewards.region_reward import compute_region_score, compute_nsd_score
 from lib.train.rewards.region_reward import _poly_to_mask_np, _extract_contour
@@ -546,117 +553,6 @@ def _per_point_fm_velocity_logprob(
     return lp.mean(dim=1)  # (B,)
 
 
-class PerPointFMScalePolicy(nn.Module):
-    """
-    Per-point multiplicative FM scale policy — tanh-bounded parameterisation.
-
-    Sampling:
-        raw_pp ~ N(mu_pp, exp(logstd_pp)^2)          # unbounded Gaussian in raw space
-        scale_pp = tanh(raw_pp) * max_scale            # bounded to (-max_scale, +max_scale)
-        action   = fm_velocity * (1 + scale_pp)        # multiplier in (1-A, 1+A)
-
-    Design rationale:
-      • scale=0 → pure FM prediction (correct initialisation: last-layer bias=0)
-      • multiplier always in (1-A, 1+A), e.g. (0.75, 1.25) with A=0.25
-      • no reversal possible; exploration is a fine-tuning of per-point amplitude
-      • tanh reparameterisation yields unbiased log_prob (no truncated-Gaussian bias)
-      • stored key 'fm_velocity_scales' now holds raw_pp (pre-tanh) for PPO reuse
-
-    forward() returns (mu_pp: B×N, logstd_pp: B×1) for the raw (pre-tanh) Gaussian.
-    """
-
-    def __init__(
-        self,
-        outer_steps: int,
-        feature_dim: int = 128,
-        feature_embed_dim: int = 32,
-        hidden_dim: int = 64,
-        init_logstd: float = -0.5,
-        logstd_min: float = -3.0,
-        logstd_max: float = 2.0,
-        offset_scale: float = 0.5,
-        max_scale: float = 0.25,
-    ):
-        super().__init__()
-        self.outer_steps = int(outer_steps)
-        self.init_logstd = float(init_logstd)
-        self.logstd_min = float(logstd_min)
-        self.logstd_max = float(logstd_max)
-        self.offset_scale = float(offset_scale)
-        self.max_scale = float(max_scale)  # tanh bound: scale_pp ∈ (-A,+A), multiplier ∈ (1-A,1+A)
-
-        self.step_embed = nn.Embedding(
-            max(int(outer_steps), 1), max(int(feature_embed_dim), 4)
-        )
-        # Global branch: pool(sampled_feat) + step_emb → (mu_g, raw_logstd_g)
-        global_in = max(int(feature_dim), 1) + max(int(feature_embed_dim), 4)
-        self.global_net = nn.Sequential(
-            nn.Linear(global_in, max(int(hidden_dim), 16)),
-            nn.ReLU(),
-            nn.Linear(max(int(hidden_dim), 16), 2),  # mu_g, raw_logstd_g
-        )
-        nn.init.zeros_(self.global_net[-1].weight)
-        nn.init.constant_(self.global_net[-1].bias, 0.0)
-
-        # Per-point branch: per-point feat + step_emb + vel_mag_norm → mu_offset
-        point_in = max(int(feature_dim), 1) + max(int(feature_embed_dim), 4) + 1
-        self.point_net = nn.Sequential(
-            nn.Linear(point_in, max(int(hidden_dim), 16)),
-            nn.ReLU(),
-            nn.Linear(max(int(hidden_dim), 16), 1),  # raw mu_offset per point
-        )
-        nn.init.zeros_(self.point_net[-1].weight)
-        nn.init.zeros_(self.point_net[-1].bias)
-
-    def forward(
-        self,
-        step_idx: int,
-        poly: torch.Tensor,
-        c_poly: torch.Tensor,
-        mean_action: torch.Tensor,  # FM velocity (B, N_poly, 2)
-        sampled_feat: torch.Tensor,  # (B, N_samp, C) or (B, C, N_samp)
-        frac: float,
-    ):
-        """Returns (mu_pp: B×N, logstd_pp: B×1 broadcast-ready)."""
-        B = poly.size(0)
-        N_poly = mean_action.size(1)
-
-        # Normalise sampled_feat to (B, N_samp, C). Use N_poly (known ground truth)
-        # to pick the point axis — channel count (64) can be smaller OR larger than
-        # N_poly (128) depending on config, so a size-comparison heuristic is unsafe.
-        if sampled_feat.dim() == 3 and sampled_feat.size(1) != N_poly and sampled_feat.size(2) == N_poly:
-            sampled_feat = sampled_feat.transpose(1, 2)
-        sf = sampled_feat.to(device=poly.device, dtype=poly.dtype)
-
-        idx = max(0, min(int(step_idx), self.step_embed.num_embeddings - 1))
-        step_t = torch.full((B,), idx, device=poly.device, dtype=torch.long)
-        s_emb = self.step_embed(step_t).to(dtype=poly.dtype)  # (B, E)
-
-        # Global branch
-        global_feat = sf.mean(dim=1)  # (B, C)
-        g_in = torch.cat([global_feat, s_emb], dim=-1)
-        g_out = self.global_net(g_in)  # (B, 2)
-        mu_g = g_out[:, :1]            # (B, 1)
-        raw_logstd = g_out[:, 1:2]     # (B, 1)
-        logstd_pp = (raw_logstd + self.init_logstd).clamp(self.logstd_min, self.logstd_max)  # (B,1)
-
-        # FM velocity magnitude feature
-        vel_mag = mean_action.norm(dim=-1, keepdim=True)       # (B, N_poly, 1)
-        vel_mag_norm = vel_mag / (vel_mag.mean(dim=1, keepdim=True).clamp_min(1e-6))
-
-        # Per-point mu offset -- use the UN-pooled per-point feature (sf) so the
-        # point_net actually sees each point's local image content, instead of
-        # a copy-pasted global-pooled feature (which erased all spatial signal).
-        # sf is sampled at the N_poly contour-point locations (get_gcn_feature
-        # on i_it_py), so N_samp == N_poly here and no re-alignment is needed.
-        s_emb_exp = s_emb.unsqueeze(1).expand(-1, N_poly, -1)      # (B, N_poly, E)
-        p_in = torch.cat([sf, s_emb_exp, vel_mag_norm], dim=-1)
-        mu_offset_raw = self.point_net(p_in).squeeze(-1)  # (B, N_poly)
-
-        mu_pp = mu_g + torch.tanh(mu_offset_raw) * self.offset_scale  # (B, N_poly)
-        return mu_pp, logstd_pp  # (B, N), (B, 1)
-
-
 def _per_point_fm_scale_logprob(
     raw_pp: torch.Tensor,     # (B, N) — PRE-TANH sample stored at rollout time
     mu_pp: torch.Tensor,      # (B, N) — current policy mean (in raw/pre-tanh space)
@@ -689,6 +585,37 @@ def _per_point_fm_scale_logprob(
     log_jacob = math.log(max_scale) + torch.log1p(-tanh_raw.pow(2).clamp(max=1.0 - 1e-6))
     lp = lp_gauss - log_jacob   # subtract log|Jacobian| for change-of-variables
     return lp.mean(dim=1)  # (B,)
+
+
+def _per_point_fm_scale_logprob_masked(
+    raw_pp: torch.Tensor,      # (B, N) — PRE-TANH sample stored at rollout time
+    mu_pp: torch.Tensor,       # (B, N) — current policy mean (in raw/pre-tanh space)
+    logstd_pp: torch.Tensor,   # (B, 1) or (B, N) — current policy logstd
+    mask: torch.Tensor,        # (B, N) bool mask — only selected points contribute
+    max_scale: float = 0.25,   # tanh bound (must match policy's max_scale)
+) -> torch.Tensor:
+    """
+    Compute log-prob only for selected points (mask=True).
+
+    Same change-of-variables formula as _per_point_fm_scale_logprob, but only
+    masked points contribute. The selected points form one multivariate action,
+    so their independent per-point log-probabilities are summed (not averaged).
+    This keeps the PPO ratio mathematically consistent with the sampled group
+    and attributes the gradient exclusively to the group that actually acted.
+
+    Returns (B,) joint log-prob per batch element.
+    """
+    var = torch.exp(2.0 * logstd_pp).clamp_min(1e-12)
+    lp_gauss = -0.5 * (
+        (raw_pp - mu_pp) ** 2 / var
+        + 2.0 * logstd_pp
+        + math.log(2.0 * math.pi)
+    )  # (B, N)
+    tanh_raw = torch.tanh(raw_pp)
+    log_jacob = math.log(max_scale) + torch.log1p(-tanh_raw.pow(2).clamp(max=1.0 - 1e-6))
+    lp = lp_gauss - log_jacob  # (B, N)
+
+    return (lp * mask.float()).sum(dim=1)  # (B,)
 
 
 def _normal_z_logprob(z: torch.Tensor, mu: torch.Tensor, logstd: torch.Tensor) -> torch.Tensor:
@@ -849,13 +776,27 @@ def main():
         print(f'[RL-V5] Override GPU -> {gpu_override}')
 
     train_steps = int(cv('train_steps', 300))
-    rl_resume_ckpt = str(getattr(cfg, 'rl_v4_resume_ckpt', '') or '').strip()
+    rl_resume_ckpt = str(
+        os.environ.get('RL_V4_RESUME_CKPT', '')
+        or getattr(cfg, 'rl_v4_resume_ckpt', '')
+        or ''
+    ).strip()
+    resume_policy_state = bool(cv('resume_policy_state', True))
+    resume_optimizer_state = bool(cv('resume_optimizer_state', True))
     k_rollouts = int(cv('k', 8))
     outer_steps = int(cv('outer_steps', 3))
     fractions = [float(x) for x in list(cv('fractions', [0.3333, 0.5, 1.0]))]
     if len(fractions) < outer_steps:
         fractions = fractions + [1.0] * (outer_steps - len(fractions))
     fractions = fractions[:outer_steps]
+    policy_train_last_n_steps = int(cv('policy_train_last_n_steps', outer_steps))
+    if not 1 <= policy_train_last_n_steps <= outer_steps:
+        raise ValueError(
+            'rl_v4_policy_train_last_n_steps must be in [1, outer_steps], '
+            f'got {policy_train_last_n_steps} for outer_steps={outer_steps}'
+        )
+    policy_train_start = outer_steps - policy_train_last_n_steps
+    active_policy_steps = tuple(range(policy_train_start, outer_steps))
     ode_steps = int(cv('ode_steps', getattr(cfg, 'iterative_ode_steps', getattr(cfg, 'flow_ode_steps', 10))))
     if ode_steps <= 0:
         ode_steps = int(getattr(cfg, 'flow_ode_steps', 10))
@@ -918,6 +859,12 @@ def main():
     ppo_kl_target = float(cv('ppo_kl_target', 0.002))
     kl_beta = float(cv('kl_beta', 0.01))
     adv_clip_max = float(cv('adv_clip_max', 2.0))
+    # GRPO reward standard-deviation floor. Keep 0.1 as the legacy default;
+    # local grouped actions need a smaller floor because their score deltas are ~1e-3.
+    adv_std_floor = float(cv('adv_std_floor', 0.1))
+    # Optional canonical GRPO centering across K rollouts. Disabled by default to
+    # preserve legacy experiments; grouped local exploration should enable it.
+    adv_center_group = _as_bool(cv('adv_center_group', False))
     # Per-step shaped reward: blend terminal-only advantage with per-step advantage.
     # 0.0 = terminal-only (original behaviour); 1.0 = pure per-step; 0.5 = equal blend.
     per_step_reward_weight = float(cv('per_step_reward_weight', 0.0))
@@ -927,6 +874,19 @@ def main():
     # 'full_extrap' judges each action by the endpoint contour it *points to* (frac=1),
     # putting every step on the same yardstick regardless of its frac step size.
     per_step_credit_mode = str(cv('per_step_credit_mode', 'seq_delta')).strip().lower()
+    # For grouped per-point actions, compare sampled and deterministic FM actions
+    # from the same rollout state so earlier stochastic steps cannot contaminate
+    # the current step's credit. Legacy experiments keep this disabled.
+    group_local_credit = _as_bool(cv('group_local_credit', False))
+    # V11 assigns a separate same-state counterfactual and PPO ratio to each
+    # selected point. It is intentionally inert outside the grouped scale policy.
+    point_marginal_credit_cfg = _as_bool(cv('point_marginal_credit', False))
+    point_marginal_metric = str(cv('point_marginal_metric', 'region')).strip().lower()
+    if point_marginal_metric not in ('region', 'continuous_boundary'):
+        raise ValueError(
+            'rl_v4_point_marginal_metric must be region or continuous_boundary, '
+            f'got {point_marginal_metric!r}'
+        )
     grad_clip_norm = float(cv('grad_clip_norm', 0.3))
     lr = float(cv('lr', getattr(cfg.train, 'lr', 5e-8)))
     explorer_lr = float(cv('explorer_lr', lr))
@@ -936,12 +896,40 @@ def main():
     log_every = int(cv('log_every', 1))
     seed = int(cv('seed', 20260525))
     freeze_yolo = _as_bool(cv('freeze_yolo', True))
+    # Minimal causal switch: by default the GCN/backbone remains trainable.
+    # When enabled, only the external per-point policy is optimized.
+    freeze_gcn_backbone = _as_bool(cv('freeze_gcn_backbone', False))
+    train_network = network_training_enabled(freeze_gcn_backbone)
     min_load_ratio = float(cv('min_load_ratio', 95.0))
     max_contours = int(cv('max_contours', 0))
     difficulty_index_path = str(cv('difficulty_index_path', '') or '').strip()
     hard_oversample_factor = float(cv('hard_oversample_factor', 4.0))
     hard_iou_thresh = float(cv('hard_iou_thresh', 0.8))
     sigma_difficulty_scale = float(cv('sigma_difficulty_scale', 0.0))
+    # Grouped-serial-exploration for per_point_fm_scale:
+    # Partition N_poly points into n_groups; each rollout step only one group
+    # receives stochastic noise — the rest use deterministic FM (scale_pp=0).
+    # This turns a 128-dim credit-assignment problem into an 8-dim one.
+    rl_v4_group_explore = _as_bool(cv('group_explore', False))
+    rl_v4_n_groups = int(cv('n_groups', 16))
+    group_schedule = str(cv('group_schedule', 'random')).strip().lower()
+    if group_schedule not in ('random', 'cyclic'):
+        raise ValueError(
+            'rl_v4_group_schedule must be random or cyclic, '
+            f'got {group_schedule!r}'
+        )
+    if freeze_gcn_backbone and (
+        action_policy != 'per_point_fm_scale' or not rl_v4_group_explore
+    ):
+        raise ValueError(
+            'rl_v4_freeze_gcn_backbone requires grouped action_policy=per_point_fm_scale'
+        )
+    point_marginal_credit = bool(
+        point_marginal_credit_cfg
+        and group_local_credit
+        and action_policy == 'per_point_fm_scale'
+        and rl_v4_group_explore
+    )
 
     reward_w_region = float(cv('reward_w_region', 0.30))
     reward_w_dice = float(cv('reward_w_dice', 0.10))
@@ -992,14 +980,21 @@ def main():
         raise RuntimeError(f'load ratio too low: {load_ratio:.2f}%')
 
     inner = net_for_load.net if hasattr(net_for_load, 'net') else net_for_load
-    if freeze_yolo:
-        for name in ('yolo', 'cnn_proj', 'cnn_proj_p3', 'swin_snake_feature'):
-            _set_requires_grad(getattr(inner, name, None), False)
-        print('[RL-V5] froze detector/feature projection parameters.')
-    _set_requires_grad(inner.gcn, True)
-    inner.train()
-    nbn = freeze_bn_running_stats(inner)
-    print(f'[RL-V5] froze BN running stats on {nbn} layers.')
+    if freeze_gcn_backbone:
+        _set_requires_grad(trainer.network, False)
+        inner.eval()
+        prefix_distill_weight = 0.0
+        kl_beta = 0.0
+        print('[RL-V5] froze GCN/backbone; only the external per-point policy will train.')
+    else:
+        if freeze_yolo:
+            for name in ('yolo', 'cnn_proj', 'cnn_proj_p3', 'swin_snake_feature'):
+                _set_requires_grad(getattr(inner, name, None), False)
+            print('[RL-V5] froze detector/feature projection parameters.')
+        _set_requires_grad(inner.gcn, True)
+        inner.train()
+        nbn = freeze_bn_running_stats(inner)
+        print(f'[RL-V5] froze BN running stats on {nbn} layers.')
 
     explorer = None
     if adaptive_explorer:
@@ -1039,6 +1034,7 @@ def main():
             # Tanh-bounded per-point FM scale: multiplier in (1-A, 1+A), no reversal
             fmv_offset_scale = float(cv('fm_velocity_offset_scale', 0.5))
             fmv_max_scale = float(cv('fm_velocity_max_scale', 0.25))
+            fmv_zero_mean_local = bool(cv('fm_velocity_zero_mean_local', False))
             fm_velocity_policy = PerPointFMScalePolicy(
                 outer_steps=outer_steps,
                 feature_dim=fmv_feature_dim,
@@ -1049,12 +1045,19 @@ def main():
                 logstd_max=fmv_logstd_max,
                 offset_scale=fmv_offset_scale,
                 max_scale=fmv_max_scale,
+                zero_mean_local=fmv_zero_mean_local,
             ).to(_dev)
             print(f'[RL-V5] per_point_fm_scale_policy: outer_steps={outer_steps}, '
                   f'hidden={fmv_hidden_dim}, feature_dim={fmv_feature_dim}, '
                   f'init_logstd={fmv_init_logstd}, offset_scale={fmv_offset_scale}, '
-                  f'max_scale={fmv_max_scale}, fmv_lr={fmv_lr}, '
-                  f'entropy_weight={fmv_entropy_weight}')
+                  f'max_scale={fmv_max_scale}, zero_mean_local={fmv_zero_mean_local}, '
+                  f'fmv_lr={fmv_lr}, '
+                  f'entropy_weight={fmv_entropy_weight}, '
+                  f'active_policy_steps={list(active_policy_steps)}, '
+                  f'freeze_gcn_backbone={freeze_gcn_backbone}, '
+                  f'group_explore={rl_v4_group_explore}, '
+                  f'group_schedule={group_schedule}, '
+                  f'n_groups={rl_v4_n_groups if rl_v4_group_explore else "N/A"}')
         elif action_policy == 'per_point_fm_velocity':
             fmv_offset_scale = float(cv('fm_velocity_offset_scale', 0.3))
             fm_velocity_policy = PerPointFMVelocityPolicy(
@@ -1082,15 +1085,22 @@ def main():
             ).to(_dev)
             print(f'[RL-V5] fm_velocity_policy: outer_steps={outer_steps}, hidden={fmv_hidden_dim}, '
                   f'sigma_px={sigma_px}, fmv_lr={fmv_lr}')
-        if isinstance(raw_ckpt, dict) and isinstance(raw_ckpt.get('fm_velocity_policy_state_dict'), dict):
+        if (
+            not rl_resume_ckpt
+            and resume_policy_state
+            and isinstance(raw_ckpt, dict)
+            and isinstance(raw_ckpt.get('fm_velocity_policy_state_dict'), dict)
+        ):
             try:
-                fm_velocity_policy.load_state_dict(raw_ckpt['fm_velocity_policy_state_dict'], strict=False)
-                print('[RL-V5] loaded fm_velocity_policy from checkpoint.')
+                fm_velocity_policy.load_state_dict(raw_ckpt['fm_velocity_policy_state_dict'], strict=True)
+                print('[RL-V5] loaded fm_velocity_policy from base checkpoint.')
             except RuntimeError as e:
-                print(f'[RL-V5] WARNING: fm_velocity_policy shape mismatch vs checkpoint '
+                print(f'[RL-V5] WARNING: fm_velocity_policy shape mismatch vs base checkpoint '
                       f'(architecture changed, e.g. feature_dim), keeping freshly-initialised '
                       f'policy weights. Error: {e}')
                 _fmv_policy_shape_mismatch = True
+        elif not resume_policy_state:
+            print('[RL-V5] policy-state restore disabled; using a fresh action policy.')
 
     net_trainable = [p for p in trainer.network.parameters() if p.requires_grad]
     if net_trainable:
@@ -1119,15 +1129,27 @@ def main():
     else:
         for group in extra_param_groups:
             optimizer.add_param_group(group)
+    if freeze_gcn_backbone:
+        network_param_ids = {id(p) for p in trainer.network.parameters()}
+        if any(
+            id(p) in network_param_ids
+            for group in optimizer.param_groups
+            for p in group['params']
+        ):
+            raise RuntimeError('Frozen network parameter leaked into the optimizer.')
     print(f'[RL-V5] optimizer LR set to {lr}')
     if explorer is not None:
         print(f'[RL-V5] explorer LR set to {explorer_lr}')
-    ref_flow = freeze_ref_flow(inner)
-    print('[RL-V5] frozen reference flow snapshot created.')
+    ref_flow = None if freeze_gcn_backbone else freeze_ref_flow(inner)
+    if ref_flow is not None:
+        print('[RL-V5] frozen reference flow snapshot created.')
+    else:
+        print('[RL-V5] skipped reference flow snapshot because the network is frozen.')
 
-    # RL-specific resume: load model weights + optimizer state from a previous RL checkpoint.
-    # The ref_flow is frozen BEFORE this, so KL is measured against the original pretrained policy.
+    # RL-specific resume: load model, action-policy, and optional optimizer state.
+    # In network-training mode ref_flow is frozen before this, preserving historical KL semantics.
     start_step = 0
+    active_resume_path = None
     if rl_resume_ckpt:
         rl_resume_path = _project_path(rl_resume_ckpt)
         if rl_resume_path.exists():
@@ -1135,7 +1157,25 @@ def main():
             _sd = _rl_ckpt.get('state_dict', _rl_ckpt)
             if isinstance(_sd, dict):
                 net_for_load.load_state_dict(_sd, strict=True)
-            if 'optimizer' in _rl_ckpt and isinstance(_rl_ckpt['optimizer'], dict):
+            if resume_policy_state and fm_velocity_policy is not None:
+                _policy_sd = _rl_ckpt.get('fm_velocity_policy_state_dict')
+                if not isinstance(_policy_sd, dict):
+                    raise RuntimeError(
+                        f'RL resume checkpoint has no fm_velocity_policy_state_dict: {rl_resume_path}'
+                    )
+                try:
+                    fm_velocity_policy.load_state_dict(_policy_sd, strict=True)
+                except RuntimeError as e:
+                    raise RuntimeError(
+                        f'RL action-policy state is incompatible with the current policy: '
+                        f'{rl_resume_path}'
+                    ) from e
+                print(f'[RL-V5] loaded fm_velocity_policy from RL checkpoint: {rl_resume_path}')
+            if (
+                resume_optimizer_state
+                and 'optimizer' in _rl_ckpt
+                and isinstance(_rl_ckpt['optimizer'], dict)
+            ):
                 try:
                     optimizer.load_state_dict(_rl_ckpt['optimizer'])
                 except (RuntimeError, ValueError) as e:
@@ -1163,7 +1203,10 @@ def main():
                 if _mismatch_count:
                     print(f'[RL-V5] WARNING: reset optimizer momentum for {_mismatch_count} '
                           f'parameter(s) with shape mismatch vs checkpoint (fresh start for those).')
+            elif not resume_optimizer_state:
+                print('[RL-V5] optimizer-state restore disabled; using fresh optimizer momentum.')
             start_step = int(_rl_ckpt.get('step', 0))
+            active_resume_path = rl_resume_path
             print(f'[RL-V5] RL resume: loaded {rl_resume_path}, continuing from step={start_step}')
         else:
             print(f'[RL-V5] WARNING: rl_v4_resume_ckpt not found: {rl_resume_path}, starting from step=0')
@@ -1272,12 +1315,44 @@ def main():
         json.dump({
             'cfg_file': _cfg_file_used(),
             'base_ckpt': str(ckpt_path),
+            'seed': int(seed),
             'train_steps': train_steps,
             'k': k_rollouts,
             'outer_steps': outer_steps,
             'fractions': fractions,
             'ode_steps': ode_steps,
             'action_policy': action_policy,
+            'freeze_gcn_backbone': bool(freeze_gcn_backbone),
+            'train_network': bool(train_network),
+            'reference_flow_enabled': bool(ref_flow is not None),
+            'per_point_fm_policy': {
+                'enabled': fm_velocity_policy is not None,
+                'hidden_dim': fmv_hidden_dim if fm_velocity_policy is not None else None,
+                'feature_dim': fmv_feature_dim if fm_velocity_policy is not None else None,
+                'feature_embed_dim': fmv_feature_embed_dim if fm_velocity_policy is not None else None,
+                'init_logstd': fmv_init_logstd if fm_velocity_policy is not None else None,
+                'logstd_min': fmv_logstd_min if fm_velocity_policy is not None else None,
+                'logstd_max': fmv_logstd_max if fm_velocity_policy is not None else None,
+                'offset_scale': fmv_offset_scale if fm_velocity_policy is not None else None,
+                'max_scale': fmv_max_scale if action_policy == 'per_point_fm_scale' else None,
+                'entropy_weight': fmv_entropy_weight if fm_velocity_policy is not None else 0.0,
+                'lr': fmv_lr if fm_velocity_policy is not None else None,
+                'train_last_n_steps': int(policy_train_last_n_steps),
+                'active_step_indices': list(active_policy_steps),
+                'group_explore': bool(rl_v4_group_explore),
+                'n_groups': rl_v4_n_groups if rl_v4_group_explore else None,
+                'group_schedule': group_schedule,
+            },
+            'credit_assignment': {
+                'adv_std_floor': adv_std_floor,
+                'adv_center_group': bool(adv_center_group),
+                'per_step_reward_weight': per_step_reward_weight,
+                'per_step_credit_mode': per_step_credit_mode,
+                'group_local_credit': bool(group_local_credit),
+                'point_marginal_credit_configured': bool(point_marginal_credit_cfg),
+                'point_marginal_credit_enabled': bool(point_marginal_credit),
+                'point_marginal_metric': point_marginal_metric,
+            },
             'geom_lowfreq_modes': geom_modes,
             'geom_lowfreq_damp_highfreq': bool(geom_lowfreq_damp_highfreq),
             'geom_sigma_px': sigma_px,
@@ -1509,7 +1584,7 @@ def main():
         return (win_start, win_start + window_size)
 
     @torch.no_grad()
-    def _sample_rollout(output, sigma_multiplier: float = 1.0):
+    def _sample_rollout(output, sigma_multiplier: float = 1.0, group_ids=None):
         current = output['i_it_py'].detach()
         total_disp = torch.zeros_like(current)
         sigma_multiplier = max(float(sigma_multiplier), 0.0)
@@ -1517,19 +1592,25 @@ def main():
             'states': [],
             'c_states': [],
             'actions': [],
+            'mean_actions': [],
             'old_logs': [],
+            'old_point_logs': [],
             'fractions': [],
             'sigmas': [],
             'detail_sigmas': [],
             'outer_indices': [],
             'geom_sampled_feats': [],
             'fm_velocity_scales': [],
+            'policy_active': [],
             'prefix_states': [],
             'prefix_c_states': [],
             'prefix_fractions': [],
             'prefix_indices': [],
             'polys': [current.detach()],
         }
+        if action_policy == 'per_point_fm_scale' and rl_v4_group_explore:
+            traj['fm_velocity_group_ids'] = []    # list of int, one per outer step
+            traj['fm_velocity_group_masks'] = []  # list of (B, N) bool tensors
         if action_policy in ('df', 'df_inner_step', 'diffusion_inner_step', 'flow_inner_step'):
             traj.update({
                 'x_ts': [],
@@ -1671,26 +1752,84 @@ def main():
                 # scale_pp = tanh(raw_pp) * max_scale      → bounded (-A, +A)
                 # action   = fm_velocity * (1 + scale_pp)  → multiplier in (1-A, 1+A)
                 # scale=0 (raw=0) → pure FM; no reversal possible; no log_prob bias.
-                ctx = gcn.prepare_sampling_context(output['cnn_feature'], current, output['py_ind'])
-                sampled_feat = ctx['sampled_feat'].detach()
-                mu_pp, logstd_pp = fm_velocity_policy(si, current, c_cur, mean, sampled_feat, float(frac))
-                eps = torch.randn_like(mu_pp)  # (B, N)
-                raw_pp = mu_pp + torch.exp(logstd_pp) * eps   # (B, N) pre-tanh raw sample
-                _max_s = fm_velocity_policy.max_scale
-                scale_pp = torch.tanh(raw_pp) * _max_s        # (B, N) bounded scale
-                # action_i = fm_vel_i * (1 + scale_i)  — scale ∈ (-A,+A) → multiplier ∈ (1-A,1+A)
-                action = mean * (1.0 + scale_pp.unsqueeze(-1))  # (B, N, 2)
-                old_log = _per_point_fm_scale_logprob(raw_pp, mu_pp, logstd_pp, _max_s)
+                #
+                # Grouped-serial-exploration (when rl_v4_group_explore=True):
+                # Select one group (spatially contiguous span of points) uniformly,
+                # apply stochastic scale_pp only to that group, rest get scale_pp=0
+                # (pure FM). Reward delta directly attributes credit to the selected
+                # group's actions. Log-prob only accounts for the selected group.
+                policy_active = si in active_policy_steps
+                if policy_active:
+                    ctx = gcn.prepare_sampling_context(output['cnn_feature'], current, output['py_ind'])
+                    sampled_feat = ctx['sampled_feat'].detach()
+                    mu_pp, logstd_pp = fm_velocity_policy(
+                        si, current, c_cur, mean, sampled_feat, float(frac)
+                    )
+                    eps = torch.randn_like(mu_pp)
+                    raw_pp = mu_pp + torch.exp(logstd_pp) * eps
+                    _max_s = fm_velocity_policy.max_scale
+
+                    if rl_v4_group_explore:
+                        B, N_poly = mean.size(0), mean.size(1)
+                        n_groups = rl_v4_n_groups
+                        pts_per_group = N_poly // n_groups
+                        group_id = (
+                            int(group_ids[si]) if group_ids is not None
+                            else torch.randint(0, n_groups, (1,)).item()
+                        )
+                        mask = torch.zeros(B, N_poly, dtype=torch.bool, device=mean.device)
+                        start_idx = group_id * pts_per_group
+                        end_idx = start_idx + pts_per_group
+                        mask[:, start_idx:end_idx] = True
+                        scale_pp_full = torch.tanh(raw_pp) * _max_s
+                        scale_pp = torch.zeros_like(raw_pp)
+                        scale_pp[mask] = scale_pp_full[mask]
+                        old_point_log = per_point_squashed_gaussian_logprob(
+                            raw_pp, mu_pp, logstd_pp, _max_s
+                        )
+                        old_log = _per_point_fm_scale_logprob_masked(
+                            raw_pp, mu_pp, logstd_pp, mask, _max_s
+                        )
+                    else:
+                        scale_pp = torch.tanh(raw_pp) * _max_s
+                        old_log = _per_point_fm_scale_logprob(
+                            raw_pp, mu_pp, logstd_pp, _max_s
+                        )
+                        old_point_log = None
+                        group_id = None
+                        mask = None
+                    action = mean * (1.0 + scale_pp.unsqueeze(-1))
+                else:
+                    sampled_feat = None
+                    raw_pp = None
+                    old_point_log = None
+                    old_log = torch.zeros(mean.size(0), device=mean.device, dtype=mean.dtype)
+                    group_id = None
+                    mask = None
+                    action = mean
+
                 traj['states'].append(current.detach())
                 traj['c_states'].append(c_cur.detach())
                 traj['actions'].append(action.detach())
+                traj['mean_actions'].append(mean.detach())
                 traj['old_logs'].append(old_log.detach())
+                traj['old_point_logs'].append(
+                    None if old_point_log is None else old_point_log.detach()
+                )
                 traj['fractions'].append(float(frac))
                 traj['sigmas'].append(0.0)  # sigma unused for this scheme
                 traj['detail_sigmas'].append(0.0)
                 traj['outer_indices'].append(int(si))
                 traj['geom_sampled_feats'].append(sampled_feat)
-                traj['fm_velocity_scales'].append(raw_pp.detach())  # (B, N) raw pre-tanh sample for PPO recompute
+                traj['fm_velocity_scales'].append(
+                    None if raw_pp is None else raw_pp.detach()
+                )
+                traj['policy_active'].append(bool(policy_active))
+                if rl_v4_group_explore:
+                    traj['fm_velocity_group_ids'].append(group_id)
+                    traj['fm_velocity_group_masks'].append(
+                        None if mask is None else mask.detach()
+                    )
                 current = (current + action).detach()
                 total_disp = total_disp + action.detach()
                 traj['polys'].append(current.detach())
@@ -1838,6 +1977,224 @@ def main():
         """
         if fm_velocity_policy is None or not eval_batches or action_policy != 'per_point_fm_scale':
             return {}
+        if rl_v4_group_explore:
+            # Training-aligned local-action diagnostic. Probe the same small
+            # per-point FM scale amplitude seen during sampling (about 0.02 at
+            # the initial std), rather than forcing an entire group to +/-max.
+            # Each selected point gets an independent same-state central
+            # difference target, which can be compared directly with its mu.
+            policy_all = []
+            preference_all = []
+            centered_policy_all = []
+            centered_preference_all = []
+            deterministic_gains = []
+            policy_by_step = [[] for _ in fractions]
+            preference_by_step = [[] for _ in fractions]
+            gain_by_step = [[] for _ in fractions]
+            probe_delta = min(float(fm_velocity_policy.max_scale), 0.02)
+            probe_groups = sorted(set(
+                min(int(round(x)), rl_v4_n_groups - 1)
+                for x in np.linspace(0, rl_v4_n_groups - 1, min(4, rl_v4_n_groups))
+            ))
+            for eb in eval_batches:
+                out = _manual_context(eb)
+                if out['i_it_py'].numel() == 0:
+                    continue
+                current = out['i_it_py'].detach()
+                gt = out['i_gt_py']
+                for si, frac in enumerate(fractions):
+                    c_cur = snake_gcn_utils.img_poly_to_can_poly(current)
+                    mean = _outer_action_mean(
+                        gcn, out['cnn_feature'], current, c_cur,
+                        out['py_ind'], float(frac), ode_steps,
+                    )
+                    if si not in active_policy_steps:
+                        current = (current + mean).detach()
+                        continue
+                    ctx = gcn.prepare_sampling_context(
+                        out['cnn_feature'], current, out['py_ind']
+                    )
+                    sampled_feat = ctx['sampled_feat'].detach()
+                    mu_pp, _ = fm_velocity_policy(
+                        si, current, c_cur, mean, sampled_feat, float(frac)
+                    )
+                    policy_scale = (
+                        torch.tanh(mu_pp) * fm_velocity_policy.max_scale
+                    )
+                    denom = max(float(frac), 1e-3)
+                    pure_endpoint = current + mean / denom
+                    policy_endpoint = current + mean * (
+                        1.0 + policy_scale.unsqueeze(-1)
+                    ) / denom
+                    if point_marginal_metric == 'continuous_boundary':
+                        gain_step = continuous_boundary_quality_delta(
+                            policy_endpoint,
+                            pure_endpoint,
+                            gt,
+                            coord_scale=float(snake_config.down_ratio),
+                            dist_max_px=reward_dist_max_px,
+                        ).mean(dim=1).detach().cpu().numpy().reshape(-1)
+                    else:
+                        gain_step = (
+                            _quality_score(policy_endpoint, gt, out['image_hw'])
+                            - _quality_score(pure_endpoint, gt, out['image_hw'])
+                        ).detach().cpu().numpy().reshape(-1)
+                    deterministic_gains.append(gain_step)
+                    gain_by_step[si].append(gain_step)
+                    n_poly = mean.size(1)
+                    pts_per_group = n_poly // rl_v4_n_groups
+                    probe_indices = []
+                    for group_id in probe_groups:
+                        start = group_id * pts_per_group
+                        probe_indices.extend(range(start, start + pts_per_group))
+                    plus_endpoints = []
+                    minus_endpoints = []
+                    for point_idx in probe_indices:
+                        point_mask = torch.zeros_like(mu_pp)
+                        point_mask[:, point_idx] = probe_delta
+                        plus_endpoints.append(
+                            current + mean * (1.0 + point_mask.unsqueeze(-1)) / denom
+                        )
+                        minus_endpoints.append(
+                            current + mean * (1.0 - point_mask.unsqueeze(-1)) / denom
+                        )
+                    point_policy = policy_scale[:, probe_indices].transpose(0, 1)
+                    if point_marginal_metric == 'continuous_boundary':
+                        point_preferences = []
+                        for probe_idx, point_idx in enumerate(probe_indices):
+                            plus_point = plus_endpoints[probe_idx][:, point_idx:point_idx + 1]
+                            minus_point = minus_endpoints[probe_idx][:, point_idx:point_idx + 1]
+                            point_preferences.append(
+                                continuous_boundary_quality_delta(
+                                    plus_point,
+                                    minus_point,
+                                    gt,
+                                    coord_scale=float(snake_config.down_ratio),
+                                    dist_max_px=reward_dist_max_px,
+                                ).squeeze(1)
+                            )
+                        preference = torch.stack(point_preferences, dim=0)
+                    else:
+                        n_probes = len(probe_indices)
+                        both_endpoints = torch.cat(plus_endpoints + minus_endpoints, dim=0)
+                        both_gt = gt.repeat(2 * n_probes, 1, 1)
+                        scores = _quality_score(
+                            both_endpoints, both_gt, out['image_hw']
+                        ).detach().view(2, n_probes, gt.size(0))
+                        preference = scores[0] - scores[1]
+                    point_policy_np = point_policy.detach().cpu().numpy().reshape(-1)
+                    preference_np = preference.detach().cpu().numpy().reshape(-1)
+                    policy_all.append(point_policy_np)
+                    preference_all.append(preference_np)
+                    policy_by_step[si].append(point_policy_np)
+                    preference_by_step[si].append(preference_np)
+                    centered_policy_all.append(
+                        (point_policy - point_policy.mean(dim=0, keepdim=True))
+                        .detach().cpu().numpy().reshape(-1)
+                    )
+                    centered_preference_all.append(
+                        (preference - preference.mean(dim=0, keepdim=True))
+                        .detach().cpu().numpy().reshape(-1)
+                    )
+                    current = (current + mean).detach()
+            if not policy_all:
+                return {}
+            policy_flat = np.concatenate(policy_all)
+            pref_flat = np.concatenate(preference_all)
+            n = min(policy_flat.size, pref_flat.size)
+            policy_flat, pref_flat = policy_flat[:n], pref_flat[:n]
+            valid = np.abs(pref_flat) > 1e-7
+            corr = 0.0
+            if n >= 2 and policy_flat.std() >= 1e-9 and pref_flat.std() >= 1e-9:
+                corr = float(np.corrcoef(policy_flat, pref_flat)[0, 1])
+            sign_match = np.sign(policy_flat[valid]) == np.sign(pref_flat[valid])
+            sign_acc = float(np.mean(sign_match)) if valid.any() else 0.0
+            positive = valid & (pref_flat > 0)
+            negative = valid & (pref_flat < 0)
+            positive_recall = float(np.mean(policy_flat[positive] > 0)) if positive.any() else 0.0
+            negative_recall = float(np.mean(policy_flat[negative] < 0)) if negative.any() else 0.0
+            balanced_sign_acc = (
+                0.5 * (positive_recall + negative_recall)
+                if positive.any() and negative.any() else 0.0
+            )
+            preference_positive_frac = (
+                float(np.mean(pref_flat[valid] > 0)) if valid.any() else 0.0
+            )
+            centered_policy_flat = np.concatenate(centered_policy_all)
+            centered_pref_flat = np.concatenate(centered_preference_all)
+            centered_n = min(centered_policy_flat.size, centered_pref_flat.size)
+            centered_policy_flat = centered_policy_flat[:centered_n]
+            centered_pref_flat = centered_pref_flat[:centered_n]
+            centered_corr = 0.0
+            if (
+                centered_n >= 2
+                and centered_policy_flat.std() >= 1e-9
+                and centered_pref_flat.std() >= 1e-9
+            ):
+                centered_corr = float(np.corrcoef(
+                    centered_policy_flat, centered_pref_flat
+                )[0, 1])
+            det_gain_flat = (
+                np.concatenate(deterministic_gains)
+                if deterministic_gains else np.zeros(1, dtype=np.float32)
+            )
+            step_diagnostics = []
+            for step_idx, (step_policy_parts, step_pref_parts, step_gain_parts) in enumerate(
+                zip(policy_by_step, preference_by_step, gain_by_step)
+            ):
+                if not step_policy_parts or not step_pref_parts:
+                    continue
+                step_policy = np.concatenate(step_policy_parts)
+                step_pref = np.concatenate(step_pref_parts)
+                step_n = min(step_policy.size, step_pref.size)
+                step_policy, step_pref = step_policy[:step_n], step_pref[:step_n]
+                step_valid = np.abs(step_pref) > 1e-7
+                step_positive = step_valid & (step_pref > 0)
+                step_negative = step_valid & (step_pref < 0)
+                step_pos_recall = (
+                    float(np.mean(step_policy[step_positive] > 0))
+                    if step_positive.any() else 0.0
+                )
+                step_neg_recall = (
+                    float(np.mean(step_policy[step_negative] < 0))
+                    if step_negative.any() else 0.0
+                )
+                step_corr = 0.0
+                if step_n >= 2 and step_policy.std() >= 1e-9 and step_pref.std() >= 1e-9:
+                    step_corr = float(np.corrcoef(step_policy, step_pref)[0, 1])
+                step_gain = (
+                    np.concatenate(step_gain_parts)
+                    if step_gain_parts else np.zeros(1, dtype=np.float32)
+                )
+                step_diagnostics.append({
+                    'step_index': int(step_idx),
+                    'fraction': float(fractions[step_idx]),
+                    'pref_corr': step_corr,
+                    'balanced_sign_acc': 0.5 * (step_pos_recall + step_neg_recall),
+                    'positive_recall': step_pos_recall,
+                    'negative_recall': step_neg_recall,
+                    'preference_positive_frac': (
+                        float(np.mean(step_pref[step_valid] > 0)) if step_valid.any() else 0.0
+                    ),
+                    'policy_gain_mean': float(step_gain.mean()),
+                    'n': int(step_valid.sum()),
+                })
+            return {
+                'diag_point_pref_corr': corr,
+                'diag_point_centered_pref_corr': centered_corr,
+                'diag_point_sign_acc': sign_acc,
+                'diag_point_balanced_sign_acc': balanced_sign_acc,
+                'diag_point_positive_recall': positive_recall,
+                'diag_point_negative_recall': negative_recall,
+                'diag_point_preference_positive_frac': preference_positive_frac,
+                'diag_point_pref_n': int(valid.sum()),
+                'diag_policy_gain_mean': float(det_gain_flat.mean()),
+                'diag_policy_gain_positive_frac': float((det_gain_flat > 0).mean()),
+                'diag_point_by_step': step_diagnostics,
+                'diag_probe_scale': float(probe_delta),
+                'diag_mu_err_corr': 0.0,
+                'diag_mu_err_n': 0,
+            }
         mu_abs_all = []
         err_abs_all = []
         for eb in eval_batches:
@@ -1888,6 +2245,42 @@ def main():
             'metrics': metrics,
             'cfg_file': _cfg_file_used(),
             'time': datetime.datetime.now().isoformat(),
+            'experiment_metadata': {
+                'group_logprob_reduction': (
+                    'per_point' if point_marginal_credit
+                    else 'sum' if action_policy == 'per_point_fm_scale' and rl_v4_group_explore
+                    else 'mean'
+                ),
+                'resume_policy_state': bool(resume_policy_state),
+                'resume_optimizer_state': bool(resume_optimizer_state),
+                'policy_train_last_n_steps': int(policy_train_last_n_steps),
+                'active_policy_step_indices': list(active_policy_steps),
+                'freeze_gcn_backbone': bool(freeze_gcn_backbone),
+                'train_network': bool(train_network),
+                'reference_flow_enabled': bool(ref_flow is not None),
+                'group_explore': bool(rl_v4_group_explore),
+                'n_groups': int(rl_v4_n_groups) if rl_v4_group_explore else 0,
+                'group_schedule': group_schedule,
+                'seed': int(seed),
+                'group_visit_counts': list(group_visit_counts),
+                'group_visit_counts_by_outer_step': [
+                    list(counts) for counts in group_visit_counts_by_outer_step
+                ],
+                'group_local_credit': bool(group_local_credit),
+                'point_marginal_credit_configured': bool(point_marginal_credit_cfg),
+                'point_marginal_credit_enabled': bool(point_marginal_credit),
+                'point_marginal_metric': point_marginal_metric,
+                'point_credit_shape': [
+                    int(k_rollouts), int(outer_steps), 'contours', 8
+                ] if point_marginal_credit else None,
+                'adv_center_group': bool(adv_center_group),
+                'adv_std_floor': float(adv_std_floor),
+                'fm_velocity_max_scale': float(fmv_max_scale),
+                'fm_velocity_zero_mean_local': bool(
+                    getattr(fm_velocity_policy, 'zero_mean_local', False)
+                ) if fm_velocity_policy is not None else False,
+                'fm_velocity_lr': float(fmv_lr),
+            },
         }, path)
 
     @torch.no_grad()
@@ -2130,9 +2523,35 @@ def main():
         with open(viz_dir / f'train_group_step{step:06d}.json', 'w') as f:
             json.dump(meta, f, indent=2)
 
+    if _as_bool(os.environ.get('RL_V4_DIAG_ONLY', '0')):
+        if rl_resume_ckpt and active_resume_path is None:
+            raise RuntimeError(
+                f'Diagnostic mode requires a valid RL resume checkpoint: {rl_resume_ckpt}'
+            )
+        diagnostic = _diag_mu_error_correlation()
+        diagnostic.update({
+            'checkpoint': str(active_resume_path or ckpt_path),
+            'cfg_file': _cfg_file_used(),
+            'point_marginal_metric': point_marginal_metric,
+            'diagnostic_only': True,
+        })
+        diagnostic_path = os.environ.get('RL_V4_DIAG_OUTPUT', '').strip()
+        if diagnostic_path:
+            output_path = _project_path(diagnostic_path)
+            output_path.parent.mkdir(parents=True, exist_ok=True)
+            with open(output_path, 'w') as handle:
+                json.dump(diagnostic, handle, indent=2, sort_keys=True)
+        print(f'[DIAG-ONLY] {json.dumps(diagnostic, sort_keys=True)}', flush=True)
+        return
+
     train_iter = iter(train_loader)
+    group_visit_counts = [0] * rl_v4_n_groups
+    group_visit_counts_by_outer_step = [
+        [0] * rl_v4_n_groups for _ in range(outer_steps)
+    ]
     for step in range(start_step + 1, train_steps + 1):
-        freeze_bn_running_stats(inner)
+        if not freeze_gcn_backbone:
+            freeze_bn_running_stats(inner)
         try:
             batch = next(train_iter)
         except StopIteration:
@@ -2198,8 +2617,27 @@ def main():
         burr_raws = []
         regression_penalties = []
         old_log_counts = []
+        rollout_group_ids = None
+        if action_policy == 'per_point_fm_scale' and rl_v4_group_explore:
+            # All K rollouts perturb the same group at each outer step so their
+            # scalar rewards remain comparable for GRPO ranking.
+            rollout_group_ids = group_ids_for_update(
+                rl_update_step=step,
+                outer_steps=outer_steps,
+                n_groups=rl_v4_n_groups,
+                seed=seed,
+                schedule=group_schedule,
+            )
+            for outer_step, group_id in enumerate(rollout_group_ids):
+                if outer_step in active_policy_steps:
+                    group_visit_counts[group_id] += 1
+                    group_visit_counts_by_outer_step[outer_step][group_id] += 1
         for _ in range(k_rollouts):
-            ret = _sample_rollout(output, sigma_multiplier=sigma_multiplier)
+            ret = _sample_rollout(
+                output,
+                sigma_multiplier=sigma_multiplier,
+                group_ids=rollout_group_ids,
+            )
             rollouts.append(ret)
             final_poly = output['i_it_py'] + ret['disp']
             score, score_comps = _score_with_components(final_poly, i_gt, output['image_hw'])
@@ -2234,7 +2672,9 @@ def main():
             burr_penalties.append(burr_penalty.detach())
             burr_raws.append(burr_raw.detach())
             regression_penalties.append(regression_penalty)
-            old_log_counts.append(len(ret['old_logs']))
+            old_log_counts.append(
+                sum(ret['policy_active']) if ret.get('policy_active') else len(ret['old_logs'])
+            )
 
         # ===== CREDIT-ASSIGNMENT DIAGNOSTIC (offline, opt-in) =====
         # Toggle via env RL_V4_CREDIT_DIAG=1. When active we measure the
@@ -2367,9 +2807,12 @@ def main():
             final_scores_reward_t - baseline_score_adj.unsqueeze(0)
         )
         # gate mechanism removed; all rollouts contribute to advantage
-        adv = quality / quality.std(dim=0, unbiased=False, keepdim=True).clamp_min(0.1)
+        quality_std = quality.std(dim=0, unbiased=False, keepdim=True)
+        quality_for_adv = quality - quality.mean(dim=0, keepdim=True) if adv_center_group else quality
+        adv = quality_for_adv / quality_std.clamp_min(adv_std_floor)
         adv = adv.clamp(-adv_clip_max, adv_clip_max)
         reward_mean = float(quality.mean().item())
+        reward_std_mean = float(quality_std.mean().item())
         ema_reward_val = ema_reward.update(reward_mean)
 
         # ===== PER-STEP SHAPED REWARD =====
@@ -2393,10 +2836,21 @@ def main():
         #                      every step is judged on the same "one-shot to goal"
         #                      ruler. Attribution only; reward stays terminal.
         #
-        # If per_step_reward_weight == 0 (default) this entire block is a no-op:
-        # adv_ps is just adv broadcast to [K, n_steps, N_contours].
+        # Point-marginal mode always computes its per-step signal; legacy modes
+        # remain a no-op when per_step_reward_weight is zero.
         n_outer = len(fractions)
-        if per_step_reward_weight > 0.0 and n_outer > 0:
+        step_quality_std_mean = 0.0
+        step_adv_abs_mean = 0.0
+        point_quality_std_mean = 0.0
+        point_quality_nonzero_frac = 0.0
+        point_quality_abs_mean = 0.0
+        point_adv_abs_mean = 0.0
+        active_point_quality_std_mean = 0.0
+        active_point_quality_nonzero_frac = 0.0
+        active_point_quality_abs_mean = 0.0
+        active_point_adv_abs_mean = 0.0
+        point_adv = None
+        if (per_step_reward_weight > 0.0 or point_marginal_credit) and n_outer > 0:
             with torch.no_grad():
                 _frac_list = [max(float(fractions[_si]), 1e-3) for _si in range(n_outer)]
 
@@ -2428,22 +2882,186 @@ def main():
                     else _step_quality_seq
                 )
 
-                det_polys = det_ret.get('polys', [])
-                det_step_t = _step_fn(det_polys)  # [n_outer, N_contours]
+                if (
+                    group_local_credit
+                    and action_policy == 'per_point_fm_scale'
+                    and rl_v4_group_explore
+                ):
+                    _n_contours = int(i_gt.shape[0])
+                    _n_rollouts = len(rollouts)
+                    step_quality_by_step = []
+                    point_quality_by_step = []
+                    for _si in range(n_outer):
+                        _denom = _frac_list[_si]
+                        if _si not in active_policy_steps:
+                            step_quality_by_step.append(torch.zeros(
+                                _n_rollouts, _n_contours,
+                                device=i_gt.device, dtype=i_gt.dtype,
+                            ))
+                            if point_marginal_credit:
+                                point_quality_by_step.append(torch.zeros(
+                                    _n_rollouts, _n_contours, 8,
+                                    device=i_gt.device, dtype=i_gt.dtype,
+                                ))
+                            continue
+                        if point_marginal_credit:
+                            if point_marginal_metric == 'continuous_boundary':
+                                sampled_points = []
+                                pure_points = []
+                                for _ret in rollouts:
+                                    state = _ret['states'][_si]
+                                    mean_action = _ret['mean_actions'][_si]
+                                    sampled_action = _ret['actions'][_si]
+                                    mask = _ret['fm_velocity_group_masks'][_si]
+                                    selected = mask[0].nonzero(as_tuple=False).flatten()
+                                    if selected.numel() != 8 or not torch.equal(
+                                        mask, mask[:1].expand_as(mask)
+                                    ):
+                                        raise RuntimeError(
+                                            'point marginal credit requires one shared 8-point mask per contour'
+                                        )
+                                    point_index = selected.view(1, 8, 1).expand(
+                                        _n_contours, 8, 2
+                                    )
+                                    sampled_points.append(torch.gather(
+                                        state + sampled_action / _denom,
+                                        dim=1,
+                                        index=point_index,
+                                    ))
+                                    pure_points.append(torch.gather(
+                                        state + mean_action / _denom,
+                                        dim=1,
+                                        index=point_index,
+                                    ))
+                                sampled_points = torch.stack(sampled_points, dim=0)
+                                pure_points = torch.stack(pure_points, dim=0)
+                                gt_polylines = i_gt.unsqueeze(0).expand(
+                                    _n_rollouts, -1, -1, -1
+                                )
+                                point_quality_step = continuous_boundary_quality_delta(
+                                    sampled_points,
+                                    pure_points,
+                                    gt_polylines,
+                                    coord_scale=float(snake_config.down_ratio),
+                                    dist_max_px=reward_dist_max_px,
+                                ).detach()
+                            else:
+                                marginal_endpoints = []
+                                pure_endpoints = []
+                                for _ret in rollouts:
+                                    state = _ret['states'][_si]
+                                    mean_action = _ret['mean_actions'][_si]
+                                    sampled_action = _ret['actions'][_si]
+                                    mask = _ret['fm_velocity_group_masks'][_si]
+                                    selected = mask[0].nonzero(as_tuple=False).flatten()
+                                    if selected.numel() != 8 or not torch.equal(
+                                        mask, mask[:1].expand_as(mask)
+                                    ):
+                                        raise RuntimeError(
+                                            'point marginal credit requires one shared 8-point mask per contour'
+                                        )
+                                    pure = state + mean_action / _denom
+                                    pure_endpoints.append(pure)
+                                    for point_idx in selected.tolist():
+                                        endpoint = pure.clone()
+                                        endpoint[:, point_idx] = (
+                                            state[:, point_idx]
+                                            + sampled_action[:, point_idx] / _denom
+                                        )
+                                        # Flatten order is rollout, point, contour; GT repeats
+                                        # in the same contour-fast order below.
+                                        marginal_endpoints.append(endpoint)
+                                endpoint_batch = torch.cat(
+                                    marginal_endpoints + pure_endpoints, dim=0
+                                )
+                                gt_batch = i_gt.repeat(_n_rollouts * (8 + 1), 1, 1)
+                                scores = _quality_score(
+                                    endpoint_batch, gt_batch, output['image_hw']
+                                ).detach()
+                                marginal_count = _n_rollouts * 8 * _n_contours
+                                marginal_scores = scores[:marginal_count].view(
+                                    _n_rollouts, 8, _n_contours
+                                ).permute(0, 2, 1)
+                                pure_scores = scores[marginal_count:].view(
+                                    _n_rollouts, _n_contours
+                                )
+                                point_quality_step = (
+                                    marginal_scores - pure_scores.unsqueeze(-1)
+                                )
+                            point_quality_by_step.append(point_quality_step)
+                            step_quality_by_step.append(point_quality_step.mean(dim=-1))
+                        else:
+                            sampled_endpoints = torch.cat([
+                                _ret['states'][_si] + _ret['actions'][_si] / _denom
+                                for _ret in rollouts
+                            ], dim=0)
+                            det_endpoints = torch.cat([
+                                _ret['states'][_si] + _ret['mean_actions'][_si] / _denom
+                                for _ret in rollouts
+                            ], dim=0)
+                            both_endpoints = torch.cat(
+                                [sampled_endpoints, det_endpoints], dim=0
+                            )
+                            both_gt = i_gt.repeat(2 * _n_rollouts, 1, 1)
+                            both_scores = _quality_score(
+                                both_endpoints, both_gt, output['image_hw']
+                            ).detach().view(2, _n_rollouts, _n_contours)
+                            step_quality_by_step.append(
+                                both_scores[0] - both_scores[1]
+                            )
+                    step_quality = torch.stack(step_quality_by_step, dim=1)
+                    if point_marginal_credit:
+                        point_quality = torch.stack(point_quality_by_step, dim=1)
+                        point_std = point_quality.std(
+                            dim=0, unbiased=False, keepdim=True
+                        )
+                        point_adv = (
+                            point_quality - point_quality.mean(dim=0, keepdim=True)
+                        ) / point_std.clamp_min(adv_std_floor)
+                        point_adv = point_adv.clamp(-adv_clip_max, adv_clip_max)
+                        point_quality_std_mean = float(point_std.mean().item())
+                        point_quality_nonzero_frac = float(
+                            (point_quality != 0).float().mean().item()
+                        )
+                        point_quality_abs_mean = float(point_quality.abs().mean().item())
+                        point_adv_abs_mean = float(point_adv.abs().mean().item())
+                        active_idx = torch.as_tensor(
+                            active_policy_steps, device=point_quality.device, dtype=torch.long
+                        )
+                        active_quality = point_quality.index_select(1, active_idx)
+                        active_std = point_std.index_select(1, active_idx)
+                        active_adv = point_adv.index_select(1, active_idx)
+                        active_point_quality_std_mean = float(active_std.mean().item())
+                        active_point_quality_nonzero_frac = float(
+                            (active_quality != 0).float().mean().item()
+                        )
+                        active_point_quality_abs_mean = float(active_quality.abs().mean().item())
+                        active_point_adv_abs_mean = float(active_adv.abs().mean().item())
+                else:
+                    det_polys = det_ret.get('polys', [])
+                    det_step_t = _step_fn(det_polys)  # [n_outer, N_contours]
 
-                rollout_step = []
-                for _ret in rollouts:
-                    rollout_step.append(_step_fn(_ret.get('polys', [])))
-                rollout_step_t = torch.stack(rollout_step, dim=0)  # [K, n_outer, N_contours]
+                    rollout_step = []
+                    for _ret in rollouts:
+                        rollout_step.append(_step_fn(_ret.get('polys', [])))
+                    rollout_step_t = torch.stack(rollout_step, dim=0)  # [K, n_outer, N_contours]
 
-                # Centre by deterministic baseline at the same step (same role as
-                # baseline_score_adj for the terminal reward).
-                step_quality = rollout_step_t - det_step_t.unsqueeze(0)
+                    # Centre by deterministic baseline at the same step (same role as
+                    # baseline_score_adj for the terminal reward).
+                    step_quality = rollout_step_t - det_step_t.unsqueeze(0)
 
-                step_adv = step_quality / step_quality.std(
+                step_quality_for_adv = (
+                    step_quality - step_quality.mean(dim=0, keepdim=True)
+                    if adv_center_group else step_quality
+                )
+                step_quality_std_mean = float(
+                    step_quality.std(dim=0, unbiased=False).mean().item()
+                )
+                step_adv = step_quality_for_adv / step_quality.std(
                     dim=0, unbiased=False, keepdim=True
-                ).clamp_min(0.1)
+                ).clamp_min(adv_std_floor)
                 step_adv = step_adv.clamp(-adv_clip_max, adv_clip_max)
+                step_adv_abs_mean = float(step_adv.abs().mean().item())
 
                 # Blend: (1-w)*terminal + w*per-step
                 adv_ps = (
@@ -2456,7 +3074,10 @@ def main():
             # [K, n_outer, N_contours]
         # ===== END PER-STEP SHAPED REWARD =====
 
-        total_actions = sum(len(t['actions']) for t in rollouts)
+        total_actions = sum(
+            sum(t['policy_active']) if t.get('policy_active') else len(t['actions'])
+            for t in rollouts
+        )
         total_prefixes = sum(len(t.get('prefix_states', [])) for t in rollouts)
         approx_kl_hist, ratio_hist, loss_hist, prefix_loss_hist = [], [], [], []
         early_stop_epoch = ppo_inner_epochs
@@ -2469,6 +3090,8 @@ def main():
             for ri, traj in enumerate(rollouts):
                 _n_ps = adv_ps.shape[1]  # n_outer steps
                 for si, action in enumerate(traj['actions']):
+                    if traj.get('policy_active') and not traj['policy_active'][si]:
+                        continue
                     state = traj['states'][si]
                     c_state = traj['c_states'][si]
                     frac = traj['fractions'][si]
@@ -2528,9 +3151,22 @@ def main():
                             mu_pp, logstd_pp = fm_velocity_policy(
                                 outer_idx, state, c_state, mean_cur, sampled_feat, frac
                             )
-                            lp_cur = _per_point_fm_scale_logprob(
-                                raw_pp_old, mu_pp, logstd_pp, fm_velocity_policy.max_scale
-                            )
+                            if rl_v4_group_explore:
+                                mask = traj['fm_velocity_group_masks'][si]  # (B, N) bool
+                                if point_marginal_credit:
+                                    lp_cur = per_point_squashed_gaussian_logprob(
+                                        raw_pp_old, mu_pp, logstd_pp,
+                                        fm_velocity_policy.max_scale,
+                                    )
+                                else:
+                                    lp_cur = _per_point_fm_scale_logprob_masked(
+                                        raw_pp_old, mu_pp, logstd_pp, mask,
+                                        fm_velocity_policy.max_scale,
+                                    )
+                            else:
+                                lp_cur = _per_point_fm_scale_logprob(
+                                    raw_pp_old, mu_pp, logstd_pp, fm_velocity_policy.max_scale
+                                )
                             # Entropy of the underlying (pre-tanh) Gaussian, as a proxy for
                             # exploration entropy. Differentiable w.r.t. logstd_pp (network
                             # output) -> subtracting it from the loss (i.e. rewarding higher
@@ -2600,12 +3236,27 @@ def main():
                                 damp_highfreq=geom_lowfreq_damp_highfreq,
                             )
                         std_cur = None
-                    ratio = torch.exp(lp_cur - old_log)
-                    # adv_ps: [K, n_outer, N_contours]; index by (ri, si) for per-step signal
-                    _adv_si = adv_ps[ri, min(si, _n_ps - 1)].detach()
-                    unclipped = -_adv_si * ratio
-                    clipped = -_adv_si * torch.clamp(ratio, 1.0 - ppo_clip, 1.0 + ppo_clip)
-                    policy_loss = torch.maximum(unclipped, clipped).mean() / max(total_actions, 1)
+                    if point_marginal_credit:
+                        old_point_log = traj['old_point_logs'][si]
+                        selected = mask[0].nonzero(as_tuple=False).flatten()
+                        point_adv_si = point_adv[
+                            ri, min(si, point_adv.shape[1] - 1)
+                        ].detach()  # (contour, 8), matching selected point order
+                        full_point_adv = torch.zeros_like(lp_cur)
+                        full_point_adv[:, selected] = point_adv_si
+                        point_loss, ratio = masked_pointwise_ppo_loss(
+                            lp_cur, old_point_log, full_point_adv, mask, ppo_clip
+                        )
+                        policy_loss = point_loss / max(total_actions, 1)
+                    else:
+                        ratio = torch.exp(lp_cur - old_log)
+                        # adv_ps: [K, n_outer, N_contours]
+                        _adv_si = adv_ps[ri, min(si, _n_ps - 1)].detach()
+                        unclipped = -_adv_si * ratio
+                        clipped = -_adv_si * torch.clamp(
+                            ratio, 1.0 - ppo_clip, 1.0 + ppo_clip
+                        )
+                        policy_loss = torch.maximum(unclipped, clipped).mean() / max(total_actions, 1)
                     if kl_beta > 0:
                         if action_policy in ('df', 'df_inner_step', 'diffusion_inner_step', 'flow_inner_step'):
                             with torch.no_grad():
@@ -2657,7 +3308,11 @@ def main():
                         loss.backward()
                     with torch.no_grad():
                         epoch_losses.append(float(policy_loss.detach().item()))
-                        epoch_kls.append(float(0.5 * torch.mean((lp_cur - old_log) ** 2).item()))
+                        if point_marginal_credit:
+                            logprob_delta = (lp_cur - old_point_log).masked_select(mask)
+                        else:
+                            logprob_delta = lp_cur - old_log
+                        epoch_kls.append(float(0.5 * torch.mean(logprob_delta ** 2).item()))
                         epoch_ratios.append(ratio.detach())
 
                 if prefix_distill_weight > 0.0 and traj.get('prefix_states'):
@@ -2725,12 +3380,44 @@ def main():
                 diag_corr = _diag_mu_error_correlation()
                 if diag_corr:
                     eval_metrics.update(diag_corr)
-                    print(f"[DIAG-SMART] step={step} mu_err_corr={diag_corr['diag_mu_err_corr']:+.4f} "
-                          f"n={diag_corr['diag_mu_err_n']}", flush=True)
+                    if 'diag_point_pref_corr' in diag_corr:
+                        print(
+                            f"[DIAG-POINT] step={step} "
+                            f"pref_corr={diag_corr['diag_point_pref_corr']:+.4f} "
+                            f"centered_corr={diag_corr.get('diag_point_centered_pref_corr', 0.0):+.4f} "
+                            f"sign_acc={diag_corr['diag_point_sign_acc']:.3f} "
+                            f"balanced={diag_corr.get('diag_point_balanced_sign_acc', 0.0):.3f} "
+                            f"pref_pos={diag_corr.get('diag_point_preference_positive_frac', 0.0):.3f} "
+                            f"gain={diag_corr['diag_policy_gain_mean']:+.6f} "
+                            f"gain_pos={diag_corr['diag_policy_gain_positive_frac']:.3f} "
+                            f"n={diag_corr['diag_point_pref_n']}",
+                            flush=True,
+                        )
+                    else:
+                        print(f"[DIAG-SMART] step={step} mu_err_corr={diag_corr['diag_mu_err_corr']:+.4f} "
+                              f"n={diag_corr['diag_mu_err_n']}", flush=True)
 
         metrics = {
             'step': step,
             'reward_mean': reward_mean,
+            'reward_std_mean': reward_std_mean,
+            'adv_std_floor': float(adv_std_floor),
+            'adv_center_group': bool(adv_center_group),
+            'group_local_credit': bool(group_local_credit),
+            'point_marginal_credit': bool(point_marginal_credit),
+            'point_marginal_metric': point_marginal_metric,
+            'adv_mean': float(adv.mean().item()),
+            'adv_abs_mean': float(adv.abs().mean().item()),
+            'step_quality_std_mean': step_quality_std_mean,
+            'step_adv_abs_mean': step_adv_abs_mean,
+            'point_quality_std_mean': point_quality_std_mean,
+            'point_quality_nonzero_frac': point_quality_nonzero_frac,
+            'point_quality_abs_mean': point_quality_abs_mean,
+            'point_adv_abs_mean': point_adv_abs_mean,
+            'active_point_quality_std_mean': active_point_quality_std_mean,
+            'active_point_quality_nonzero_frac': active_point_quality_nonzero_frac,
+            'active_point_quality_abs_mean': active_point_quality_abs_mean,
+            'active_point_adv_abs_mean': active_point_adv_abs_mean,
             'reward_ema': float(ema_reward_val),
             'quality_best_mean': float(quality.max(dim=0).values.mean().item()),
             'quality_p10': percentiles(quality.flatten())['p10'],
@@ -2761,6 +3448,18 @@ def main():
             'grad_norm': float(grad_norm.detach().item() if torch.is_tensor(grad_norm) else grad_norm),
             'early_stop_epoch': int(early_stop_epoch),
             'action_policy': action_policy,
+            'freeze_gcn_backbone': bool(freeze_gcn_backbone),
+            'train_network': bool(train_network),
+            'group_schedule': group_schedule,
+            'group_ids_by_outer_step': rollout_group_ids,
+            'visited_group_ids_by_outer_step': [
+                group_id if outer_step in active_policy_steps else None
+                for outer_step, group_id in enumerate(rollout_group_ids or [])
+            ],
+            'group_visit_counts': list(group_visit_counts),
+            'group_visit_counts_by_outer_step': [
+                list(counts) for counts in group_visit_counts_by_outer_step
+            ],
             'df_step_mode': df_step_mode,
             'df_sde_type': df_sde_type,
             'df_noise_level': float(df_noise_level),
@@ -2769,6 +3468,7 @@ def main():
             'geom_sigma_px': [float(x) for x in sigma_px],
             'sigma_difficulty_multiplier': float(sigma_multiplier),
             'lr': lr,
+            'fm_velocity_lr': float(fmv_lr) if fm_velocity_policy is not None else 0.0,
         }
         for key, value in baseline_comps.items():
             metrics[f'baseline_{key}_mean'] = float(value.mean().item())
@@ -2794,7 +3494,7 @@ def main():
                 extra = f" eval_iou={eval_metrics['eval_iou']:.4f} mbf={eval_metrics['eval_mboundf']:.4f}"
             print(
                 f"[RL-V5] step={step}/{train_steps} reward={reward_mean:+.5f} "
-                f"best={metrics['quality_best_mean']:+.5f} "
+                f"rstd={reward_std_mean:.5f} best={metrics['quality_best_mean']:+.5f} "
                 f"dsig={sigma_multiplier:.2f} "
                 f"burr={metrics['burr_penalty_mean']:.3f} reg={metrics['regression_penalty_mean']:+.3f} "
                 f"detail={metrics.get('final_detail_score_mean', 0.0):+.3f} "

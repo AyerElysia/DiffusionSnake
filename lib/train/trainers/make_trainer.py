@@ -1,6 +1,8 @@
 from .trainer import Trainer
 import importlib.util
 import os
+import torch
+from torch.nn.parallel import DistributedDataParallel as DDP
 
 
 def _wrapper_factory(cfg, network):
@@ -30,8 +32,22 @@ def _wrapper_factory(cfg, network):
     return network_wrapper
 
 
-def make_trainer(cfg, network):
+def make_trainer(cfg, network, distributed=False, local_rank=None):
     network = _wrapper_factory(cfg, network)
+    if distributed:
+        if not torch.distributed.is_available() or not torch.distributed.is_initialized():
+            raise RuntimeError('distributed=True requires an initialized process group')
+        if local_rank is None:
+            local_rank = torch.distributed.get_rank()
+        network = DDP(
+            network,
+            device_ids=[int(local_rank)],
+            output_device=int(local_rank),
+            broadcast_buffers=True,
+            bucket_cap_mb=int(getattr(cfg, 'ddp_bucket_cap_mb', 25)),
+            find_unused_parameters=bool(getattr(cfg, 'ddp_find_unused_parameters', True)),
+            gradient_as_bucket_view=bool(getattr(cfg, 'ddp_gradient_as_bucket_view', True)),
+        )
     return Trainer(network)
 
 '''

@@ -1,0 +1,223 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<title>2D FM 曲线推理失败的理论根因分析</title>
+<style>
+body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Arial, sans-serif; margin: 0; color: #1f2933; background: #f7f9fb; line-height: 1.7; }
+main { max-width: 980px; margin: 0 auto; padding: 28px; background: #fff; }
+h1, h2, h3 { color: #0f172a; }
+h1 { font-size: 26px; margin-bottom: 4px; }
+h2 { margin-top: 36px; border-top: 1px solid #d9e2ec; padding-top: 22px; font-size: 20px; }
+h3 { font-size: 17px; margin-top: 20px; }
+code, pre { font-family: "SFMono-Regular", Consolas, monospace; }
+code { background: #f3f6f9; padding: 2px 5px; border-radius: 3px; font-size: 0.9em; }
+pre { white-space: pre-wrap; overflow-wrap: anywhere; background: #f3f6f9; border: 1px solid #d9e2ec; padding: 12px; border-radius: 6px; font-size: 0.85em; line-height: 1.5; }
+table { border-collapse: collapse; width: 100%; margin: 12px 0; }
+th, td { border: 1px solid #d9e2ec; padding: 7px 10px; vertical-align: top; }
+th { background: #edf2f7; text-align: left; }
+.ok { color: #0f766e; font-weight: 700; }
+.warn { color: #b45309; font-weight: 700; }
+.bad { color: #b91c1c; font-weight: 700; }
+.summary { background: #f0f7ff; border: 1px solid #bfdbfe; padding: 14px; border-radius: 6px; margin: 10px 0; }
+.formula { background: #faf5ff; border-left: 3px solid #a78bfa; padding: 10px 14px; margin: 10px 0; font-size: 0.9em; }
+.redblock { background: #fef2f2; border-left: 4px solid #dc2626; padding: 12px 16px; margin: 14px 0; font-size: 0.94em; }
+.greenblock { background: #f0fdf4; border-left: 4px solid #16a34a; padding: 12px 16px; margin: 14px 0; font-size: 0.94em; }
+</style>
+</head>
+<body>
+<main>
+
+<h1>2D FM 曲线推理失败的理论根因分析</h1>
+<p>日期：2026-06-26 &nbsp;|&nbsp; 上下文：曲线推理 IoU=0.087（vs 阶梯 0.8177）的理论解释</p>
+
+<div class="summary">
+<p><b>一句话结论：</b>当前训练模式<b>不是真正的 2D FM</b>，是"1D FM × 外部 rich-state 采样"。s 维度在训练时通过<b>外部推进 init</b> 实现（<code>i_init = init + s·d</code>），模型从未在同一个固定 init 上学过沿 s 方向连续演化。曲线推理违背这个隐含假设——它沿 s 移动但保持 init 不变——导致模型在严重 OOD 状态下评估。这不是 d̂ 数值误差，是结构性的训练-推理分布不匹配。</p>
+</div>
+
+<h2>1. 严格推导：训练时 s 是怎么进入的</h2>
+
+<p>训练 forward 主路径（<code>flow_matching_evolution.py:2274-2512</code>）按顺序执行：</p>
+
+<h3>1.1 初始化 i_init_train_py</h3>
+<pre>
+i_init_train_py = train_dict['i_it_py']   # 原始 init 轮廓（来自 octagon）
+x1_raw         = i_gt_py - i_init_train_py   # 完整位移 d = GT - init
+</pre>
+
+<h3>1.2 rich-state 采样推进 init（关键步骤）</h3>
+<pre>
+frac ~ rich_state_sampling()                  # s ∈ [0, 1]
+i_init_train_py = i_init_train_py + full_disp * frac   # ← 外部推进 init
+x1_raw         = full_disp * (1.0 - frac)              # ← 残差位移 (1-s)·d
+</pre>
+
+<div class="redblock">
+<b>关键事实：</b>训练时 <code>i_init_train_py</code> 被改成 <b>已经前进了 s·d 的轮廓</b>。模型在 <b>advanced init</b> 上做去噪，不是在原始 init 上。
+</div>
+
+<h3>1.3 采 feature 在 advanced init 上</h3>
+<pre>
+feat_poly = i_init_train_py                       # = init + s·d（advanced contour）
+sampled_feat = get_gcn_feature(cnn_feature, feat_poly, ...)
+</pre>
+
+<h3>1.4 FM 训练目标</h3>
+<pre>
+x1 = normalize(x1_raw) = (1-s)·d_normalized       # 残差（normalized）
+x0 = ε (随机噪声)
+x_t = (1-t)·ε + t·(1-s)·d_normalized
+v_target = x1 - x0 = (1-s)·d_normalized - ε
+模型输入: v_θ(x_t, s, t, feat_at_advanced_init)
+</pre>
+
+<h2>2. 训练时模型实际看到了什么</h2>
+
+<p>在训练点 <code>(s, t)</code>，模型同时收到：</p>
+<table>
+<tr><th>输入</th><th>值</th><th>含义</th></tr>
+<tr><td>init（即 i_init_train_py）</td><td><code>init + s·d</code></td><td>已前进 s·d 的轮廓</td></tr>
+<tr><td>feature</td><td>在 <code>init + s·d</code> 上采</td><td>advanced contour 周围的图像证据</td></tr>
+<tr><td>x_t</td><td><code>(1-t)·ε + t·(1-s)·d</code></td><td>残差位移的带噪插值</td></tr>
+<tr><td>s</td><td>frac</td><td>refinement 进度</td></tr>
+<tr><td>t</td><td>U[0,1]</td><td>去噪进度</td></tr>
+</table>
+
+<p><b>模型学到的映射：</b></p>
+<div class="formula">
+<pre>
+v_θ(x_t, s, t, feat(init+s·d)) ≈ (1-s)·d - ε
+</pre>
+</div>
+
+<p>这个映射的<b>隐含条件</b>是：模型看到的 init <b>已经前进了 s·d</b>。</p>
+
+<h2>3. 曲线推理时模型实际看到了什么</h2>
+
+<p>曲线推理（<code>sample_disp_curve</code>）沿 <code>(s(τ), t(τ))</code> 走。在点 <code>(s, t)</code>：</p>
+<table>
+<tr><th>输入</th><th>曲线推理传入</th><th>训练期望</th><th>匹配？</th></tr>
+<tr><td>init（i_it_py）</td><td><code>init</code>（原始，固定不变）</td><td><code>init + s·d</code></td><td class="bad">不匹配</td></tr>
+<tr><td>feature</td><td>在 <code>init + denorm(x_t)</code> 上采</td><td>在 <code>init + s·d</code> 上采</td><td class="bad">不匹配</td></tr>
+<tr><td>x_t</td><td><code>(1-t)·ε + t·(1-s)·d̂</code>（积分累积值）</td><td><code>(1-t)·ε + t·(1-s)·d</code></td><td>近似（含误差）</td></tr>
+<tr><td>s</td><td>当前 τ 对应的 s_val</td><td>当前 s</td><td class="ok">匹配</td></tr>
+<tr><td>t</td><td>当前 τ 对应的 t_val</td><td>当前 t</td><td class="ok">匹配</td></tr>
+</table>
+
+<div class="redblock">
+<b>根本不匹配：</b>曲线推理传入的 <code>i_it_py</code> 始终是<b>原始 init</b>，但训练时模型见到的 init 是 <code>init + s·d</code>。<br>
+<br>
+<b>举例：s=0.5, t=1 时</b><br>
+- 训练：模型看到 init=<code>init+0.5d</code>，x=0.5d，目标 v=0.5d-ε<br>
+- 曲线推理：模型看到 init=<code>init</code>，x≈0.5d̂，目标 v≈0.5d̂-ε<br>
+- 模型在原始 init 上看到 x=0.5d 的位移——这等价于 s=0（还没前进）但 x 已经是 0.5d，是<b>训练分布外</b>的输入。
+</div>
+
+<h2>4. 为什么阶梯推理却 work</h2>
+
+<p>阶梯推理（<code>sample_disp_iterative</code>）每步：</p>
+<pre>
+current_contour = i_it_py.clone()           # 初始 = 原始 init
+for each outer step:
+    feat = resample(current_contour)         # 在当前 contour 上采
+    disp = sample_disp_from_sampled_feat(...)  # 跑完整 t:0→1 ODE
+    current_contour = current_contour + frac * disp   # ← 推进 init！
+    cumulative_s += (1-cumulative_s) * frac   # s 推进
+</pre>
+
+<p>每个 outer step 结束后 <code>current_contour</code> 被<b>显式推进</b>——下一个 step 的 init 是 advanced contour，feature 在 advanced contour 上采。这正是训练时模型见到的分布！</p>
+
+<div class="greenblock">
+<b>阶梯推理 work 的原因：</b>它显式地推进 <code>current_contour</code>，让每个 outer step 的 init 和 feature 都匹配训练分布。曲线推理<b>没有推进 init</b>，只是在固定 init 上让 x 变化——和训练完全不一致。
+</div>
+
+<h2>5. 这就是"不是真二维"</h2>
+
+<p><b>真正的 2D FM</b> 应该是：</p>
+<div class="formula">
+<pre>
+状态: X(s, t) ∈ 物理坐标空间
+∂X/∂t = v_θ(X, s, t)           # t 方向：去噪（模型学）
+∂X/∂s = u_θ(X, s, t)           # s 方向：refine（模型也学）
+推理：沿任意曲线 (s(τ), t(τ)) 积分 dX/dτ
+</pre>
+</div>
+
+<p><b>当前的"伪 2D"：</b></p>
+<div class="formula">
+<pre>
+训练: s 是外部参数，通过推进 init 实现（不是模型的 s 方向速度）
+     只在 t 方向学 FM（1D FM × rich-state 参数化）
+推理: 沿任意 s 方向走时，必须外部推进 init——否则分布外
+     这只能做"分段 1D FM"（阶梯），不能做连续 2D 曲线
+</pre>
+</div>
+
+<p>s 维度<b>从未被模型内部化</b>：它只是一个告知模型的"进度标签"，实际 init 推进由外部代码完成。模型从来没有学过"在同一个 init 上，s 增加 → 残差自然减少"的连续演化。</p>
+
+<h2>6. 严格证明：曲线推理为何必然失败</h2>
+
+<p>令 <code>M(s, t, init_adv, x)</code> 表示模型在点 (s,t)、init_adv、输入 x 下的预测。训练目标：</p>
+<div class="formula">
+<pre>
+M(s, t, init+s·d, (1-t)ε+t(1-s)d) → (1-s)d - ε   (训练分布)
+</pre>
+</div>
+
+<p>曲线推理传入：</p>
+<div class="formula">
+<pre>
+M(s, t, init, x_curve(τ))   where x_curve evolves via Euler
+</pre>
+</div>
+
+<p>当 <code>s > 0</code> 时，<code>init ≠ init + s·d</code>。模型在<strong>从未见过的输入组合</strong>下评估。泛化保证只覆盖训练分布的支持集——<code>(init, s>0, x_t=正确的残差)</code> 不在支持集内（因为训练时 init 一旦不是原始 init，就是 <code>init+s·d</code>）。</p>
+
+<p><b>结论：</b>不存在一致的推理时欧拉方案能让曲线推理从当前训练的模型中正确工作，除非每个曲线点都显式推进 init（等价于阶梯）。这是<b>结构性的不匹配，不是数值噪声</b>。</p>
+
+<h2>7. 三种可能的解决方向</h2>
+
+<h3>7.1 方向 A：改训练范式为真 2D（最激进）</h3>
+<pre>
+训练时不再推进 init（i_init_train = 原始，不 advance）
+让 x_t = (1-t)ε + t·(1-s)·d   # 在固定 init 上
+模型在原始 init 上学习 s 方向连续演化
+特征在固定 init 上采（固定特征）
+→ 模型内部化 s 维度
+→ 推理时可以在固定 init 上走任意曲线
+</pre>
+<p><b>成本：</b>放弃 rich-state 训练带来的数据增广（init 在不同 s 下是不同轮廓），训练分布变窄。但可能让曲线推理成立。</p>
+
+<h3>7.2 方向 B：曲线推理时也推进 init（妥协方案）</h3>
+<pre>
+曲线推理也显式推进 init:
+    init_adv = init + cumulative_s · d̂
+    feat = resample(init_adv)
+    但这等价于阶梯 + 特征重采——和现有 iterative 推理一样
+→ 曲线推理没有独立意义
+</pre>
+<p><b>结论：</b>这个方向让曲线推理退化为阶梯，不增加新能力。</p>
+
+<h3>7.3 方向 C：让模型学 s 方向速度（真 2D FM）</h3>
+<pre>
+状态: X = init + x 是 contour 坐标
+训练目标新增: u_θ(X, s, t) ≈ ∂X/∂s = -t·d    # s 方向速度也学
+推理曲线: dX/dτ = v_θ·dt/dτ + u_θ·ds/dτ
+→ 不需要 d̂（因为 u_θ 自己估计了 s 方向速度）
+→ 训练是真正的 2D PDE 学习
+</pre>
+<p><b>成本：</b>需要改训练 loss 增加 s 方向项。但训练时 s 推进 init 的事实仍然存在——除非同时改为方向 A。</p>
+
+<h2>8. 我（Claude）的看法</h2>
+
+<p>当前实验已经验证了一个非常重要的事实：<b>显式 s-conditioning 加值显著</b>。1232_final 上 s_cond 200ep 阶梯 0.818 vs pretrain 3000ep 0.746，+7.1 个点。这个收益来自模型"知道自己在 refinement 的哪个阶段"，能各自策。</p>
+
+<p>但<b>这个收益不需要真 2D FM</b>——它只需要 s 作为条件标签，阶梯推理就能 extract 这个收益。曲线推理只是"如果真 2D 成立时"的额外红利。</p>
+
+<p>如果要追求真 2D 曲线推理，最干净的方向是 <b>方向 A（改训练范式）</b>：让 init 固定、s 是内部维度。但这放弃了 rich-state 的 init 增广，可能掉点。需要实验权衡。</p>
+
+<p>用户应该有自己的方向或对当前范式的本质看法——请告诉我你的想法。</p>
+
+</main>
+</body>
+</html>

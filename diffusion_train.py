@@ -9,7 +9,13 @@ import time
 import copy
 import sys
 import json
+import hashlib
+import math
+import random
+import traceback
+import uuid
 import logging
+from datetime import datetime
 from pathlib import Path
 import torch.distributed as dist
 from torch.nn.parallel import DistributedDataParallel as DDP
@@ -30,10 +36,8 @@ logger = logging.getLogger(__name__)
 
 # Training constants
 '''
-GRAD_CLIP_VALUE = 40.0:这个是梯度裁剪阈值。
-训练时如果梯度太大，模型参数更新会非常剧烈，可能导致训练崩掉。后面代码里有：
-torch.nn.utils.clip_grad_value_(trainer.network.parameters(), GRAD_CLIP_VALUE)
-意思是：如果梯度值超过 40.0，就把它限制住。
+cfg.train.gradient_clip controls global L2 gradient clipping with
+error_if_nonfinite=True. The pre-clip norm and applied coefficient are logged.
 
 TIME_SCALE_FACTOR = 1000.0这个是时间换算系数。
 Python 里的 time.time() 计算出来通常是“秒”，代码后面有：
@@ -47,10 +51,212 @@ DEFAULT_LR_GAMMA = 0.5
 这个是学习率衰减比例。
 如果学习率需要下降，就乘以 0.5，也就是变成原来的一半。
 '''
-GRAD_CLIP_VALUE = 40.0
 TIME_SCALE_FACTOR = 1000.0
 DEFAULT_WARMUP_START_FACTOR = 1e-3
 DEFAULT_LR_GAMMA = 0.5
+CHECKPOINT_FORMAT_VERSION = 2
+DEFAULT_STEP_CHECKPOINT_EVERY = 500
+DEFAULT_STEP_CHECKPOINT_KEEP = 3
+
+
+def _is_finite_value(value):
+    if isinstance(value, torch.Tensor):
+        return bool(torch.isfinite(value.detach()).all().item())
+    if isinstance(value, dict):
+        return all(_is_finite_value(item) for item in value.values())
+    if isinstance(value, (list, tuple)):
+        return all(_is_finite_value(item) for item in value)
+    if isinstance(value, (float, int)):
+        return math.isfinite(float(value))
+    return True
+
+
+def _scalar_float(value, field_name):
+    if isinstance(value, torch.Tensor):
+        if value.numel() != 1:
+            raise ValueError(f'{field_name} must be scalar, got shape={tuple(value.shape)}')
+        value = value.detach().item()
+    value = float(value)
+    if not math.isfinite(value):
+        raise FloatingPointError(f'{field_name} is non-finite: {value!r}')
+    return value
+
+
+def _loss_stats_to_floats(loss_stats):
+    if loss_stats is None:
+        return {}
+    if not isinstance(loss_stats, dict):
+        raise TypeError(f'loss_stats must be a dict, got {type(loss_stats).__name__}')
+    if not _is_finite_value(loss_stats):
+        raise FloatingPointError('loss_stats contains a non-finite value')
+
+    result = {}
+    for key, value in loss_stats.items():
+        field_name = f'loss_stats[{key!r}]'
+        if isinstance(value, torch.Tensor) and value.numel() != 1:
+            value = value.detach().float().mean()
+        result[str(key)] = _scalar_float(value, field_name)
+    return result
+
+
+_CRASH_CONTEXT = {}
+
+
+def _write_crash_event(exc):
+    path = os.environ.get('ONE_SAMPLE_CRASH_PATH', '').strip()
+    if not path:
+        path = os.path.join(_CRASH_CONTEXT.get('out_dir', 'data/outputs'), 'crash.jsonl')
+    event = {
+        'event': 'crash',
+        'run_id': _CRASH_CONTEXT.get('run_id'),
+        'cfg_hash': _CRASH_CONTEXT.get('cfg_hash'),
+        'timestamp': datetime.utcnow().isoformat(timespec='milliseconds') + 'Z',
+        'rank': _CRASH_CONTEXT.get('rank'),
+        'phase': _CRASH_CONTEXT.get('phase'),
+        'step': _CRASH_CONTEXT.get('step'),
+        'epoch': _CRASH_CONTEXT.get('epoch'),
+        'step_in_epoch': _CRASH_CONTEXT.get('step_in_epoch'),
+        'loss': _CRASH_CONTEXT.get('loss'),
+        'exception_type': type(exc).__name__,
+        'error': str(exc),
+        'traceback': traceback.format_exc(),
+    }
+    try:
+        os.makedirs(os.path.dirname(path) or '.', exist_ok=True)
+        with open(path, 'a', encoding='utf-8') as handle:
+            handle.write(json.dumps(event, ensure_ascii=False, allow_nan=False) + '\n')
+            handle.flush()
+    except Exception as write_exc:
+        logger.error('Failed to write crash JSONL: %s', write_exc)
+
+
+def _config_hash(config):
+    normalized = copy.deepcopy(config)
+    for key, value in (
+        ('resume', False),
+        ('resume_path', ''),
+        ('resume_weights_only', False),
+    ):
+        if key in normalized:
+            normalized[key] = value
+    return hashlib.sha256(normalized.dump().encode('utf-8')).hexdigest()
+
+
+def _capture_rng_state():
+    state = {
+        'python': random.getstate(),
+        'torch': torch.get_rng_state(),
+    }
+    if torch.cuda.is_available():
+        state['cuda'] = torch.cuda.get_rng_state_all()
+    try:
+        import numpy as np
+        state['numpy'] = np.random.get_state()
+    except ImportError:
+        pass
+    return state
+
+
+def _restore_rng_state(state):
+    if not isinstance(state, dict):
+        raise ValueError('checkpoint RNG state is missing or invalid')
+    random.setstate(state['python'])
+    torch.set_rng_state(state['torch'])
+    if 'cuda' in state and torch.cuda.is_available():
+        torch.cuda.set_rng_state_all(state['cuda'])
+    if 'numpy' in state:
+        import numpy as np
+        np.random.set_state(state['numpy'])
+
+
+def _adapter_parameters(module):
+    return [
+        (name, parameter)
+        for name, parameter in module.named_parameters()
+        if 'locate_feat_adapter' in name.lower() and parameter.requires_grad
+    ]
+
+
+def _adapter_metrics(module, before=None):
+    grad_sq = 0.0
+    grad_max = 0.0
+    weight_absmax = 0.0
+    update_sq = 0.0
+    update_max = 0.0
+    current = {}
+    grad_parameter_count = 0
+    adapter_parameters = _adapter_parameters(module)
+    for name, parameter in adapter_parameters:
+        weight = parameter.detach()
+        if not bool(torch.isfinite(weight).all().item()):
+            raise FloatingPointError(f'non-finite adapter weight: {name}')
+        weight_absmax = max(weight_absmax, float(weight.abs().max().item()))
+        current[name] = weight.clone()
+        if parameter.grad is not None:
+            grad_parameter_count += 1
+            grad = parameter.grad.detach()
+            if not bool(torch.isfinite(grad).all().item()):
+                raise FloatingPointError(f'non-finite adapter gradient: {name}')
+            grad_sq += float(torch.sum(grad * grad).item())
+            grad_max = max(grad_max, float(grad.abs().max().item()))
+        if before is not None and name in before:
+            delta = weight - before[name]
+            update_sq += float(torch.sum(delta * delta).item())
+            update_max = max(update_max, float(delta.abs().max().item()))
+    return {
+        'adapter_parameter_count': int(len(adapter_parameters)),
+        'adapter_grad_parameter_count': int(grad_parameter_count),
+        'adapter_grad_l2': float(grad_sq ** 0.5),
+        'adapter_grad_max': float(grad_max),
+        'adapter_weight_absmax': float(weight_absmax),
+        'adapter_update_l2': float(update_sq ** 0.5),
+        'adapter_update_max': float(update_max),
+    }, current
+
+
+def _batch_health_metrics(batch):
+    foreground_count = 0
+    contour_count = 0
+    foreground_ratio = 0.0
+    if isinstance(batch, dict):
+        mask = batch.get('ct_01')
+        if isinstance(mask, torch.Tensor):
+            valid = mask > 0.5
+            contour_count = int(valid.sum().item())
+            if valid.ndim >= 2 and valid.size(0) > 0:
+                foreground_samples = valid.any(dim=1)
+                foreground_count = int(foreground_samples.sum().item())
+                foreground_ratio = float(foreground_samples.float().mean().item())
+            elif valid.numel() > 0:
+                foreground_count = int(valid.any().item())
+                foreground_ratio = float(valid.any().item())
+        elif 'meta' in batch and isinstance(batch['meta'], dict):
+            count = batch['meta'].get('ct_num')
+            if isinstance(count, torch.Tensor):
+                count = count.detach().reshape(-1)
+                foreground_samples = count > 0
+                foreground_count = int(foreground_samples.sum().item())
+                contour_count = int(count.sum().item())
+                foreground_ratio = float(foreground_samples.float().mean().item()) if count.numel() else 0.0
+    return {
+        'foreground_count': int(foreground_count),
+        'foreground_ratio': float(foreground_ratio),
+        'contour_count': int(contour_count),
+    }
+
+
+def _cuda_health_metrics():
+    if not torch.cuda.is_available():
+        return {
+            'cuda_allocated_bytes': 0,
+            'cuda_reserved_bytes': 0,
+            'cuda_max_allocated_bytes': 0,
+        }
+    return {
+        'cuda_allocated_bytes': int(torch.cuda.memory_allocated()),
+        'cuda_reserved_bytes': int(torch.cuda.memory_reserved()),
+        'cuda_max_allocated_bytes': int(torch.cuda.max_memory_allocated()),
+    }
 
 '''
 尝试导入一些可选工具。
@@ -174,6 +380,38 @@ def main():
     except (AttributeError, TypeError) as e:
         logger.warning(f"Failed to get config file stem: {e}")
         _cfg_stem = 'default'
+
+    out_dir_override = os.environ.get('ONE_SAMPLE_OUT_DIR', '').strip()
+    out_dir = out_dir_override or os.path.join(os.path.dirname(__file__), 'data', 'outputs', _cfg_stem)
+    os.makedirs(out_dir, exist_ok=True)
+    run_id = os.environ.get('TRAIN_RUN_ID', '').strip() or uuid.uuid4().hex
+    if is_distributed:
+        run_id_object = [run_id if is_main_process else None]
+        dist.broadcast_object_list(
+            run_id_object,
+            src=0,
+            device=torch.device('cuda', local_rank),
+        )
+        run_id = str(run_id_object[0])
+    cfg_hash = _config_hash(cfg)
+    _CRASH_CONTEXT.update({
+        'run_id': run_id,
+        'cfg_hash': cfg_hash,
+        'out_dir': out_dir,
+        'rank': rank,
+    })
+    os.environ['ONE_SAMPLE_CRASH_PATH'] = os.path.join(out_dir, 'crash.jsonl')
+
+    accumulation_steps = int(getattr(cfg.train, 'gradient_accumulation_steps', 1))
+    if accumulation_steps != 1:
+        raise ValueError(
+            'gradient_accumulation_steps must be exactly 1 for health-safe training, '
+            f'got {accumulation_steps}'
+        )
+    configured_clip = getattr(cfg.train, 'gradient_clip', 1.0)
+    gradient_clip = float(configured_clip)
+    if not math.isfinite(gradient_clip) or gradient_clip <= 0.0:
+        raise ValueError(f'cfg.train.gradient_clip must be finite and > 0, got {gradient_clip!r}')
 
     try:
         train_name = getattr(cfg.train, 'dataset', None)
@@ -374,9 +612,26 @@ def main():
     os.makedirs(ckpt_dir, exist_ok=True)
 
     save_ep = int(getattr(cfg.train, 'save_ep', 0))
+    step_checkpoint_every = int(
+        os.environ.get(
+            'TRAIN_STEP_CHECKPOINT_EVERY',
+            getattr(cfg.train, 'step_checkpoint_every', DEFAULT_STEP_CHECKPOINT_EVERY),
+        )
+    )
+    step_checkpoint_keep = int(
+        os.environ.get(
+            'TRAIN_STEP_CHECKPOINT_KEEP',
+            getattr(cfg.train, 'step_checkpoint_keep', DEFAULT_STEP_CHECKPOINT_KEEP),
+        )
+    )
+    if step_checkpoint_every < 0 or step_checkpoint_keep <= 0:
+        raise ValueError('step checkpoint interval must be >= 0 and retention must be > 0')
     resume_step = 0
+    resume_epoch = 0
+    resume_step_in_epoch = 0
     resume_json_pos = None
     resume_checkpoint = None
+    strict_resume = False
     resume_path = os.environ.get('ONE_SAMPLE_RESUME_PATH', '').strip()
     if not resume_path:
         resume_path = str(getattr(cfg, 'resume_path', '') or '').strip()
@@ -437,6 +692,23 @@ def main():
         """Load checkpoint tensors conservatively, reusing exact matches and overlapping slices when possible."""
         if not isinstance(source_state_dict, dict):
             return None
+
+        raw_exclude_prefixes = getattr(cfg, 'resume_exclude_prefixes', [])
+        if isinstance(raw_exclude_prefixes, str):
+            exclude_prefixes = [item.strip() for item in raw_exclude_prefixes.split(',') if item.strip()]
+        elif isinstance(raw_exclude_prefixes, (list, tuple)):
+            exclude_prefixes = [str(item).strip() for item in raw_exclude_prefixes if str(item).strip()]
+        else:
+            raise TypeError('resume_exclude_prefixes must be a string, list, or tuple')
+        excluded_keys = []
+        if exclude_prefixes:
+            filtered_state_dict = {}
+            for key, value in source_state_dict.items():
+                if any(str(key).startswith(prefix) for prefix in exclude_prefixes):
+                    excluded_keys.append(str(key))
+                else:
+                    filtered_state_dict[key] = value
+            source_state_dict = filtered_state_dict
 
         target_state_dict = model_obj.state_dict()
         matched_state_dict = {}
@@ -504,6 +776,7 @@ def main():
             'skipped_shape': skipped_shape,
             'skipped_shape_keys': len(skipped_shape),
             'skipped_params': skipped_params,
+            'excluded_keys': excluded_keys,
             'missing_keys': list(getattr(incompatible, 'missing_keys', [])),
             'unexpected_keys': list(getattr(incompatible, 'unexpected_keys', [])),
             'unexpected_ckpt_keys': unexpected,
@@ -513,15 +786,62 @@ def main():
 
     if getattr(cfg, 'resume', False):
         candidate = resume_path if resume_path else os.path.join(ckpt_dir, 'latest.pt')
+        if not candidate or not os.path.exists(candidate):
+            message = f'formal resume checkpoint was not found: {candidate or "<empty path>"}'
+            if not resume_weights_only:
+                raise RuntimeError(message)
+            logger.error(message)
         if candidate and os.path.exists(candidate):
             try:
                 resume_checkpoint = torch.load(candidate, map_location='cpu')
                 logger.info(f"Loaded checkpoint from {candidate}")
             except (RuntimeError, FileNotFoundError) as e:
-                logger.error(f"Failed to load checkpoint from {candidate}: {e}")
+                if not resume_weights_only:
+                    raise RuntimeError(f"Failed to load formal resume checkpoint {candidate}: {e}") from e
+                logger.error(f"Failed to load weights-only checkpoint from {candidate}: {e}")
+                resume_checkpoint = None
+
+            if resume_checkpoint is not None and not isinstance(resume_checkpoint, dict):
+                message = (
+                    'resume checkpoint root must be a dict, '
+                    f'got {type(resume_checkpoint).__name__}'
+                )
+                if not resume_weights_only:
+                    raise RuntimeError(message)
+                logger.error(message)
                 resume_checkpoint = None
 
             if isinstance(resume_checkpoint, dict):
+                format_version = int(resume_checkpoint.get('format_version', 0) or 0)
+                strict_resume = (not resume_weights_only) and format_version >= CHECKPOINT_FORMAT_VERSION
+                if strict_resume:
+                    required_fields = (
+                        'format_version', 'run_id', 'cfg_hash', 'saved_at',
+                        'epoch', 'step', 'step_in_epoch', 'rng', 'state_dict',
+                        'optimizer', 'scheduler',
+                    )
+                    missing_fields = [key for key in required_fields if key not in resume_checkpoint]
+                    if missing_fields:
+                        raise RuntimeError(
+                            f"formal resume checkpoint is missing required fields: {missing_fields}"
+                        )
+                    if str(resume_checkpoint['cfg_hash']) != str(cfg_hash):
+                        raise RuntimeError(
+                            'formal resume cfg hash mismatch: '
+                            f"checkpoint={resume_checkpoint['cfg_hash']} current={cfg_hash}"
+                        )
+                    checkpoint_run_id = str(resume_checkpoint['run_id'])
+                    configured_run_id = os.environ.get('TRAIN_RUN_ID', '').strip()
+                    if not checkpoint_run_id:
+                        raise RuntimeError('formal resume checkpoint has an empty run_id')
+                    if configured_run_id and configured_run_id != checkpoint_run_id:
+                        raise RuntimeError(
+                            'formal resume run_id mismatch: '
+                            f'checkpoint={checkpoint_run_id} configured={configured_run_id}'
+                        )
+                    run_id = checkpoint_run_id
+                    _CRASH_CONTEXT['run_id'] = run_id
+
                 state_dict = resume_checkpoint.get('state_dict')
                 if state_dict is None:
                     state_dict = resume_checkpoint.get('model')
@@ -534,64 +854,92 @@ def main():
                 except ImportError:
                     logger.debug("Legacy state dict remapping not available")
 
-                try:
-                    model_to_load = trainer.network.module if hasattr(trainer.network, 'module') else trainer.network
-                    load_report = _safe_load_model_state(model_to_load, state_dict)
-                    if load_report is None:
-                        raise RuntimeError("checkpoint state_dict is not a dict")
+                model_to_load = trainer.network.module if hasattr(trainer.network, 'module') else trainer.network
+                if strict_resume:
+                    if not isinstance(state_dict, dict):
+                        raise RuntimeError('formal resume state_dict is not a dict')
+                    model_to_load.load_state_dict(state_dict, strict=True)
+                    logger.info('Strictly restored model state from formal checkpoint.')
+                else:
+                    try:
+                        load_report = _safe_load_model_state(model_to_load, state_dict)
+                        if load_report is None:
+                            raise RuntimeError("checkpoint state_dict is not a dict")
 
-                    logger.info(
-                        "Partial checkpoint init: "
-                        f"matched_keys={load_report['matched_keys']} "
-                        f"exact_match_keys={load_report['exact_match_keys']} "
-                        f"partial_copy_keys={load_report['partial_copy_keys']} "
-                        f"matched_params={load_report['matched_params']} "
-                        f"exact_match_params={load_report['exact_match_params']} "
-                        f"partial_copy_params={load_report['partial_copy_params']} "
-                        f"skipped_shape_keys={load_report['skipped_shape_keys']} "
-                        f"skipped_params={load_report['skipped_params']} "
-                        f"missing_after_load={len(load_report['missing_keys'])} "
-                        f"unexpected_ckpt_keys={len(load_report['unexpected_ckpt_keys'])}"
-                    )
-
-                    critical_missing = [
-                        k for k in load_report['missing_keys']
-                        if any(x in k for x in ['yolo', 'gcn', 'denoiser'])
-                    ]
-                    if load_report['matched_keys'] == 0:
-                        logger.error("Checkpoint init matched zero parameter tensors.")
-                    if critical_missing:
-                        logger.warning(
-                            f"Critical modules still partially uninitialized ({len(critical_missing)} keys): "
-                            f"{critical_missing[:10]}..."
-                        )
-                    if load_report['skipped_shape_keys']:
-                        logger.warning(
-                            "Shape-mismatched checkpoint tensors were skipped: "
-                            f"{load_report['skipped_shape'][:5]}..."
-                        )
-                    if load_report['partial_copy_keys']:
                         logger.info(
-                            "Partially copied checkpoint tensors into larger target shapes: "
-                            f"{load_report['partially_copied'][:5]}..."
+                            "Partial checkpoint init: "
+                            f"matched_keys={load_report['matched_keys']} "
+                            f"exact_match_keys={load_report['exact_match_keys']} "
+                            f"partial_copy_keys={load_report['partial_copy_keys']} "
+                            f"matched_params={load_report['matched_params']} "
+                            f"exact_match_params={load_report['exact_match_params']} "
+                            f"partial_copy_params={load_report['partial_copy_params']} "
+                            f"skipped_shape_keys={load_report['skipped_shape_keys']} "
+                            f"skipped_params={load_report['skipped_params']} "
+                            f"excluded_keys={len(load_report['excluded_keys'])} "
+                            f"missing_after_load={len(load_report['missing_keys'])} "
+                            f"unexpected_ckpt_keys={len(load_report['unexpected_ckpt_keys'])}"
                         )
-                    if load_report['unexpected_ckpt_keys']:
-                        logger.warning(
-                            f"Unexpected checkpoint keys ({len(load_report['unexpected_ckpt_keys'])} total): "
-                            f"{load_report['unexpected_ckpt_keys'][:5]}..."
-                        )
-                except RuntimeError as e:
-                    logger.error(f"Failed to load model state dict: {e}")
 
-                if (not resume_weights_only) and ('optimizer' in resume_checkpoint):
-                    _safe_load_optimizer_state(optimizer, resume_checkpoint['optimizer'])
+                        critical_missing = [
+                            k for k in load_report['missing_keys']
+                            if any(x in k for x in ['yolo', 'gcn', 'denoiser'])
+                        ]
+                        if load_report['matched_keys'] == 0:
+                            logger.error("Checkpoint init matched zero parameter tensors.")
+                        if critical_missing:
+                            logger.warning(
+                                f"Critical modules still partially uninitialized ({len(critical_missing)} keys): "
+                                f"{critical_missing[:10]}..."
+                            )
+                        if load_report['skipped_shape_keys']:
+                            logger.warning(
+                                "Shape-mismatched checkpoint tensors were skipped: "
+                                f"{load_report['skipped_shape'][:5]}..."
+                            )
+                        if load_report['partial_copy_keys']:
+                            logger.info(
+                                "Partially copied checkpoint tensors into larger target shapes: "
+                                f"{load_report['partially_copied'][:5]}..."
+                            )
+                        if load_report['unexpected_ckpt_keys']:
+                            logger.warning(
+                                f"Unexpected checkpoint keys ({len(load_report['unexpected_ckpt_keys'])} total): "
+                                f"{load_report['unexpected_ckpt_keys'][:5]}..."
+                            )
+                        if load_report['excluded_keys']:
+                            logger.info(
+                                f"Excluded checkpoint tensors ({len(load_report['excluded_keys'])} total): "
+                                f"{load_report['excluded_keys'][:5]}..."
+                            )
+                    except RuntimeError as e:
+                        logger.error(f"Failed to load historical model state dict: {e}")
+
+                if not resume_weights_only:
+                    if 'optimizer' not in resume_checkpoint:
+                        logger.warning('Historical checkpoint has no optimizer state; using fresh optimizer.')
+                    elif strict_resume:
+                        optimizer.load_state_dict(resume_checkpoint['optimizer'])
+                    elif not _safe_load_optimizer_state(optimizer, resume_checkpoint['optimizer']):
+                        logger.warning('Historical optimizer state was not compatible; using fresh optimizer.')
 
                 if resume_weights_only:
                     resume_step = 0
+                    resume_epoch = 0
+                    resume_step_in_epoch = 0
                     logger.info("Weights-only resume enabled: optimizer, scheduler, and step state were reset.")
                 else:
                     resume_step = int(resume_checkpoint.get('step', 0))
-                    logger.info(f"Resuming from step {resume_step}")
+                    resume_epoch = int(resume_checkpoint.get('epoch', 0))
+                    resume_step_in_epoch = int(resume_checkpoint.get('step_in_epoch', 0))
+                    if resume_step < 0 or resume_epoch < 0 or resume_step_in_epoch < 0:
+                        raise RuntimeError('resume checkpoint has negative progress metadata')
+                    if strict_resume:
+                        _restore_rng_state(resume_checkpoint['rng'])
+                    logger.info(
+                        f"Resuming from epoch={resume_epoch}, step={resume_step}, "
+                        f"step_in_epoch={resume_step_in_epoch}, strict={strict_resume}"
+                    )
 
     def _find_jsonl_truncate_pos(jsonl_path: str, keep_step: int):
         """Return byte position to truncate jsonl so that all remaining lines satisfy step <= keep_step."""
@@ -675,6 +1023,92 @@ def main():
 
     def _count_trainable_params(module: torch.nn.Module) -> int:
         return sum(p.numel() for p in module.parameters() if p.requires_grad)
+
+    def _healthy_optimizer_step(
+        network_obj,
+        optimizer_obj,
+        scheduler_obj,
+        batch_obj,
+        loss_obj,
+        loss_stats_obj,
+        phase_name,
+        epoch_index,
+        step_index,
+    ):
+        loss_obj = loss_obj.mean() if isinstance(loss_obj, torch.Tensor) else loss_obj
+        loss_value = _scalar_float(loss_obj, 'total loss')
+        stats_values = _loss_stats_to_floats(loss_stats_obj)
+        if not _is_finite_value(stats_values):
+            raise FloatingPointError('loss_stats contains a non-finite value')
+        if not isinstance(loss_obj, torch.Tensor) or not loss_obj.requires_grad:
+            raise RuntimeError('total loss does not require gradients')
+
+        _CRASH_CONTEXT.update({
+            'phase': str(phase_name),
+            'epoch': int(epoch_index),
+            'step_in_epoch': int(step_index),
+        })
+        optimizer_obj.zero_grad(set_to_none=True)
+        loss_obj.backward()
+
+        trainable_parameters = [
+            parameter for parameter in network_obj.parameters() if parameter.requires_grad
+        ]
+        total_l2_sq = 0.0
+        grad_max = 0.0
+        for parameter in trainable_parameters:
+            if parameter.grad is None:
+                continue
+            gradient = parameter.grad.detach()
+            gradient_values = gradient.coalesce().values() if gradient.is_sparse else gradient
+            if not bool(torch.isfinite(gradient_values).all().item()):
+                raise FloatingPointError('gradient contains a non-finite value')
+            total_l2_sq += float(torch.sum(gradient_values * gradient_values).item())
+            grad_max = max(grad_max, float(gradient_values.abs().max().item()))
+        preclip_l2 = float(total_l2_sq ** 0.5)
+        adapter_before_metrics, adapter_before = _adapter_metrics(network_obj)
+        clipped_norm = torch.nn.utils.clip_grad_norm_(
+            trainable_parameters,
+            max_norm=gradient_clip,
+            error_if_nonfinite=True,
+        )
+        preclip_l2 = _scalar_float(clipped_norm, 'preclip gradient norm')
+        clip_coefficient = 1.0 if preclip_l2 <= gradient_clip or preclip_l2 == 0.0 else gradient_clip / preclip_l2
+        optimizer_obj.step()
+        if scheduler_obj is not None:
+            scheduler_obj.step()
+
+        adapter_after_metrics, _ = _adapter_metrics(network_obj, before=adapter_before)
+        lr_values = [
+            _scalar_float(group.get('lr'), 'learning rate')
+            for group in optimizer_obj.param_groups
+        ]
+        adapter_after_metrics['adapter_grad_l2'] = adapter_before_metrics['adapter_grad_l2']
+        adapter_after_metrics['adapter_grad_max'] = adapter_before_metrics['adapter_grad_max']
+        adapter_after_metrics['moonvit_adapter_grad_l2'] = adapter_before_metrics['adapter_grad_l2']
+        adapter_after_metrics['moonvit_adapter_grad_max'] = adapter_before_metrics['adapter_grad_max']
+        adapter_after_metrics['moonvit_adapter_weight_absmax'] = adapter_after_metrics['adapter_weight_absmax']
+        adapter_after_metrics['moonvit_adapter_update_l2'] = adapter_after_metrics['adapter_update_l2']
+        adapter_after_metrics['moonvit_adapter_update_max'] = adapter_after_metrics['adapter_update_max']
+        health = {
+            'loss': loss_value,
+            'loss_stats': stats_values,
+            'grad_l2': preclip_l2,
+            'grad_max': float(grad_max),
+            'preclip_grad_l2': preclip_l2,
+            'preclip_grad_max': float(grad_max),
+            'grad_clip_coefficient': float(clip_coefficient),
+            'lr_min': min(lr_values) if lr_values else 0.0,
+            'lr_max': max(lr_values) if lr_values else 0.0,
+            'scheduler_last_epoch': int(scheduler_obj.last_epoch) if scheduler_obj is not None else -1,
+            **adapter_after_metrics,
+            **_batch_health_metrics(batch_obj),
+            **_cuda_health_metrics(),
+        }
+        health['cuda_allocated'] = health['cuda_allocated_bytes']
+        health['cuda_reserved'] = health['cuda_reserved_bytes']
+        health['cuda_max_allocated'] = health['cuda_max_allocated_bytes']
+        return health
 
     def _set_phase(wrapper, phase: str):
         """phase in {'det', 'diff'}; toggle freeze flags and requires_grad to match."""
@@ -772,28 +1206,17 @@ def main():
             batch = move_batch_to_cuda(batch)
             t0 = time.time()
             output, loss, loss_stats, _ = trainer.network(batch)
-            loss = loss.mean()
-            optimizer_p.zero_grad(set_to_none=True)
-            if loss.requires_grad:
-                loss.backward()
-
-            # gradient stats
-            total_l2 = 0.0
-            max_abs = 0.0
-            with torch.no_grad():
-                for p in trainer.network.parameters():
-                    if p.grad is None:
-                        continue
-                    g = p.grad
-                    total_l2 += float(torch.sum(g.detach() * g.detach()).item())
-                    max_abs = max(max_abs, float(g.detach().abs().max().item()))
-            total_l2 = float(total_l2 ** 0.5)
-
-            torch.nn.utils.clip_grad_value_(trainer.network.parameters(), GRAD_CLIP_VALUE)
-            optimizer_p.step()
-            if scheduler_p is not None:
-                # MultiStepLR 或 diffusers 的 scheduler 都支持每步 step
-                scheduler_p.step()
+            health = _healthy_optimizer_step(
+                trainer.network,
+                optimizer_p,
+                scheduler_p,
+                batch,
+                loss,
+                loss_stats,
+                phase_name,
+                0,
+                step,
+            )
 
             # periodic inference visualization (Diffusion phase only)
             diff_viz_interval = int(os.environ.get('ONE_SAMPLE_DIFF_VIZ_INTERVAL', '0'))
@@ -806,29 +1229,16 @@ def main():
                 safe_barrier(is_distributed)
 
             dt = time.time() - t0
-            # json logging per step
-            lr = optimizer_p.param_groups[0].get('lr', None)
-            lr = float(lr) if lr is not None else None
-
             entry = {
+                'run_id': str(run_id),
+                'timestamp': datetime.utcnow().isoformat(timespec='milliseconds') + 'Z',
                 'phase': str(phase_name),
                 'step': int(step),
                 'total_steps': int(steps),
-                'loss': float(loss.item()),
-                'lr': lr,
-                'grad_l2': float(total_l2),
-                'grad_max': float(max_abs),
-                'time_ms': float(dt * TIME_SCALE_FACTOR)
+                'time_ms': float(dt * TIME_SCALE_FACTOR),
+                **health,
             }
-            # include loss stats if dict
-            if isinstance(loss_stats, dict):
-                safe_stats = {}
-                for k, v in loss_stats.items():
-                    try:
-                        safe_stats[k] = float(getattr(v, 'item', lambda: v)())
-                    except Exception:
-                        pass
-                entry['loss_stats'] = safe_stats
+            _CRASH_CONTEXT.update({'step': int(step), 'loss': health['loss']})
             json_logger.log(entry)
 
             # explicit cleanup
@@ -862,33 +1272,64 @@ def main():
             return SequentialLR(optimizer_obj, schedulers=[warmup, main_sched], milestones=[int(warmup_steps)])
         return MultiStepLR(optimizer_obj, milestones=milestones, gamma=gamma)
 
-    def _save_checkpoint(step: int, scheduler_obj, total_steps: int = None, epoch: int = None):
+    def _atomic_torch_save(payload, path):
+        path = os.path.abspath(path)
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        tmp_path = f'{path}.tmp.{os.getpid()}'
+        try:
+            with open(tmp_path, 'wb') as handle:
+                torch.save(payload, handle)
+                handle.flush()
+                os.fsync(handle.fileno())
+            os.replace(tmp_path, path)
+        finally:
+            if os.path.exists(tmp_path):
+                os.remove(tmp_path)
+
+    def _save_checkpoint(
+        step: int,
+        scheduler_obj,
+        total_steps: int = None,
+        epoch: int = None,
+        step_in_epoch: int = 0,
+        step_file: bool = False,
+    ):
         if not is_main_process:
             return
         model_to_save = trainer.network.module if hasattr(trainer.network, 'module') else trainer.network
         ckpt = {
+            'format_version': CHECKPOINT_FORMAT_VERSION,
+            'run_id': str(run_id),
+            'cfg_hash': str(cfg_hash),
+            'saved_at': datetime.utcnow().isoformat(timespec='milliseconds') + 'Z',
             'state_dict': model_to_save.state_dict(),
             'optimizer': optimizer.state_dict(),
+            'scheduler': scheduler_obj.state_dict() if scheduler_obj is not None else None,
             'step': int(step),
+            'step_in_epoch': int(step_in_epoch),
+            'rng': _capture_rng_state(),
         }
         if epoch is not None:
-            try:
-                ckpt['epoch'] = int(epoch)
-            except Exception:
-                pass
-        if scheduler_obj is not None:
-            try:
-                ckpt['scheduler'] = scheduler_obj.state_dict()
-            except Exception:
-                pass
+            ckpt['epoch'] = int(epoch)
         if total_steps is not None:
             ckpt['total_steps'] = int(total_steps)
-        if epoch is not None:
-            ckpt_path = os.path.join(ckpt_dir, f'ep{int(epoch)}_st{int(step)}_{time.strftime("%m%d_%H%M")}.pt')
-        else:
+
+        if step_file:
             ckpt_path = os.path.join(ckpt_dir, f'step_{int(step)}.pt')
-        torch.save(ckpt, ckpt_path)
-        torch.save(ckpt, os.path.join(ckpt_dir, 'latest.pt'))
+            _atomic_torch_save(ckpt, ckpt_path)
+            step_paths = sorted(
+                Path(ckpt_dir).glob('step_*.pt'),
+                key=lambda item: int(item.stem.split('_', 1)[1]),
+            )
+            for old_path in step_paths[:-step_checkpoint_keep]:
+                old_path.unlink()
+        elif epoch is not None:
+            ckpt_path = os.path.join(
+                ckpt_dir,
+                f'ep{int(epoch)}_st{int(step)}_{time.strftime("%m%d_%H%M")}.pt',
+            )
+            _atomic_torch_save(ckpt, ckpt_path)
+        _atomic_torch_save(ckpt, os.path.join(ckpt_dir, 'latest.pt'))
 
 
     def _set_yolo_trainable(wrapper, trainable: bool):
@@ -942,11 +1383,33 @@ def main():
         except Exception:
             max_train_steps = 0
         if max_train_steps > 0:
-            total_steps = min(total_steps, int(resume_step) + max_train_steps)
-            logger.info(f"Limiting this run to max_steps={max_train_steps}; stop_step={total_steps}")
+            total_steps = min(total_steps, max_train_steps)
+            logger.info(f"Limiting training to absolute max_steps={max_train_steps}; stop_step={total_steps}")
         global_step = int(resume_step)
-        start_epoch = int(global_step // steps_per_epoch)
-        start_step_in_epoch = int(global_step % steps_per_epoch)
+        if strict_resume:
+            expected_step = int(resume_epoch * steps_per_epoch + resume_step_in_epoch)
+            if global_step != expected_step:
+                raise RuntimeError(
+                    'formal resume progress is inconsistent: '
+                    f'step={global_step}, epoch={resume_epoch}, '
+                    f'step_in_epoch={resume_step_in_epoch}, '
+                    f'steps_per_epoch={steps_per_epoch}'
+                )
+            start_epoch = int(resume_epoch)
+            start_step_in_epoch = int(resume_step_in_epoch)
+            if start_step_in_epoch >= steps_per_epoch:
+                start_epoch += int(start_step_in_epoch // steps_per_epoch)
+                start_step_in_epoch = int(start_step_in_epoch % steps_per_epoch)
+        else:
+            start_epoch = int(global_step // steps_per_epoch)
+            start_step_in_epoch = int(global_step % steps_per_epoch)
+        if global_step >= total_steps:
+            logger.info(
+                f"Checkpoint already reached stop_step={total_steps}; "
+                "no optimization steps are required."
+            )
+            start_epoch = num_epochs
+            start_step_in_epoch = 0
 
         try:
             eta_min = float(getattr(cfg.train, 'eta_min', 0.0))
@@ -961,6 +1424,39 @@ def main():
         disable_scheduler = bool(getattr(cfg.train, 'disable_scheduler', False))
         if disable_scheduler:
             logger.info("LR scheduler disabled; using optimizer checkpoint/current LR.")
+        scheduler_resume_state = None
+        if (not resume_weights_only) and isinstance(resume_checkpoint, dict):
+            scheduler_resume_state = resume_checkpoint.get('scheduler')
+            if strict_resume and not disable_scheduler and scheduler_resume_state is None:
+                raise RuntimeError('formal resume checkpoint has no scheduler state')
+
+        scheduler_base_lrs = None
+        if isinstance(scheduler_resume_state, dict):
+            scheduler_base_lrs = scheduler_resume_state.get('base_lrs')
+            if scheduler_base_lrs is None:
+                nested_schedulers = scheduler_resume_state.get('_schedulers')
+                if nested_schedulers and isinstance(nested_schedulers[0], dict):
+                    scheduler_base_lrs = nested_schedulers[0].get('base_lrs')
+
+        if global_step > 0:
+            missing_initial_lrs = 0
+            for index, param_group in enumerate(optimizer.param_groups):
+                if 'initial_lr' in param_group:
+                    continue
+                missing_initial_lrs += 1
+                fallback_lr = param_group.get('lr')
+                if isinstance(scheduler_base_lrs, (list, tuple)) and index < len(scheduler_base_lrs):
+                    fallback_lr = scheduler_base_lrs[index]
+                param_group['initial_lr'] = _scalar_float(
+                    fallback_lr,
+                    f'initial learning rate for parameter group {index}',
+                )
+            if missing_initial_lrs:
+                logger.warning(
+                    'Resume optimizer checkpoint omitted initial_lr for '
+                    f'{missing_initial_lrs} parameter groups; restored scheduler base_lrs when available.'
+                )
+
         if total_steps > 0 and not disable_scheduler:
             warmup_steps = int(getattr(cfg.train, 'warmup_steps', 0))
             if warmup_steps > 0:
@@ -992,16 +1488,26 @@ def main():
                     eta_min=float(eta_min),
                     last_epoch=int(global_step - 1),
                 )
-            if (not resume_weights_only) and isinstance(resume_checkpoint, dict) and 'scheduler' in resume_checkpoint:
-                try:
-                    scheduler.load_state_dict(resume_checkpoint['scheduler'])
-                    restored_lrs = scheduler.get_last_lr()
-                    if len(restored_lrs) == len(optimizer.param_groups):
+            if (not resume_weights_only) and isinstance(resume_checkpoint, dict):
+                scheduler_state = resume_checkpoint.get('scheduler')
+                if strict_resume and scheduler_state is None:
+                    raise RuntimeError('formal resume checkpoint has no scheduler state')
+                if scheduler_state is not None:
+                    try:
+                        scheduler.load_state_dict(scheduler_state)
+                        restored_lrs = scheduler.get_last_lr()
+                        if len(restored_lrs) != len(optimizer.param_groups):
+                            raise RuntimeError(
+                                'scheduler/optimizer parameter-group count mismatch: '
+                                f'{len(restored_lrs)} != {len(optimizer.param_groups)}'
+                            )
                         for param_group, lr in zip(optimizer.param_groups, restored_lrs):
-                            param_group['lr'] = float(lr)
+                            param_group['lr'] = _scalar_float(lr, 'restored learning rate')
                         logger.info(f"Restored scheduler LR: {restored_lrs[0]:.8g}")
-                except Exception:
-                    pass
+                    except Exception:
+                        if strict_resume:
+                            raise
+                        logger.warning('Historical scheduler state was not compatible; using current scheduler.')
 
         for epoch in range(start_epoch, num_epochs):
             # Freeze detection head after a chosen epoch boundary.
@@ -1035,29 +1541,34 @@ def main():
                     batch = next(data_iter)
                 batch = move_batch_to_cuda(batch)
                 t0 = time.time()
+                _CRASH_CONTEXT.update({
+                    'phase': 'one_stage',
+                    'step': int(global_step + 1),
+                    'epoch': int(epoch),
+                    'step_in_epoch': int(step_in_epoch + 1),
+                    'loss': None,
+                })
 
                 output, loss, loss_stats, _ = trainer.network(batch)
-                loss = loss.mean()
-                optimizer.zero_grad(set_to_none=True)
-                loss.backward()
-
-                total_l2 = 0.0
-                max_abs = 0.0
-                with torch.no_grad():
-                    for p in trainer.network.parameters():
-                        if p.grad is None:
-                            continue
-                        g = p.grad
-                        total_l2 += float(torch.sum(g.detach() * g.detach()).item())
-                        max_abs = max(max_abs, float(g.detach().abs().max().item()))
-                total_l2 = float(total_l2 ** 0.5)
-
-                torch.nn.utils.clip_grad_value_(trainer.network.parameters(), GRAD_CLIP_VALUE)
-                optimizer.step()
-                if scheduler is not None:
-                    scheduler.step()
+                health = _healthy_optimizer_step(
+                    trainer.network,
+                    optimizer,
+                    scheduler,
+                    batch,
+                    loss,
+                    loss_stats,
+                    'one_stage',
+                    epoch,
+                    step_in_epoch + 1,
+                )
 
                 global_step += 1
+                _CRASH_CONTEXT.update({
+                    'step': int(global_step),
+                    'epoch': int(epoch),
+                    'step_in_epoch': int(step_in_epoch + 1),
+                    'loss': health['loss'],
+                })
                 dt = time.time() - t0
                 stop_after_step = max_train_steps > 0 and global_step >= total_steps
 
@@ -1072,31 +1583,18 @@ def main():
                             trainer.network.train()
                     safe_barrier(is_distributed)
 
-                # json logging per step
-                lr = optimizer.param_groups[0].get('lr', None)
-                lr = float(lr) if lr is not None else None
-
                 entry = {
+                    'run_id': str(run_id),
+                    'timestamp': datetime.utcnow().isoformat(timespec='milliseconds') + 'Z',
                     'phase': 'one_stage',
                     'epoch': int(epoch),
                     'step_in_epoch': int(step_in_epoch + 1),
                     'steps_per_epoch': int(steps_per_epoch),
                     'step': int(global_step),
                     'total_steps': int(total_steps),
-                    'loss': float(loss.item()),
-                    'lr': lr,
-                    'grad_l2': float(total_l2),
-                    'grad_max': float(max_abs),
-                    'time_ms': float(dt * TIME_SCALE_FACTOR)
+                    'time_ms': float(dt * TIME_SCALE_FACTOR),
+                    **health,
                 }
-                if isinstance(loss_stats, dict):
-                    safe_stats = {}
-                    for k, v in loss_stats.items():
-                        try:
-                            safe_stats[k] = float(getattr(v, 'item', lambda: v)())
-                        except Exception:
-                            pass
-                    entry['loss_stats'] = safe_stats
                 json_logger.log(entry)
 
                 if wandb_run is not None:
@@ -1109,6 +1607,19 @@ def main():
                         wandb.log(wandb_payload, step=int(global_step))
                     except Exception:
                         pass
+
+                if step_checkpoint_every > 0 and global_step % step_checkpoint_every == 0:
+                    safe_barrier(is_distributed)
+                    if is_main_process:
+                        _save_checkpoint(
+                            global_step,
+                            scheduler,
+                            total_steps=total_steps,
+                            epoch=epoch,
+                            step_in_epoch=step_in_epoch + 1,
+                            step_file=True,
+                        )
+                    safe_barrier(is_distributed)
 
                 del output, loss, loss_stats, batch
                 torch.cuda.empty_cache()
@@ -1125,7 +1636,13 @@ def main():
             if do_save_epoch:
                 safe_barrier(is_distributed)
                 if is_main_process:
-                    _save_checkpoint(global_step, scheduler, total_steps=total_steps, epoch=(epoch + 1))
+                    _save_checkpoint(
+                        global_step,
+                        scheduler,
+                        total_steps=total_steps,
+                        epoch=epoch,
+                        step_in_epoch=step_in_epoch + 1,
+                    )
                 safe_barrier(is_distributed)
 
             start_step_in_epoch = 0
@@ -1158,4 +1675,8 @@ def main():
 
 
 if __name__ == '__main__':
-    main()
+    try:
+        main()
+    except BaseException as exc:
+        _write_crash_event(exc)
+        raise

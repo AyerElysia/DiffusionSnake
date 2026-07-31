@@ -1,0 +1,366 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<title>2D Flow Matching 曲线推理路径理论分析</title>
+<style>
+body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Arial, sans-serif; margin: 0; color: #1f2933; background: #f7f9fb; line-height: 1.7; }
+main { max-width: 980px; margin: 0 auto; padding: 28px; background: #fff; }
+h1, h2, h3 { color: #0f172a; }
+h1 { font-size: 28px; margin-bottom: 4px; }
+h2 { margin-top: 36px; border-top: 1px solid #d9e2ec; padding-top: 22px; font-size: 22px; }
+h3 { font-size: 18px; margin-top: 24px; }
+code, pre { font-family: "SFMono-Regular", Consolas, monospace; }
+code { background: #f3f6f9; padding: 2px 6px; border-radius: 3px; font-size: 0.9em; }
+pre { white-space: pre-wrap; overflow-wrap: anywhere; background: #f3f6f9; border: 1px solid #d9e2ec; padding: 14px; border-radius: 6px; font-size: 0.88em; line-height: 1.5; }
+table { border-collapse: collapse; width: 100%; margin: 14px 0; }
+th, td { border: 1px solid #d9e2ec; padding: 8px 12px; vertical-align: top; }
+th { background: #edf2f7; text-align: left; }
+.ok { color: #0f766e; font-weight: 700; }
+.warn { color: #b45309; font-weight: 700; }
+.bad { color: #b91c1c; font-weight: 700; }
+.summary { background: #f0f7ff; border: 1px solid #bfdbfe; padding: 16px; border-radius: 6px; margin: 12px 0; }
+.formula { background: #faf5ff; border-left: 3px solid #a78bfa; padding: 12px 16px; margin: 14px 0; font-size: 0.92em; }
+.note { background: #fefce8; border-left: 3px solid #facc15; padding: 10px 14px; margin: 12px 0; font-size: 0.92em; }
+.risk { background: #fef2f2; border-left: 3px solid #f87171; padding: 10px 14px; margin: 12px 0; font-size: 0.92em; }
+.svg-container { text-align: center; margin: 20px 0; }
+.svg-container svg { max-width: 100%; }
+</style>
+</head>
+<body>
+<main>
+
+<h1>2D Flow Matching 曲线推理路径理论分析</h1>
+<p>日期：2026-06-26 &nbsp;|&nbsp; 上下文：V4.6c 位移流 + 2D s-conditioning 改造</p>
+
+<div class="summary">
+<p><b>结论先行：</b>在 2D FM <code>(s, t)</code> 面上走一条下凸曲线（t 轴先快走、s 轴后快走）在理论上<b>可行且 well-posed</b>。它消除了阶梯路径（当前 iterative refinement）每步从噪声重新去噪的浪费，同时保持每步 contour 的物理意义和 feature resampling 的有效性。主要风险是 s 方向速度依赖 <code>d̂</code>（位移估计），误差会沿曲线累积——但下凸曲线的设计让 t 先到高位，使 <code>d̂</code> 在 s 开始快走时已经足够准，从结构上抑制了这个风险。</p>
+</div>
+
+<h2>1. 2D FM 面的完整定义</h2>
+
+<h3>1.1 训练时的状态空间</h3>
+<p>2D 改造后，训练在 <code>(s, t)</code> 二维空间上采样：</p>
+<div class="formula">
+<pre>
+d    = GT_displacement  (init → GT 的完整位移)
+s    = frac ∈ [0, 1]    (refinement 进度：0=init, 1=GT)
+x₁   = (1 - s) · d       (残差位移：还没走完的部分)
+x₀   = ε ~ N(0, σ²I)    (随机噪声)
+x_t  = (1 - t) · x₀ + t · x₁ = (1-t)·ε + t·(1-s)·d
+
+v_target = x₁ - x₀ = (1-s)·d - ε
+
+模型学习：v_θ(x_t, s, t, feat) ≈ (1-s)·d - ε
+</pre>
+</div>
+
+<h3>1.2 任意 (s, t) 点的 contour 物理意义</h3>
+<div class="formula">
+<pre>
+contour(s, t) = init + denormalize(x_t)
+             = init + (1-t)·ε + t·(1-s)·d
+             = (1-t)·(init + ε) + t·(init + (1-s)·d)
+             = (1-t)·contour_noisy  +  t·contour_partial_GT
+</pre>
+</div>
+<p>每一步 <code>contour(s,t)</code> 都是 <code>contour_noisy</code>（带噪初始轮廓）和 <code>contour_partial_GT</code>（部分走向 GT 的轮廓）的线性插值——<b>始终是真实轮廓</b>（带噪但几何合法），feature resampling 有物理意义。</p>
+
+<h3>1.3 模型在任意点的恢复能力</h3>
+<p>给定 <code>(s, t)</code> 和 <code>x_t</code>，模型预测 <code>v_θ</code>，恢复 <code>x̂₁</code>：</p>
+<div class="formula">
+<pre>
+x̂₁ = x_t + (1 - t) · v_θ
+   = (1-t)·ε + t·(1-s)·d + (1-t)·[(1-s)·d - ε]
+   = (1-s)·d  = x₁   (精确解)
+</pre>
+</div>
+<p>因此 <b>在任意 <code>(s,t)</code> 点，模型都能恢复 <code>x₁ = (1-s)·d</code></b>，进而得到 <code>d̂ = x̂₁ / (1-s)</code>（当 <code>s &lt; 1</code>）。这是曲线推理的数学基础。</p>
+
+<h2>2. 当前阶梯路径 vs 提议的曲线路径</h2>
+
+<div class="svg-container">
+<svg viewBox="0 0 600 380" xmlns="http://www.w3.org/2000/svg">
+  <!-- axes -->
+  <line x1="80" y1="340" x2="560" y2="340" stroke="#333" stroke-width="1.5" marker-end="url(#arr)"/>
+  <line x1="80" y1="340" x2="80" y2="40" stroke="#333" stroke-width="1.5" marker-end="url(#arr)"/>
+  <defs>
+    <marker id="arr" markerWidth="8" markerHeight="8" refX="6" refY="4" orient="auto">
+      <path d="M0,0 L8,4 L0,8 z" fill="#333"/>
+    </marker>
+  </defs>
+  <text x="565" y="345" font-size="13" fill="#333">s</text>
+  <text x="72" y="36" font-size="13" fill="#333">t</text>
+  <text x="60" y="355" font-size="11" fill="#666">0</text>
+  <text x="555" y="358" font-size="11" fill="#666">1</text>
+  <text x="62" y="44" font-size="11" fill="#666">1</text>
+  <text x="62" y="344" font-size="11" fill="#666">0</text>
+
+  <!-- staircase path (red) -->
+  <path d="M 80,340 L 80,170 L 190,170 L 190,100 L 300,100 L 300,60 L 410,60 L 410,42 L 520,42 L 520,40 L 540,40"
+        fill="none" stroke="#dc2626" stroke-width="2" stroke-dasharray="6,3"/>
+  <text x="300" y="200" font-size="12" fill="#dc2626" font-weight="bold">阶梯路径（当前）</text>
+
+  <!-- down-convex curve (blue) -->
+  <path d="M 80,340 Q 120,80 540,40" fill="none" stroke="#2563eb" stroke-width="2.5"/>
+  <text x="350" y="120" font-size="12" fill="#2563eb" font-weight="bold">下凸曲线（提议）</text>
+
+  <!-- diagonal (gray, reference) -->
+  <path d="M 80,340 L 540,40" fill="none" stroke="#94a3b8" stroke-width="1.5" stroke-dasharray="3,3"/>
+  <text x="340" y="280" font-size="11" fill="#94a3b8">对角线 s=t</text>
+
+  <!-- annotations -->
+  <text x="110" y="330" font-size="10" fill="#2563eb">t先快走</text>
+  <text x="430" y="60" font-size="10" fill="#2563eb">s后快走</text>
+</svg>
+</div>
+
+<h3>2.1 阶梯路径（当前 iterative refinement）</h3>
+<pre>
+for each outer step i:
+    s_i 固定
+    t: 0 → 1  (完整去噪，从新噪声开始)
+    d̂_i = denormalize(x̂₁)
+    contour += frac_i · d̂_i
+    s_{i+1} = s_i + (1 - s_i) · frac_i
+</pre>
+<p><b>问题：</b>每个 outer step 从 <code>t=0</code>（纯噪声）开始去噪。模型每次都要从噪声重新发现位移 <code>d</code>。N 步 refinement = N 次从头去噪 = <code>N × M</code> 次速度评估。</p>
+
+<h3>2.2 下凸曲线路径（提议）</h3>
+<pre>
+τ ∈ [0, 1]  (单一参数)
+t(τ) = τ^(1/α)     (α > 1 → t 先快走)
+s(τ) = τ^α          (α > 1 → s 后快走)
+
+每步：
+    contour = init + denormalize(x)         ← 真实（带噪）轮廓
+    feat = resample(contour)                ← DeepSnake 式重采
+    v = v_θ(x, s(τ), t(τ), feat)            ← t 方向速度
+    d̂ = (x + (1-t)·v) / (1 - s)            ← 位移估计
+    dx = v · dt/dτ + (-t · d̂) · ds/dτ      ← 二维速度合成
+    x = x + dx · dτ
+</pre>
+<p><b>优势：</b>去噪只做一次（累积的），不从头重来。K 步 ODE = K 次速度评估，远少于 <code>N × M</code>。</p>
+
+<h2>3. 曲线路径的严格数学分析</h2>
+
+<h3>3.1 沿曲线的全微分</h3>
+<p>曲线 <code>(s(τ), t(τ))</code> 上，状态 <code>x(τ) = (1-t(τ))·ε + t(τ)·(1-s(τ))·d</code> 的全微分：</p>
+<div class="formula">
+<pre>
+dx/dτ = ∂x/∂t · dt/dτ + ∂x/∂s · ds/dτ
+
+∂x/∂t = (1-s)·d - ε    ← t 方向速度（模型学的）
+∂x/∂s = -t·d            ← s 方向速度（解析的，但依赖 d）
+
+dx/dτ = v_θ(x, s, t) · dt/dτ + (-t · d) · ds/dτ
+</pre>
+</div>
+
+<h3>3.2 s 方向速度的推理时处理</h3>
+<p>推理时 <code>d</code> 未知，用模型估计 <code>d̂</code>：</p>
+<div class="formula">
+<pre>
+x̂₁ = x + (1 - t) · v_θ(x, s, t, feat)
+d̂  = x̂₁ / (1 - s)        (当 s < 1)
+
+s 方向速度 = -t(τ) · d̂ · ds/dτ
+</pre>
+</div>
+
+<div class="note">
+<b>关键观察：</b><code>d̂</code> 的精度取决于 <code>t</code> 的高低。t 越接近 1，<code>x̂₁</code> 越接近真实 <code>x₁</code>，<code>d̂</code> 越准。下凸曲线的设计让 <code>t</code> 先到高位（如 <code>τ=0.3</code> 时 <code>t≈0.8</code>），此时 <code>d̂</code> 已经较准，之后 <code>s</code> 快走时 <code>d̂</code> 可靠。这正是下凸优于对角线或上凸的原因。
+</div>
+
+<h3>3.3 Well-posedness（适定性）</h3>
+<p>曲线 ODE <code>dx/dτ = f(τ, x)</code> 的适定性要求 <code>f</code> 满足 Lipschitz 条件：</p>
+<ul>
+  <li><code>v_θ</code> 是神经网络，近似 Lipschitz（参数有界 + LayerNorm）</li>
+  <li><code>d̂ = (x + (1-t)·v_θ) / (1-s)</code>，当 <code>1-s</code> 有正下界时 Lipschitz</li>
+  <li><code>t(τ), s(τ)</code> 是光滑确定性函数</li>
+</ul>
+<p><b>结论：只要 <code>s(τ) &lt; 1 - δ</code>（直到 τ→1 才到 s=1），ODE well-posed。</b></p>
+
+<h3>3.4 误差分析</h3>
+<p>设 <code>v_θ</code> 的预测误差为 <code>e_v</code>（即 <code>v_θ = v_true + e_v</code>），则：</p>
+<div class="formula">
+<pre>
+d̂ = d + (1-t)·e_v / (1-s)
+
+s 方向速度误差 = -t · [(1-t)·e_v / (1-s)] · ds/dτ
+
+误差量级 ∝ t·(1-t) / (1-s) · |e_v| · |ds/dτ|
+</pre>
+</div>
+<p>当 <code>t → 1</code> 时，<code>(1-t) → 0</code>，s 方向误差趋零。下凸曲线在 <code>s</code> 快走阶段 <code>t</code> 已接近 1，所以：</p>
+<div class="formula">
+<pre>
+误差 ∝ (1-t) → 0    (s 快走时 t ≈ 1，误差被抑制)
+</pre>
+</div>
+<p><b>这是下凸曲线最核心的理论优势：</b>结构性地将 s 方向误差积累放在 t≈1 的低误差区间。</p>
+
+<h3>3.5 与阶梯路径的误差对比</h3>
+<table>
+<tr><th>性质</th><th>阶梯路径</th><th>下凸曲线路径</th></tr>
+<tr><td>每步去噪起点</td><td>t=0（纯噪声）</td><td>累积，不重置</td></tr>
+<tr><td>每步 d̂ 精度</td><td>依赖完整去噪 M 步</td><td>依赖当前 t（高位时很准）</td></tr>
+<tr><td>误差跨步关系</td><td>独立（每步从新噪声开始）</td><td>累积但有 t≈1 抑制</td></tr>
+<tr><td>速度评估次数</td><td>N × M</td><td>K（K ≪ N×M）</td></tr>
+<tr><td>feature 轨迹</td><td>离散跳变</td><td>连续平滑</td></tr>
+<tr><td>训练分布覆盖</td><td>每步 (s_i, t∈[0,1])</td><td>曲线上 (s(τ), t(τ))，训练均匀覆盖全平面</td></tr>
+</table>
+
+<h2>4. 曲线参数化</h2>
+
+<h3>4.1 幂函数曲线族</h3>
+<div class="formula">
+<pre>
+t(τ) = τ^(1/α)
+s(τ) = τ^α
+</pre>
+</div>
+<table>
+<tr><th>α</th><th>形状</th><th>τ=0.3 时 (s, t)</th><th>τ=0.7 时 (s, t)</th><th>特点</th></tr>
+<tr><td>1</td><td>对角线</td><td>(0.30, 0.30)</td><td>(0.70, 0.70)</td><td>对称，无偏好</td></tr>
+<tr><td>2</td><td>下凸</td><td>(0.09, 0.55)</td><td>(0.49, 0.84)</td><td>先去噪后refine</td></tr>
+<tr><td>3</td><td>更强下凸</td><td>(0.03, 0.67)</td><td>(0.34, 0.89)</td><td>更早完成去噪</td></tr>
+<tr><td>∞</td><td>极限</td><td>(0, 1)</td><td>(0, 1)→(1,1)</td><td>退化为阶梯（先全去噪再全refine）</td></tr>
+</table>
+
+<div class="note">
+<b>α→∞ 的极限就是阶梯路径</b>（先 t:0→1 再 s:0→1）。α=1 是对角线。α∈[2,4] 是"先快速去噪到 t≈0.8，再渐进 refine"的甜区。
+</div>
+
+<h3>4.2 更灵活的参数化：贝塞尔曲线</h3>
+<p>用二次贝塞尔曲线控制曲率：</p>
+<div class="formula">
+<pre>
+P₀ = (0, 0),  P₂ = (1, 1),  P₁ = (β, 1-β)   控制点
+(s(τ), t(τ)) = (1-τ)²·P₀ + 2(1-τ)τ·P₁ + τ²·P₂
+
+β < 0.5 → 下凸（t 先走）  |  β > 0.5 → 上凸（s 先走）
+</pre>
+</div>
+
+<h2>5. Feature resampling 沿曲线的分析</h2>
+
+<p>沿曲线 <code>(s(τ), t(τ))</code>，contour 演化为：</p>
+<div class="formula">
+<pre>
+contour(τ) = init + (1-t(τ))·ε + t(τ)·(1-s(τ))·d
+</pre>
+</div>
+
+<table>
+<tr><th>τ</th><th>(s, t)</th><th>contour 组成</th><th>feature 质量</th></tr>
+<tr><td>0.0</td><td>(0, 0)</td><td>init + ε（纯噪轮廓）</td><td>差（但 s_emb=0，模型知道在起点）</td></tr>
+<tr><td>0.2</td><td>(0.04, 0.45)</td><td>init + 0.55ε + 0.43d</td><td>中等（位移信号已占主导）</td></tr>
+<tr><td>0.5</td><td>(0.25, 0.71)</td><td>init + 0.29ε + 0.53d</td><td>好（噪声弱，位移清晰）</td></tr>
+<tr><td>0.8</td><td>(0.64, 0.89)</td><td>init + 0.11ε + 0.32d</td><td>很好（几乎纯位移轮廓）</td></tr>
+<tr><td>1.0</td><td>(1, 1)</td><td>init + d = GT</td><td>完美</td></tr>
+</table>
+
+<p><b>关键：</b>α=2 时，τ=0.5 已经 71% 去噪，contour 以位移为主。feature resampling 从 τ≈0.4 开始就高度有效。而阶梯路径每个 step 都从 t=0（纯噪 contour）开始，feature 在前几步 inner ODE 几乎无用。</p>
+
+<h2>6. 风险与缓解</h2>
+
+<div class="risk">
+<b>风险 1：s 方向误差累积</b><br>
+s 方向速度用 d̂，d̂ 有误差 → 误差沿 τ 积分。<br>
+<b>缓解：</b>下凸曲线让 t 先到高位 → d̂ 在 s 快走时已准 → 误差量级 ∝ (1-t) → 0。另外可以每 K 步做一次"重去噪校正"：固定 s，跑 t: 当前→1，用精确 t 方向 velocity 重置 x。
+</div>
+
+<div class="risk">
+<b>风险 2：s→1 时的数值奇异性</b><br>
+d̂ = x̂₁ / (1-s)，s→1 时分母→0。<br>
+<b>缓解：</b>曲线在 τ→1 时 s→1 但不精确到达。实践中设 s_max = 0.97，最后一步直接用 x̂₁ 作为最终位移。
+</div>
+
+<div class="risk">
+<b>风险 3：训练分布未沿曲线密采样</b><br>
+训练在 (s,t) 平面均匀采样，曲线路径只走窄带。<br>
+<b>缓解：</b>训练覆盖全平面 → 曲线上每个点都在训练分布内。可选择性沿目标曲线做 biased sampling 加强。
+</div>
+
+<div class="risk">
+<b>风险 4：ε 在推理时是固定的</b><br>
+推理时 ε = randn 采一次，沿整条曲线不变。如果 ε 不好，整条曲线都受影响。<br>
+<b>缓解：</b>可以做多条曲线（不同 ε）取平均，类似 infer_avg_samples。或者用 zero-noise（geom_bridge）消除随机性——但那放弃扩散性。
+</div>
+
+<h2>7. 实现方案</h2>
+
+<h3>7.1 推理端改动（训练不动）</h3>
+<pre>
+def sample_disp_curve(self, cnn_feature, i_it_py, c_it_py, py_ind,
+                      alpha=2.0, steps=20, batch=None):
+    """2D FM 曲线推理路径"""
+    N = i_it_py.size(0)
+    h, w = cnn_feature.size(2), cnn_feature.size(3)
+    contour_scale = self.compute_contour_scale(i_it_py)
+    
+    # 初始噪声
+    x = torch.randn_like(i_it_py) * self._flow_noise_scale
+    d_tau = 1.0 / steps
+    
+    for i in range(steps):
+        tau = (i + 1) * d_tau
+        t_val = tau ** (1.0 / alpha)
+        s_val = tau ** alpha
+        t_tensor = torch.full((N,), t_val, device=i_it_py.device)
+        s_tensor = torch.full((N,), s_val, device=i_it_py.device)
+        
+        # 在当前 contour 上采 feature（DeepSnake 式）
+        with torch.no_grad():
+            xt_disp = self.denormalize_pred_disp(x, contour_scale)
+            cur_contour = (i_it_py + xt_disp).detach()
+            sampled_feat = snake_gcn_utils.get_gcn_feature(
+                cnn_feature, cur_contour, py_ind, h, w)
+            detail_feat = self.sample_detail_features(
+                cnn_feature, cur_contour, py_ind, h, w,
+                sampled_feat=sampled_feat, contour_scale=contour_scale)
+        
+        # t 方向速度
+        v_t, _ = self.predict_velocity(
+            cnn_feature, i_it_py, c_it_py, sampled_feat, detail_feat,
+            py_ind, x, t_tensor * 1000, contour_scale=contour_scale.view(-1),
+            s=s_tensor)
+        
+        # d̂ 估计
+        x1_hat = x + (1 - t_val) * v_t
+        d_hat = x1_hat / max(1 - s_val, 1e-4)
+        
+        # 速度合成
+        dt_dtau = (1.0 / alpha) * tau ** (1.0 / alpha - 1)
+        ds_dtau = alpha * tau ** (alpha - 1)
+        dx = v_t * dt_dtau + (-t_val * d_hat) * ds_dtau
+        
+        x = x + dx * d_tau
+    
+    disp = self.denormalize_pred_disp(x, contour_scale)
+    return self.clamp_pred_disp(disp, i_it_py)
+</pre>
+
+<h3>7.2 需要验证的实验矩阵</h3>
+<table>
+<tr><th>实验</th><th>α</th><th>steps</th><th>速度评估</th><th>对比对象</th></tr>
+<tr><td>baseline 阶梯</td><td>—</td><td>5×20</td><td>100</td><td>当前最强</td></tr>
+<tr><td>曲线 α=2</td><td>2</td><td>20</td><td>20</td><td>5× fewer evals</td></tr>
+<tr><td>曲线 α=3</td><td>3</td><td>20</td><td>20</td><td>更早去噪</td></tr>
+<tr><td>曲线 α=2</td><td>2</td><td>10</td><td>10</td><td>10× fewer evals</td></tr>
+<tr><td>对角线 α=1</td><td>1</td><td>20</td><td>20</td><td>无偏好对照</td></tr>
+</table>
+
+<h2>8. 最终判断</h2>
+
+<div class="summary">
+<p><b>理论可行性：</b><span class="ok">成立</span>。2D FM 面上任意连续曲线的 ODE 都 well-posed，模型在训练时覆盖全平面，曲线上每个点都在分布内。</p>
+<p><b>下凸曲线的核心优势：</b>结构性地将 s 方向误差积累放在 t≈1 的低误差区间（误差 ∝ (1-t)→0），同时去噪只做一次不重来，feature 沿真实轮廓连续重采。</p>
+<p><b>主要不确定性：</b>s 方向速度依赖 d̂ 的精度。如果模型在 t≈0.8 时 d̂ 已经够准（这需要实验验证），曲线就能优于阶梯。如果 d̂ 在 t&lt;0.9 时误差仍然大，曲线可能不如阶梯（阶梯每步独立、无累积）。</p>
+<p><b>建议：</b>先在 s_cond + resample 训练好的 checkpoint 上跑 α=2 / steps=20 的推理实验。如果 20 步曲线 ≈ 100 步阶梯，就验证了效率优势。如果 20 步曲线 &gt; 100 步阶梯，说明连续路径本身有质量优势。</p>
+</div>
+
+</main>
+</body>
+</html>

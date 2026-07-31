@@ -6,6 +6,7 @@ zero-init residual improvements:
 2. a per-point delta head on top of the shared final head
 """
 
+import math
 import torch
 import torch.nn as nn
 
@@ -153,6 +154,8 @@ class MoEFinalHead(nn.Module):
         num_experts: int = 8,
         top_k: int = 2,
         balance_weight: float = 1e-3,
+        balance_mode: str = 'legacy',
+        hard_phi_ema_decay: float = 0.99,
         expert_init_std: float = 1e-4,
         router_noise_std: float = 0.01,
         use_point_embed: bool = True,
@@ -168,6 +171,10 @@ class MoEFinalHead(nn.Module):
         self.num_points = int(num_points)
         self.num_experts = int(num_experts)
         self.balance_weight = float(balance_weight)
+        self.balance_mode = str(balance_mode).strip().lower()
+        self.hard_phi_ema_decay = float(
+            min(max(hard_phi_ema_decay, 0.0), 0.99999)
+        )
         self.router_noise_std = float(router_noise_std)
         self.use_point_embed = bool(use_point_embed)
         self.use_cyclic_router = bool(use_cyclic_router)
@@ -230,6 +237,22 @@ class MoEFinalHead(nn.Module):
         self.router_time = nn.Linear(dim, dim, bias=False)
         self.router = nn.Linear(dim, self.router_num_experts, bias=True)
         self._last_aux_loss = None
+        self.register_buffer("_diag_soft_sum", torch.zeros(self.router_num_experts), persistent=False)
+        self.register_buffer("_diag_hard_sum", torch.zeros(self.router_num_experts), persistent=False)
+        self.register_buffer("_diag_top1_sum", torch.zeros(self.router_num_experts), persistent=False)
+        self.register_buffer("_diag_tokens", torch.zeros(()), persistent=False)
+        self.register_buffer(
+            "hard_phi_ema_load",
+            torch.full(
+                (self.router_num_experts,),
+                1.0 / float(self.router_num_experts),
+            ),
+        )
+        # Optional evaluation-only event capture. Disabled by default and never
+        # changes routing or checkpoint contents.
+        self._capture_conditional_routing = False
+        self._conditional_routing_context = None
+        self._conditional_routing_events = []
 
         nn.init.constant_(self.adaLN[-1].weight, 0)
         nn.init.constant_(self.adaLN[-1].bias, 0)
@@ -259,6 +282,38 @@ class MoEFinalHead(nn.Module):
             with torch.no_grad():
                 self.router.bias[-1].fill_(self.route_shared_init_bias)
 
+    def enable_conditional_routing_capture(self, enabled: bool = True) -> None:
+        self._capture_conditional_routing = bool(enabled)
+        self._conditional_routing_context = None
+        self._conditional_routing_events = []
+
+    def set_conditional_routing_context(
+        self,
+        diffusion_t: torch.Tensor = None,
+        contour_scale: torch.Tensor = None,
+    ) -> None:
+        if not self._capture_conditional_routing:
+            self._conditional_routing_context = None
+            return
+        self._conditional_routing_context = {
+            "diffusion_t": (
+                diffusion_t.detach().float().reshape(-1)
+                if torch.is_tensor(diffusion_t)
+                else None
+            ),
+            "contour_scale": (
+                contour_scale.detach().float().reshape(-1)
+                if torch.is_tensor(contour_scale)
+                else None
+            ),
+        }
+
+    def drain_conditional_routing_events(self):
+        events = self._conditional_routing_events
+        self._conditional_routing_events = []
+        self._conditional_routing_context = None
+        return events
+
     def _compute_balance_loss(self, probs: torch.Tensor, selected_idx: torch.Tensor) -> torch.Tensor:
         if self.balance_weight <= 0:
             return probs.new_zeros(())
@@ -266,6 +321,24 @@ class MoEFinalHead(nn.Module):
         selected = torch.zeros_like(probs)
         selected.scatter_(-1, selected_idx, 1.0)
         load = selected.mean(dim=(0, 1)) / float(self.top_k)
+        if self.balance_mode in ('hard_phi', 'hard-phi', 'population_hard_phi'):
+            with torch.no_grad():
+                self.hard_phi_ema_load.mul_(self.hard_phi_ema_decay).add_(
+                    load.detach() * (1.0 - self.hard_phi_ema_decay)
+                )
+                self.hard_phi_ema_load.div_(
+                    self.hard_phi_ema_load.sum().clamp_min(1e-12)
+                )
+            # The hard Top-K load determines a detached population-level
+            # congestion price; the current soft probabilities carry its
+            # gradient. This avoids the legacy no-op hard-count penalty.
+            price = self.hard_phi_ema_load.clamp_min(1e-8).log().detach()
+            price = price - price.mean()
+            return (
+                self.balance_weight
+                * float(self.router_num_experts)
+                * torch.sum(importance * price)
+            ).to(probs.dtype)
         target = probs.new_full((self.router_num_experts,), 1.0 / float(self.router_num_experts))
         balance = (importance - target).pow(2).mean() + (load - target).pow(2).mean()
         return balance * self.balance_weight
@@ -319,6 +392,57 @@ class MoEFinalHead(nn.Module):
             out = routed_out
 
         self._last_aux_loss = self._compute_balance_loss(probs, top_idx)
+        with torch.no_grad():
+            tokens = float(probs.shape[0] * probs.shape[1])
+            self._diag_soft_sum.add_(probs.float().mean(dim=(0, 1)) * tokens)
+            one_hot = torch.nn.functional.one_hot(
+                top_idx, num_classes=self.router_num_experts
+            ).float()
+            self._diag_hard_sum.add_(one_hot.mean(dim=(0, 1, 2)) * tokens)
+            self._diag_top1_sum.add_(one_hot[:, :, 0].mean(dim=(0, 1)) * tokens)
+            self._diag_tokens.add_(tokens)
+            if self._capture_conditional_routing:
+                n_contours, n_points, _ = probs.shape
+                point_bins = min(8, n_points)
+                point_bin_ids = (
+                    torch.arange(n_points, device=probs.device) * point_bins
+                ) // max(n_points, 1)
+                point_top1 = torch.zeros(
+                    n_contours,
+                    point_bins,
+                    self.router_num_experts,
+                    device=probs.device,
+                    dtype=torch.float32,
+                )
+                point_top1.scatter_add_(
+                    1,
+                    point_bin_ids.view(1, -1, 1).expand(
+                        n_contours, -1, self.router_num_experts
+                    ),
+                    one_hot[:, :, 0].float(),
+                )
+                context = self._conditional_routing_context or {}
+                diffusion_t = context.get("diffusion_t")
+                contour_scale = context.get("contour_scale")
+                if diffusion_t is None or diffusion_t.numel() != n_contours:
+                    diffusion_t = probs.new_full((n_contours,), float("nan")).float()
+                if contour_scale is None or contour_scale.numel() != n_contours:
+                    contour_scale = probs.new_full((n_contours,), float("nan")).float()
+                delta_float = expert_delta.float()
+                self._conditional_routing_events.append({
+                    "soft_sum": probs.float().sum(dim=1).cpu(),
+                    "hard_sum": one_hot.float().sum(dim=(1, 2)).cpu(),
+                    "top1_sum": one_hot[:, :, 0].float().sum(dim=1).cpu(),
+                    "point_top1": point_top1.cpu(),
+                    "expert_delta_l2_sum": delta_float.norm(dim=-1).sum(dim=1).cpu(),
+                    "expert_delta_cross": torch.einsum(
+                        "npeo,npfo->nef", delta_float, delta_float
+                    ).cpu(),
+                    "diffusion_t": diffusion_t.cpu(),
+                    "contour_scale": contour_scale.cpu(),
+                    "points": int(n_points),
+                    "top_k": int(self.top_k),
+                })
         return out
 
     def reg_loss(self) -> torch.Tensor:
@@ -328,6 +452,29 @@ class MoEFinalHead(nn.Module):
         aux_loss = self._last_aux_loss
         self._last_aux_loss = None
         return aux_loss
+
+    @torch.no_grad()
+    def routing_diagnostics(self):
+        denom = self._diag_tokens.clamp_min(1.0)
+        soft = self._diag_soft_sum / denom
+        hard = self._diag_hard_sum / denom
+        top1 = self._diag_top1_sum / denom
+        entropy = -(soft.clamp_min(1e-12) * soft.clamp_min(1e-12).log()).sum()
+        return {
+            "soft_load": soft.detach().cpu(),
+            "hard_load": hard.detach().cpu(),
+            "top1_load": top1.detach().cpu(),
+            "normalized_entropy": (
+                entropy / math.log(self.router_num_experts)
+            ).detach().cpu(),
+            "hard_cv": (
+                hard.std(unbiased=False) / hard.mean().clamp_min(1e-12)
+            ).detach().cpu(),
+            "dead_experts_lt_1pct": (hard < 0.01).sum().detach().cpu(),
+            "tokens": self._diag_tokens.detach().cpu(),
+            "hard_phi_ema_load": self.hard_phi_ema_load.detach().cpu(),
+            "balance_mode": self.balance_mode,
+        }
 
 
 class LatentLoopBlock(nn.Module):

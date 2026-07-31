@@ -29,6 +29,8 @@ class DiTFlowMatchingV4_1(DiTFlowMatchingV3_4):
         moe_num_experts: int = 8,
         moe_top_k: int = 2,
         moe_balance_weight: float = 1e-3,
+        moe_balance_mode: str = 'legacy',
+        moe_hard_phi_ema_decay: float = 0.99,
         moe_expert_init_std: float = 1e-4,
         moe_router_noise_std: float = 0.01,
         moe_use_point_embed: bool = True,
@@ -71,6 +73,8 @@ class DiTFlowMatchingV4_1(DiTFlowMatchingV3_4):
                 num_experts=moe_num_experts,
                 top_k=moe_top_k,
                 balance_weight=moe_balance_weight,
+                balance_mode=moe_balance_mode,
+                hard_phi_ema_decay=moe_hard_phi_ema_decay,
                 expert_init_std=moe_expert_init_std,
                 router_noise_std=moe_router_noise_std,
                 use_point_embed=moe_use_point_embed,
@@ -206,6 +210,11 @@ class DiTFlowMatchingV4_1(DiTFlowMatchingV3_4):
             for _ in range(self.latent_loop_steps):
                 x = self.latent_loop(x, cond_emb)
 
+        if hasattr(self.final_layer, 'set_conditional_routing_context'):
+            self.final_layer.set_conditional_routing_context(
+                diffusion_t=t,
+                contour_scale=contour_scale,
+            )
         pred = self.final_layer(x, cond_emb)
         reg_loss = pred.new_zeros(())
         if hasattr(self.final_layer, 'reg_loss'):

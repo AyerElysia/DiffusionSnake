@@ -191,23 +191,81 @@ class LocateFeatAdapter(nn.Module):
 
 
 class LocateFeatReplacer(nn.Module):
-    def __init__(self, in_channels=2304, hidden_channels=256, out_channels=64):
+    """Project cached MoonViT features and upsample them by ``upscale``.
+
+    MoonViT grids are coarse (patch 14 over a 448-long side, i.e. roughly 10.6
+    original pixels per cell), so the upsampling factor directly controls how
+    many distinct feature cells a 128-point contour can address. ``upscale`` is
+    exposed via ``cfg.locate_feat_replace_upscale`` and must stay in sync with
+    the ``source_scale`` used to build the resampling grid.
+    """
+
+    def __init__(self, in_channels=2304, hidden_channels=256, out_channels=64, upscale=2,
+                 input_layers=1):
         super().__init__()
         hidden_channels = int(hidden_channels)
-        if hidden_channels % 16 != 0 or hidden_channels % 4 != 0:
-            raise ValueError("LocateFeatReplacer hidden_channels must be divisible by 16 and 4.")
-        self.proj = nn.Sequential(
-            nn.Conv2d(int(in_channels), hidden_channels, kernel_size=1, bias=False),
+        upscale = int(upscale)
+        input_layers = int(input_layers)
+        if upscale < 1:
+            raise ValueError("LocateFeatReplacer upscale must be >= 1.")
+        if hidden_channels % 16 != 0:
+            raise ValueError("LocateFeatReplacer hidden_channels must be divisible by 16.")
+        if upscale > 1 and hidden_channels % (upscale * upscale) != 0:
+            raise ValueError(
+                "LocateFeatReplacer hidden_channels must be divisible by upscale^2 "
+                f"(got hidden_channels={hidden_channels}, upscale={upscale})."
+            )
+        self.upscale = upscale
+        out_channels = int(out_channels)
+        in_channels = int(in_channels)
+        # Cached MoonViT layers live on very different scales (measured on the
+        # sagittal cache: layer_18 std ~0.93, layer_26 std ~2.64), so a bare
+        # concat lets the deeper layer dominate the 1x1 projection's gradients.
+        # GroupNorm over `input_layers` contiguous groups is exactly per-layer
+        # standardisation. It is kept OUTSIDE `self.proj` and has affine=False so
+        # every existing `proj.N.*` key keeps its index and checkpoints still load.
+        self.input_norm = None
+        if input_layers > 1:
+            if in_channels % input_layers != 0:
+                raise ValueError(
+                    "LocateFeatReplacer in_channels must be divisible by input_layers "
+                    f"(got in_channels={in_channels}, input_layers={input_layers})."
+                )
+            self.input_norm = nn.GroupNorm(input_layers, in_channels, affine=False)
+        layers = [
+            nn.Conv2d(in_channels, hidden_channels, kernel_size=1, bias=False),
             nn.GroupNorm(16, hidden_channels),
             nn.GELU(),
             nn.Conv2d(hidden_channels, hidden_channels, kernel_size=3, padding=1, bias=False),
             nn.GroupNorm(16, hidden_channels),
             nn.GELU(),
-            nn.PixelShuffle(2),
-            nn.Conv2d(hidden_channels // 4, int(out_channels), kernel_size=3, padding=1, bias=True),
-        )
+        ]
+        if upscale <= 2:
+            # Legacy graph (upscale 1 and 2). Kept byte-identical so existing
+            # checkpoints trained with PixelShuffle(2) still load cleanly.
+            if upscale > 1:
+                layers.append(nn.PixelShuffle(upscale))
+                head_in = hidden_channels // (upscale * upscale)
+            else:
+                head_in = hidden_channels
+            layers.append(nn.Conv2d(head_in, out_channels, kernel_size=3, padding=1, bias=True))
+        else:
+            # For larger factors a bare PixelShuffle would leave only
+            # hidden/upscale^2 channels (e.g. 512/16 = 32) feeding the head.
+            # Expand to out_channels * upscale^2 first so the post-shuffle map
+            # keeps full width.
+            layers.extend([
+                nn.Conv2d(hidden_channels, out_channels * upscale * upscale, kernel_size=1, bias=False),
+                nn.PixelShuffle(upscale),
+                nn.GroupNorm(16, out_channels),
+                nn.GELU(),
+                nn.Conv2d(out_channels, out_channels, kernel_size=3, padding=1, bias=True),
+            ])
+        self.proj = nn.Sequential(*layers)
 
     def forward(self, x):
+        if self.input_norm is not None:
+            x = self.input_norm(x)
         return self.proj(x)
 
 
@@ -608,7 +666,9 @@ class Network(nn.Module):
         self.detector_backend = str(getattr(cfg, 'detector_backend', 'yolo') or 'yolo').strip().lower()
         self.down_ratio = float(down_ratio)
         nc = int(getattr(cfg, 'yolo_num_classes', 0) or heads.get('ct_hm', 1))
+        self.detector_num_classes = nc
         self.freeze_snake = bool(getattr(cfg, 'freeze_snake', False))
+        self.freeze_heatmap_detector = bool(getattr(cfg, 'freeze_heatmap_detector', False))
         self.freeze_yolo = bool(getattr(cfg, 'freeze_yolo', False))
         self.use_p3_features = False
         self.use_swin_snake_feature = False
@@ -623,6 +683,7 @@ class Network(nn.Module):
         self.locate_feat_replace = bool(getattr(cfg, 'locate_feat_replace', False))
         self.locate_feat_adapter = None
         self.locate_feat_replacer = None
+        self.locate_feat_replace_upscale = int(getattr(cfg, 'locate_feat_replace_upscale', 2))
         if self.locate_feat_inject and self.locate_feat_replace:
             raise ValueError("locate_feat_inject and locate_feat_replace are mutually exclusive.")
 
@@ -643,14 +704,33 @@ class Network(nn.Module):
                 pass
 
             # 加载 YOLO 预训练权重（测试阶段无需加载，统一依赖整体checkpoint；训练可通过开关启用）
-            try:
-                yolov8_pt = getattr(cfg, 'yolo_pretrained', None)
-                load_yolo_pretrained = getattr(cfg, 'load_yolo_pretrained', False)
-                if yolov8_pt and load_yolo_pretrained:
-                    weights_model, _ = attempt_load_one_weight(yolov8_pt, device=None, inplace=True, fuse=False)
+            yolov8_pt = str(getattr(cfg, 'yolo_pretrained', '') or '').strip()
+            load_yolo_pretrained = bool(getattr(cfg, 'load_yolo_pretrained', False))
+            require_yolo_pretrained = bool(getattr(cfg, 'require_yolo_pretrained', False))
+            if load_yolo_pretrained:
+                try:
+                    if not yolov8_pt:
+                        raise FileNotFoundError("cfg.yolo_pretrained is empty")
+                    if require_yolo_pretrained and not os.path.isfile(yolov8_pt):
+                        raise FileNotFoundError(f"YOLO pretrained weights not found: {yolov8_pt}")
+                    weights_model, _ = attempt_load_one_weight(
+                        yolov8_pt, device=None, inplace=True, fuse=False
+                    )
                     self.yolo.load(weights_model)
-            except Exception as e:
-                print(f"[WARN] Failed to load YOLO pretrained weights: {e}")
+                    print(f"[YOLO] Loaded pretrained weights: {yolov8_pt}", flush=True)
+                    if bool(getattr(cfg, 'pseudo3d_symmetric_stem_init', False)):
+                        stem_weight = self.yolo.model[0].conv.weight
+                        with torch.no_grad():
+                            stem_weight.copy_(self.make_symmetric_stem_weight(stem_weight))
+                        print(
+                            "[YOLO] Applied symmetric pseudo-3D initialization to the first stem convolution.",
+                            flush=True,
+                        )
+                except Exception as e:
+                    message = f"Failed to load YOLO pretrained weights from {yolov8_pt or '<empty>'}: {e}"
+                    if require_yolo_pretrained:
+                        raise RuntimeError(message) from e
+                    print(f"[WARN] {message}", flush=True)
 
 # 将 P2 级别的特征通道压到 snake_feature_dim，供 Snake 的 GCN 使用
             # YOLO Detect 头拼接后的通道数为 regmax*4 + nc（默认 regmax=16 -> 64）
@@ -794,14 +874,19 @@ class Network(nn.Module):
                 flush=True,
             )
         if self.locate_feat_replace:
+            self.locate_feat_replace_upscale = int(getattr(cfg, 'locate_feat_replace_upscale', 2))
             self.locate_feat_replacer = LocateFeatReplacer(
                 in_channels=int(getattr(cfg, 'locate_feat_dim', 2304)),
                 hidden_channels=int(getattr(cfg, 'locate_feat_replace_hidden_dim', 256)),
                 out_channels=int(getattr(cfg, 'locate_feat_replace_out_channels', 64)),
+                upscale=self.locate_feat_replace_upscale,
+                input_layers=int(getattr(cfg, 'locate_feat_input_layers', 1)),
             )
             param_count = sum(p.numel() for p in self.locate_feat_replacer.parameters())
             print(
                 f"[LocateFeat] replacement enabled dim={getattr(cfg, 'locate_feat_dim', 2304)} "
+                f"upscale={self.locate_feat_replace_upscale} "
+                f"input_layers={int(getattr(cfg, 'locate_feat_input_layers', 1))} "
                 f"root={getattr(cfg, 'locate_feat_cache_dir', '') or getattr(cfg, 'locate_feat_cache_root', 'data/locate_feat_cache')} "
                 f"params={param_count / 1e6:.3f}M",
                 flush=True,
@@ -851,20 +936,26 @@ class Network(nn.Module):
 
         # 冻结 Snake 相关模块（只训练 YOLO）
         if self.freeze_snake:
-            if self.detector_backend == 'yolo':
-                modules_to_freeze = [self.gcn, self.cnn_proj] if not use_diffusion else [self.cnn_proj]
-                if hasattr(self, 'cnn_proj_p3'):
-                    modules_to_freeze.append(self.cnn_proj_p3)
-            elif self.detector_backend == 'samsnake_fm':
-                modules_to_freeze = [self.gcn]
-                if self.samsnake_refine is not None:
-                    modules_to_freeze.append(self.samsnake_refine)
+            if self.detector_backend.startswith('heatmap_'):
+                # Detector-only warmup must not update the cached-feature adapter
+                # or diffusion branch. Keep only the heatmap detector trainable.
+                for name, parameter in self.named_parameters():
+                    parameter.requires_grad = name.startswith('heatmap_detector.')
             else:
-                modules_to_freeze = [self.gcn]
-            for m in modules_to_freeze:
-                m.eval()
-                for p in m.parameters():
-                    p.requires_grad = False
+                if self.detector_backend == 'yolo':
+                    modules_to_freeze = [self.gcn, self.cnn_proj] if not use_diffusion else [self.cnn_proj]
+                    if hasattr(self, 'cnn_proj_p3'):
+                        modules_to_freeze.append(self.cnn_proj_p3)
+                elif self.detector_backend == 'samsnake_fm':
+                    modules_to_freeze = [self.gcn]
+                    if self.samsnake_refine is not None:
+                        modules_to_freeze.append(self.samsnake_refine)
+                else:
+                    modules_to_freeze = [self.gcn]
+                for m in modules_to_freeze:
+                    m.eval()
+                    for p in m.parameters():
+                        p.requires_grad = False
             # 确保 YOLO 可训练（除非显式要求冻结）
             if self.yolo is not None:
                 for p in self.yolo.parameters():
@@ -874,8 +965,60 @@ class Network(nn.Module):
         if self.freeze_yolo and self.yolo is not None:
             for p in self.yolo.parameters():
                 p.requires_grad = False
+        if self.freeze_heatmap_detector and self.heatmap_detector is not None:
+            for p in self.heatmap_detector.parameters():
+                p.requires_grad = False
 
-    # 注意：自定义 NMS/IoU 函数已移除，统一使用 YOLOv8 的 non_max_suppression，避免训练/测试不一致与重复实现。
+    # Detection filtering uses torchvision.ops.nms on decoded axis-aligned xyxy boxes.
+
+    @staticmethod
+    def should_use_gt_detection(use_gt_det, train_only, is_training, batch):
+        return bool(use_gt_det) and batch is not None and (
+            bool(is_training) or not bool(train_only)
+        )
+
+    @staticmethod
+    def offset_gt_detection_classes(ct_cls, class_offset):
+        return ct_cls - float(class_offset)
+
+    @staticmethod
+    def make_symmetric_stem_weight(weight):
+        if not torch.is_tensor(weight) or weight.ndim != 4 or weight.size(1) != 3:
+            shape = tuple(weight.shape) if torch.is_tensor(weight) else type(weight).__name__
+            raise ValueError(f"Expected a [out_channels,3,kH,kW] stem weight, got {shape}")
+        grayscale_weight = weight.sum(dim=1, keepdim=True) / 3.0
+        return grayscale_weight.expand_as(weight).clone()
+
+    @staticmethod
+    def attach_py_detection_metadata(output, fail_on_mismatch=False, num_classes=None):
+        detection = output.get('detection')
+        py = output.get('py')
+        if not torch.is_tensor(detection) or py is None:
+            return output
+        final_py = py[-1] if isinstance(py, (list, tuple)) and py else py
+        if not torch.is_tensor(final_py):
+            return output
+
+        valid = detection[..., 4] > 1e-4
+        scores = detection[..., 4][valid]
+        classes = detection[..., 5][valid].long()
+        if int(final_py.size(0)) != int(scores.numel()):
+            if fail_on_mismatch:
+                raise RuntimeError(
+                    "Cannot associate final contours with detections: "
+                    f"py={int(final_py.size(0))}, detections={int(scores.numel())}"
+                )
+            return output
+        if num_classes is not None and classes.numel() > 0:
+            num_classes = int(num_classes)
+            if bool(((classes < 0) | (classes >= num_classes)).any()):
+                raise RuntimeError(
+                    f"Detection classes must be in [0, {num_classes - 1}], "
+                    f"got min={int(classes.min())}, max={int(classes.max())}"
+                )
+        output['py_score'] = scores
+        output['py_cls'] = classes
+        return output
 
     @staticmethod
     def _batch_meta_tensor(batch, key, device, dtype):
@@ -895,7 +1038,7 @@ class Network(nn.Module):
             return value.to(device=device, dtype=dtype)
         return torch.as_tensor(value, device=device, dtype=dtype)
 
-    def _build_locate_feature_grid(self, batch, target_h, target_w, device, dtype, source_scale=1.0):
+    def _build_locate_feature_grid(self, batch, target_h, target_w, device, dtype, source_scale=1.0, sample_idx=None):
         inv_trans = self._batch_meta_tensor(batch, 'inv_trans_input', device, dtype)
         orig_hw = self._batch_meta_tensor(batch, 'orig_hw', device, dtype)
         flipped = self._batch_meta_tensor(batch, 'flipped', device, dtype)
@@ -909,6 +1052,20 @@ class Network(nn.Module):
                 "Locate feature injection requires meta.inv_trans_input/meta.orig_hw and "
                 "locate_feat_scale/locate_feat_grid_hw in batch"
             )
+
+        # Slice to a single sample when called in per-sample mode
+        if sample_idx is not None:
+            i = sample_idx
+            inv_trans = inv_trans[i:i+1]
+            orig_hw = orig_hw[i:i+1]
+            if flipped is not None:
+                flipped = flipped[i:i+1]
+            locate_scale = locate_scale[i:i+1]
+            grid_hw = grid_hw[i:i+1]
+            if patch_size is not None:
+                patch_size = patch_size[i:i+1]
+            if locate_pad is not None:
+                locate_pad = locate_pad[i:i+1]
 
         bsz = int(inv_trans.size(0))
         if inv_trans.dim() != 3 or inv_trans.size(1) != 2 or inv_trans.size(2) != 3:
@@ -955,7 +1112,7 @@ class Network(nn.Module):
         return torch.stack([norm_x, norm_y], dim=-1)
 
     def apply_locate_feature_injection(self, cnn_feature, batch=None):
-        if not self.locate_feat_inject or self.locate_feat_adapter is None:
+        if not getattr(self, 'locate_feat_inject', False) or getattr(self, 'locate_feat_adapter', None) is None:
             return cnn_feature, {}
         if batch is None or 'locate_feat' not in batch:
             raise KeyError(
@@ -964,24 +1121,60 @@ class Network(nn.Module):
             )
 
         feat = batch['locate_feat']
-        if not torch.is_tensor(feat):
-            feat = torch.as_tensor(feat)
-        feat = feat.to(device=cnn_feature.device, dtype=cnn_feature.dtype, non_blocking=True)
-        adapted = self.locate_feat_adapter(feat)
-        grid = self._build_locate_feature_grid(
-            batch,
-            int(cnn_feature.size(2)),
-            int(cnn_feature.size(3)),
-            cnn_feature.device,
-            cnn_feature.dtype,
-        )
-        aligned = F.grid_sample(
-            adapted,
-            grid,
-            mode='bilinear',
-            padding_mode='zeros',
-            align_corners=True,
-        )
+        device = cnn_feature.device
+        dtype = cnn_feature.dtype
+        target_h = int(cnn_feature.size(2))
+        target_w = int(cnn_feature.size(3))
+        bsz = int(cnn_feature.size(0))
+        resample_padding = str(
+            getattr(cfg, 'locate_feat_resample_padding_mode', 'zeros')
+        ).strip().lower()
+        if resample_padding not in ('zeros', 'border', 'reflection'):
+            raise ValueError(
+                'locate_feat_resample_padding_mode must be zeros/border/reflection, '
+                'got {!r}'.format(resample_padding)
+            )
+
+        # Variable-size MoonViT caches are collated as a Python list of [C,H,W]
+        # tensors. Process each sample independently so grid_sample stays exact.
+        if isinstance(feat, (list, tuple)):
+            if len(feat) != bsz:
+                raise ValueError(
+                    f"locate_feat list length {len(feat)} != batch size {bsz}"
+                )
+            # The feature maps may have different spatial sizes, but the target
+            # grid and all batch metadata are shared by this replacement call.
+            # Build the grids once instead of repeating full-batch transfers and
+            # meshgrid/bmm work for every sample.
+            grid = self._build_locate_feature_grid(
+                batch, target_h, target_w, device, dtype,
+            )
+            aligned_list = []
+            for i, f in enumerate(feat):
+                f = f.to(device=device, dtype=dtype, non_blocking=True)
+                if f.dim() == 3:
+                    f = f.unsqueeze(0)  # [1, C, H, W]
+                adapted_i = self.locate_feat_adapter(f)  # [1, C', H', W']
+                grid_i = grid[i:i + 1]
+                aligned_i = F.grid_sample(
+                    adapted_i, grid_i,
+                    mode='bilinear', padding_mode=resample_padding, align_corners=True,
+                )
+                aligned_list.append(aligned_i)
+            aligned = torch.cat(aligned_list, dim=0)
+        else:
+            if not torch.is_tensor(feat):
+                feat = torch.stack([torch.as_tensor(f) for f in feat])
+            feat = feat.to(device=device, dtype=dtype, non_blocking=True)
+            adapted = self.locate_feat_adapter(feat)
+            grid = self._build_locate_feature_grid(
+                batch, target_h, target_w, device, dtype,
+            )
+            aligned = F.grid_sample(
+                adapted, grid,
+                mode='bilinear', padding_mode=resample_padding, align_corners=True,
+            )
+
         stats = {
             'locate_feat_residual_absmax': aligned.detach().abs().max(),
             'locate_feat_adapter_last_absmax': self.locate_feat_adapter.proj[-1].weight.detach().abs().max(),
@@ -998,24 +1191,66 @@ class Network(nn.Module):
             )
 
         feat = batch['locate_feat']
+        device = cnn_feature.device
+        dtype = cnn_feature.dtype
+        target_h = int(cnn_feature.size(2))
+        target_w = int(cnn_feature.size(3))
+        bsz = int(cnn_feature.size(0))
+        resample_padding = str(
+            getattr(cfg, 'locate_feat_resample_padding_mode', 'zeros')
+        ).strip().lower()
+        if resample_padding not in ('zeros', 'border', 'reflection'):
+            raise ValueError(
+                'locate_feat_resample_padding_mode must be zeros/border/reflection, '
+                'got {!r}'.format(resample_padding)
+            )
+        # The replacer upsamples the MoonViT grid by this factor, so the
+        # resampling grid must be built against the upsampled cell size.
+        source_scale = float(getattr(self.locate_feat_replacer, 'upscale', 2))
+
+        # Variable-size MoonViT caches are collated as a Python list of [C,H,W]
+        # tensors. Process each sample independently so grid_sample stays exact.
+        if isinstance(feat, (list, tuple)):
+            if len(feat) != bsz:
+                raise ValueError(
+                    "locate_feat list length {} != batch size {}".format(len(feat), bsz)
+                )
+            # Feature-map sizes can differ across samples, so the feature path
+            # remains per-sample. Coordinate construction does not need to be.
+            grid = self._build_locate_feature_grid(
+                batch, target_h, target_w, device, dtype, source_scale=source_scale,
+            )
+            outs = []
+            absmax = cnn_feature.new_tensor(0.0)
+            for i in range(bsz):
+                fi = feat[i]
+                if not torch.is_tensor(fi):
+                    fi = torch.as_tensor(fi)
+                fi = fi.to(device=device, dtype=dtype, non_blocking=True)
+                if fi.dim() == 3:
+                    fi = fi.unsqueeze(0)
+                ri = self.locate_feat_replacer(fi)
+                grid_i = grid[i:i + 1]
+                ri = F.grid_sample(
+                    ri, grid_i, mode='bilinear',
+                    padding_mode=resample_padding, align_corners=True,
+                )
+                outs.append(ri)
+                absmax = torch.maximum(absmax, ri.detach().abs().max())
+            replaced = torch.cat(outs, dim=0)
+            return replaced, {'locate_feat_replace_absmax': absmax}
+
         if not torch.is_tensor(feat):
             feat = torch.as_tensor(feat)
-        feat = feat.to(device=cnn_feature.device, dtype=cnn_feature.dtype, non_blocking=True)
+        feat = feat.to(device=device, dtype=dtype, non_blocking=True)
         replaced = self.locate_feat_replacer(feat)
         grid = self._build_locate_feature_grid(
-            batch,
-            int(cnn_feature.size(2)),
-            int(cnn_feature.size(3)),
-            cnn_feature.device,
-            cnn_feature.dtype,
-            source_scale=2.0,
+            batch, target_h, target_w, device, dtype,
+            source_scale=float(self.locate_feat_replace_upscale),
         )
         replaced = F.grid_sample(
-            replaced,
-            grid,
-            mode='bilinear',
-            padding_mode='zeros',
-            align_corners=True,
+            replaced, grid, mode='bilinear',
+            padding_mode=resample_padding, align_corners=True,
         )
         stats = {
             'locate_feat_replace_absmax': replaced.detach().abs().max(),
@@ -1255,8 +1490,11 @@ class Network(nn.Module):
             )
             score = torch.ones((n, 1), device=device, dtype=dtype)
             ct_cls = batch['ct_cls'][b, keep].to(device=device, dtype=dtype).view(n, 1)
-            if self.detector_backend.startswith('heatmap_'):
-                ct_cls = ct_cls - float(getattr(cfg, 'heatmap_class_offset', 0))
+            class_offset = int(getattr(cfg, 'gt_detection_class_offset', 0))
+            if class_offset == 0 and self.detector_backend.startswith('heatmap_'):
+                # Backward compatibility for legacy heatmap configs; subtract once only.
+                class_offset = int(getattr(cfg, 'heatmap_class_offset', 0))
+            ct_cls = self.offset_gt_detection_classes(ct_cls, class_offset)
             packed_ct[b, :n] = ct_feat * dr
             packed_det[b, :n] = torch.cat([bboxes, score, ct_cls], dim=1)
 
@@ -1291,7 +1529,12 @@ class Network(nn.Module):
                 'feat_hw': (h, w),
                 'cnn_feature': cnn_feature,
             }
-            if getattr(cfg, 'use_gt_det', False):
+            if self.should_use_gt_detection(
+                getattr(cfg, 'use_gt_det', False),
+                getattr(cfg, 'use_gt_det_train_only', False),
+                self.training,
+                batch,
+            ):
                 self.use_gt_detection(output, batch)
             output = self.attach_extreme_prediction(output, cnn_feature, batch)
 
@@ -1338,19 +1581,64 @@ class Network(nn.Module):
             or self.detector_backend.startswith('convnext')
             or self.detector_backend.startswith('moonvit')
         ):
-            cnn_feature, ct_hm, wh, mask_logits = self.heatmap_detector(x)
-            if mask_logits is not None:
-                mask_guidance_alpha = float(getattr(cfg, 'heatmap_mask_guidance_alpha', 0.0))
-                if mask_guidance_alpha > 0.0:
-                    mask_guidance = torch.sigmoid(mask_logits).amax(dim=1, keepdim=True)
-                    cnn_feature = cnn_feature * (1.0 + mask_guidance_alpha * mask_guidance)
+            use_gt_detection = self.should_use_gt_detection(
+                getattr(cfg, 'use_gt_det', False),
+                getattr(cfg, 'use_gt_det_train_only', False),
+                self.training,
+                batch,
+            )
+            skip_heatmap_detector = (
+                use_gt_detection
+                and bool(getattr(cfg, 'skip_heatmap_detector_when_gt', False))
+                and self.locate_feat_replace
+                and self.locate_feat_replacer is not None
+                and not self.use_extreme_refine
+            )
+            if skip_heatmap_detector:
+                det_loss_weight = float(getattr(cfg, 'loss_scales', {}).get('det', 1.0))
+                if self.training and det_loss_weight != 0.0:
+                    raise RuntimeError(
+                        'skip_heatmap_detector_when_gt requires loss_scales.det=0 during training'
+                    )
+                stride = max(int(round(self.down_ratio)), 1)
+                feature_h = (int(x.size(2)) + stride - 1) // stride
+                feature_w = (int(x.size(3)) + stride - 1) // stride
+                feature_channels = int(getattr(cfg, 'heatmap_feat_channels', 256))
+                feature_dtype = (
+                    torch.get_autocast_gpu_dtype()
+                    if torch.is_autocast_enabled() else x.dtype
+                )
+                cnn_feature = x.new_zeros(
+                    (x.size(0), feature_channels, feature_h, feature_w), dtype=feature_dtype
+                )
+                ct_hm = x.new_zeros(
+                    (x.size(0), self.detector_num_classes, feature_h, feature_w), dtype=feature_dtype
+                )
+                wh = x.new_zeros((x.size(0), 2, feature_h, feature_w), dtype=feature_dtype)
+                mask_logits = None
+            else:
+                cnn_feature, ct_hm, wh, mask_logits = self.heatmap_detector(x)
+                if mask_logits is not None:
+                    mask_guidance_alpha = float(getattr(cfg, 'heatmap_mask_guidance_alpha', 0.0))
+                    if mask_guidance_alpha > 0.0:
+                        mask_guidance = torch.sigmoid(mask_logits).amax(dim=1, keepdim=True)
+                        cnn_feature = cnn_feature * (1.0 + mask_guidance_alpha * mask_guidance)
             det_cnn_feature = cnn_feature
             snake_feature, locate_feat_stats = self.apply_locate_feature_injection(det_cnn_feature, batch)
-            snake_feature, replace_stats = self.apply_locate_feature_replacement(snake_feature, batch)
+            if self.freeze_snake:
+                replace_stats = {}
+            else:
+                snake_feature, replace_stats = self.apply_locate_feature_replacement(snake_feature, batch)
             locate_feat_stats.update(replace_stats)
             h, w = det_cnn_feature.size(2), det_cnn_feature.size(3)
-            ct, raw_det = self.decode_detection_from_heatmap(ct_hm, wh)
-            detection = self.filter_detection_candidates(raw_det)
+            if use_gt_detection:
+                # Training will replace these with GT detections below. Avoid
+                # building an unused top-k/NMS graph from the heatmap outputs.
+                ct = ct_hm.new_zeros((ct_hm.size(0), 0, 2))
+                detection = ct_hm.new_zeros((ct_hm.size(0), 0, 6))
+            else:
+                ct, raw_det = self.decode_detection_from_heatmap(ct_hm, wh)
+                detection = self.filter_detection_candidates(raw_det)
 
             output = {
                 'ct_hm': ct_hm,
@@ -1363,12 +1651,15 @@ class Network(nn.Module):
             output.update(locate_feat_stats)
             if mask_logits is not None:
                 output['mask_logits'] = mask_logits
-            if getattr(cfg, 'use_gt_det', False):
+            if use_gt_detection:
                 self.use_gt_detection(output, batch)
             output = self.attach_extreme_prediction(output, det_cnn_feature, batch)
             if (not self.training) and str(getattr(cfg, 'contour_init_method', 'octagon')).strip().lower() == 'sam':
                 from lib.utils.snake.sam_init import attach_sam_testing_init
                 output = attach_sam_testing_init(output, batch, device=x.device)
+            if (not self.training) and batch is not None and batch.get('prev_contour_cache'):
+                from lib.utils.snake.prev_contour_init import attach_prev_contour_testing_init
+                output = attach_prev_contour_testing_init(output, batch, device=x.device)
             det_side_output = {
                 k: output[k]
                 for k in ('ct_hm', 'wh', 'ct', 'detection', 'mask_logits')
@@ -1409,93 +1700,81 @@ class Network(nn.Module):
                     p3_up = F.interpolate(p3, size=p2.shape[-2:], mode='bilinear', align_corners=False)
                     cnn_feature = cnn_feature + self.cnn_proj_p3(p3_up)
 
+        det_cnn_feature = cnn_feature
+        snake_feature, locate_feat_stats = self.apply_locate_feature_injection(det_cnn_feature, batch)
+
         # 从 YOLO 输出构建 detection (B, N, 6) => [x1,y1,x2,y2,score,cls]
         # 并按配置执行阈值+NMS，确保训练/测试阶段一致地给 Snake 提供精简候选
-        h, w = cnn_feature.size(2), cnn_feature.size(3) # 这个h,w是特征图的尺寸，相比图像尺寸缩小了4倍
+        h, w = det_cnn_feature.size(2), det_cnn_feature.size(3) # 这个h,w是特征图的尺寸，相比图像尺寸缩小了4倍
         h_img, w_img = h*4, w*4
         raw_det = self.decode_detection_from_yolo(yolo_y, h_img, w_img)  # [B, HW, 6]
 
-        use_nms = getattr(cfg, 'use_nms_for_snake', True)
-        conf_thres = float(getattr(cfg, 'det_conf_thresh', 0.20))
-        iou_thres = float(getattr(cfg, 'det_iou_thresh', 0.30))
-        max_det = int(getattr(cfg, 'det_max_det', 300))
-        per_class = bool(getattr(cfg, 'per_class_nms', True))
-
-        # 直接使用 YOLO 内部 NMS，保证与推理后处理完全一致
-        if use_nms:
-            from lib.networks.YOLOV8.utils.ops import non_max_suppression
-
-            # 从 yolo 输出构建 NMS 所需的 prediction 张量: (B, 4+nc, HW)
-            y = yolo_y.permute(0, 2, 1).contiguous()  # (B, HW, 4+nc)
-            xywh = y[..., :4]
-            cls_logits = y[..., 4:]
-            cls_prob = cls_logits.sigmoid()
-            # 转为 xyxy 并裁剪
-            x_c, y_c, w_box, h_box = xywh.unbind(-1)
-            x1 = x_c - w_box / 2
-            y1 = y_c - h_box / 2
-            x2 = x_c + w_box / 2
-            y2 = y_c + h_box / 2
-            boxes = torch.stack([x1, y1, x2, y2], dim=-1)
-            boxes = data_utils.clip_to_image(boxes, h_img, w_img)
-
-            pred = torch.cat([boxes, cls_prob], dim=-1).permute(0, 2, 1).contiguous()  # (B, 4+nc, HW)
-
-            nms_out = non_max_suppression(
-                pred,
-                conf_thres=conf_thres,
-                iou_thres=iou_thres,
-                classes=None,
-                agnostic=not per_class,
-                multi_label=False,
-                labels=(),
-                max_det=max_det,
-                nc=cls_prob.shape[-1],
-                in_place=True,
-                rotated=True,
-            )
-
-            # 打包为 [B, M, 6]
-            max_len = max((d.size(0) for d in nms_out), default=0)
-            if max_len == 0:
-                detection = raw_det.new_zeros((raw_det.size(0), 0, 6))
-            else:
-                detection = raw_det.new_zeros((raw_det.size(0), max_len, 6))
-                for b, det_b in enumerate(nms_out):
-                    if det_b is not None and det_b.size(0) > 0:
-                        detection[b, :det_b.size(0)] = det_b[:, :6]
-        else:
-            detection = raw_det
+        detection = self.filter_detection_candidates(raw_det)
 
         # 构造与下游一致的 output 字典
         output = {}
         output.update({'detection': detection})
+        output.update(locate_feat_stats)
         # 记录特征图尺寸，供可视化/坐标缩放使用（不再依赖 ct_hm）
         output['feat_hw'] = (h, w)
-        output['cnn_feature'] = cnn_feature
+        output['cnn_feature'] = snake_feature
 
         # 训练时可选择使用 GT 框替换
-        if getattr(cfg, 'use_gt_det', False):
+        if self.should_use_gt_detection(
+            getattr(cfg, 'use_gt_det', False),
+            getattr(cfg, 'use_gt_det_train_only', False),
+            self.training,
+            batch,
+        ):
             self.use_gt_detection(output, batch)
 
-        output = self.attach_extreme_prediction(output, cnn_feature, batch)
+        output = self.attach_extreme_prediction(output, det_cnn_feature, batch)
 
         if (not self.training) and str(getattr(cfg, 'contour_init_method', 'octagon')).strip().lower() == 'sam':
             from lib.utils.snake.sam_init import attach_sam_testing_init
             output = attach_sam_testing_init(output, batch, device=x.device)
 
-        # 传入 Snake 进行演化
+        if (not self.training) and batch is not None and batch.get('prev_contour_cache'):
+            from lib.utils.snake.prev_contour_init import attach_prev_contour_testing_init
+            output = attach_prev_contour_testing_init(output, batch, device=x.device)
+
+        detector_side_output = {
+            key: output[key]
+            for key in (
+                'ct_hm', 'wh', 'ct', 'detection', 'ex', 'ex_py_ind',
+                'sam_i_it_py', 'sam_c_it_py', 'sam_py_ind', 'sam_ct',
+                'sam_raw_i_it_py', 'samsnake_coarse_i_it_py',
+            )
+            if key in output
+        }
+
+        # 传入 Snake 进行演化。部分 evolution 实现返回一个新字典，
+        # 因而需要像 heatmap 分支一样恢复 detector-side keys。
         if self.gcn is not None and not self.freeze_snake:
-            output = self.gcn(output, cnn_feature, batch)
+            output = self.gcn(output, snake_feature, batch)
+        output.update(detector_side_output)
+        output.update(locate_feat_stats)
         output['feat_hw'] = (h, w)
-        output['cnn_feature'] = cnn_feature
-        # print("output",output.keys())
-        # print("py_pred",len(output['py_pred']))
-        # print("py_pred",output['py_pred'][-1].shape)
-        # print("detection",output['detection'].shape)
+        output['cnn_feature'] = snake_feature
 
         # 暴露 YOLO 原始预测供损失使用
         output['yolo_preds'] = (yolo_y, yolo_feats)
+
+        if (
+            not self.training
+            and str(getattr(cfg, 'contour_init_method', 'octagon')).strip().lower() == 'octagon'
+        ):
+            yolo_nc = int(
+                getattr(self.yolo, 'yaml', {}).get(
+                    'nc', getattr(cfg, 'yolo_num_classes', 0) or 0
+                )
+                or 0
+            )
+            output = self.attach_py_detection_metadata(
+                output,
+                fail_on_mismatch=True,
+                num_classes=yolo_nc if yolo_nc > 0 else None,
+            )
 
         return output
 

@@ -290,10 +290,14 @@ class DiffusionPretrainNetworkWrapper(nn.Module):
             if debug_key in output:
                 value = output[debug_key]
                 if isinstance(value, torch.Tensor):
-                    scalar_stats[debug_key] = value.detach().cpu()
+                    # Keep diagnostics on the training device. Trainer batches
+                    # scalar diagnostics into one host transfer at log time.
+                    scalar_stats[debug_key] = value.detach()
                 else:
                     try:
-                        scalar_stats[debug_key] = torch.tensor(float(value))
+                        scalar_stats[debug_key] = torch.tensor(
+                            float(value), device=base_device
+                        )
                     except Exception:
                         pass
 
@@ -387,7 +391,17 @@ class DiffusionPretrainNetworkWrapper(nn.Module):
         # Clean up large intermediate outputs during training to save memory
         if self.training and isinstance(output, dict):
             output.pop('yolo_preds', None)
-            # Return minimal output during training
-            output = {}
+            if bool(getattr(cfg, 'volmem_return_training_prediction', False)):
+                # MemFlowDiT uses the detached endpoint estimate as scheduled
+                # memory evidence for the following slice.  Keep only the two
+                # small tensors required to rasterize it; the normal 2D trainer
+                # still returns an empty output and retains its old memory use.
+                output = {
+                    key: output[key]
+                    for key in ('pred_contours', 'py_ind')
+                    if key in output
+                }
+            else:
+                output = {}
 
         return output, loss, scalar_stats, image_stats

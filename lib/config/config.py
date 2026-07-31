@@ -37,6 +37,7 @@ cfg.gpus = [0]
 cfg.resume = True
 cfg.resume_weights_only = False
 cfg.resume_path = ''
+cfg.resume_exclude_prefixes = []
 
 # Diffusion/Snake integration switches
 cfg.use_diffusion_evolution = False
@@ -47,8 +48,11 @@ cfg.detector_only_warmup = False
 cfg.detector_backend = 'yolo'
 cfg.heatmap_backbone = 'resnet18'
 cfg.heatmap_pretrained = False
+cfg.freeze_heatmap_detector = False
+cfg.skip_heatmap_detector_when_gt = False
 cfg.heatmap_wh_weight = 0.1
 cfg.heatmap_class_offset = 0
+cfg.gt_detection_class_offset = 0
 cfg.convnext_model_name = 'convnextv2_tiny'
 cfg.convnext_pretrained = False
 cfg.convnext_pretrained_path = ''
@@ -81,6 +85,38 @@ cfg.locate_feat_cache_root = 'data/locate_feat_cache'
 cfg.locate_feat_cache_dir = ''
 cfg.locate_feat_keys = ['feat']
 cfg.locate_feat_dim = 2304
+# Upsampling factor inside LocateFeatReplacer (PixelShuffle). MoonViT grids are
+# coarse (patch 14 -> ~10.6 original pixels per cell), so 2 leaves neighbouring
+# contour points inside a single feature cell. 4 halves that effective stride.
+cfg.locate_feat_replace_upscale = 2
+# Number of stacked MoonViT layers fed to LocateFeatReplacer. When > 1 the
+# cached layers are concatenated along channels, and their raw scales differ a
+# lot (layer_18 std ~0.93 vs layer_26 std ~2.64), so layer_26 dominates the
+# 1x1 input conv. Setting this to the layer count enables a parameter-free
+# per-layer GroupNorm(affine=False) in front of the projection, which equalises
+# the two layers without changing the state_dict.
+cfg.locate_feat_input_layers = 1
+# Per-point contour sampling in snake_gcn_utils.get_gcn_feature().
+# 'legacy' keeps the original ResNet/YOLOv8-era formula (2x/w - 1), which sits
+# half a pixel off the pixel-center convention; 'half_pixel' corrects it and
+# agrees with the align_corners=True grid used by locate-feature replacement.
+# 'border' padding stops contour points outside the map from sampling zeros.
+cfg.gcn_sample_mode = 'legacy'
+cfg.gcn_sample_padding_mode = 'zeros'
+# Minimum GT polygon area, measured in the 1/4-resolution output space, below
+# which an instance is dropped from supervision (snake_voc_utils.filter_tiny
+# _polys). The inherited VOC value of 5.0 was tuned for large natural objects;
+# sagittal vertebrae of 84-217 px^2 in a 616x473 slice shrink to 0.3-4.8 px^2
+# after the 512-input / 128-output transform and are silently discarded, which
+# is why 26 foreground val slices predict nothing at all.
+cfg.min_poly_area_output = 5.0
+cfg.sagittal_moonvit_cache_root = ''
+cfg.sagittal_moonvit_feature_key = 'layer_18'
+cfg.sagittal_moonvit_fusion_mode = 'center_neighbor_mean'
+cfg.sagittal_moonvit_expected_input_size = 448
+cfg.sagittal_moonvit_expected_patch_size = 14
+cfg.sagittal_moonvit_expected_normalization = 'moonvit_pretrained_rgb_mean_std'
+cfg.sagittal_moonvit_expected_checkpoint = ''
 cfg.use_swin_snake_feature = False
 cfg.swin_model_name = 'swin_tiny_patch4_window7_224'
 cfg.swin_img_size = 672
@@ -173,6 +209,10 @@ cfg.iterative_ode_steps = 0
 cfg.v3_4_use_p3_features = False
 cfg.v3_4_use_detail_context = False
 cfg.v3_4_detail_context_mode = 'normal'
+cfg.v3_7_use_p3_features = False
+cfg.v3_7_use_detail_context = False
+cfg.v3_7_use_detail_curve_context = False
+cfg.v3_7_detail_context_mode = 'normal'
 cfg.v4_use_p3_features = False
 cfg.v4_use_detail_context = False
 cfg.v4_detail_context_mode = 'normal_tangent'
@@ -182,9 +222,14 @@ cfg.v4_per_point_delta_reg_weight = 0.0
 cfg.v4_1_use_p3_features = False
 cfg.v4_1_use_detail_context = False
 cfg.v4_1_detail_context_mode = 'normal'
+cfg.v4_1_final_head_type = 'standard'
 cfg.v4_1_use_per_point_delta = True
 cfg.v4_1_per_point_delta_scale = 0.10
 cfg.v4_1_per_point_delta_reg_weight = 0.0
+# V4.6 output-head MoE balancing. Legacy remains the compatibility default;
+# hard_phi converts measured hard Top-K congestion into a differentiable price.
+cfg.v4_6_moe_balance_mode = 'legacy'
+cfg.v4_6_moe_hard_phi_ema_decay = 0.99
 cfg.v4_1_use_curvature_reweight = False
 cfg.v4_1_curvature_loss_weight = 1.5
 cfg.v4_1_curvature_reweight_power = 1.0
@@ -233,6 +278,17 @@ cfg.v4_10_dit_ffn_moe_routed_scale = 1.0
 cfg.v4_10_dit_ffn_moe_use_point_embed = True
 cfg.v4_10_dit_ffn_moe_use_cyclic_router = True
 
+# V5.1 research: prototype routing + population-level phi balancing.
+cfg.v5_1_use_prototype_phi_moe = False
+cfg.v5_1_prototype_phi_moe_layers = 'odd'
+cfg.v5_1_prototype_phi_num_experts = 4
+cfg.v5_1_prototype_phi_top_k = 1
+cfg.v5_1_prototype_phi_hidden_dim = 0
+cfg.v5_1_prototype_phi_router_temperature = 0.20
+cfg.v5_1_prototype_phi_balance_weight = 1e-3
+cfg.v5_1_prototype_phi_ema_decay = 0.99
+cfg.v5_1_prototype_phi_contrastive_weight = 1e-3
+
 # V4.6d: route shared expert together with routed experts instead of always-on residual addition.
 cfg.v4_6_moe_route_shared_expert = False
 
@@ -264,8 +320,30 @@ cfg.yolo_num_classes = 0
 cfg.yolo_model_scale = ''
 cfg.yolo_train_scope = 'head'
 cfg.disable_lr_flip = False
+cfg.pseudo3d_symmetric_stem_init = False
+cfg.require_yolo_pretrained = False
+
+# Sagittal pseudo-3D input defaults (three grayscale slices in three channels).
+cfg.pseudo3d_mean = 0.5
+cfg.pseudo3d_std = 0.5
+cfg.pseudo3d_color_aug = False
+cfg.pseudo3d_lr_flip = False
+cfg.pseudo3d_random_crop = True
+cfg.pseudo3d_input_mode = 'neighbors'
+
 cfg.dataloader_persistent_workers = True
 cfg.dataloader_prefetch_factor = 4
+
+# Distributed training/runtime tuning.
+cfg.ddp_sync_mode = 'standard'
+cfg.ddp_find_unused_parameters = True
+cfg.ddp_gradient_as_bucket_view = True
+cfg.ddp_bucket_cap_mb = 25
+cfg.use_amp = False
+cfg.amp_dtype = 'bfloat16'
+cfg.enable_tf32 = True
+cfg.cudnn_benchmark = True
+cfg.cuda_empty_cache_interval = 0
 
 # V5.0: optional SAM mask-based contour initialization.
 cfg.contour_init_method = 'octagon'
@@ -324,6 +402,9 @@ cfg.train.dataset = 'SbdTrain'
 cfg.train.epoch = 140
 cfg.train.max_steps = 0
 cfg.train.num_workers = 8
+cfg.train.gradient_accumulation_steps = 1
+cfg.train.gradient_clip = 40.0
+cfg.train.drop_last = False
 
 # use adam as default
 cfg.train.optim = 'adam'
@@ -363,6 +444,7 @@ cfg.save_ep = 100
 cfg.eval_ep = 5
 
 cfg.use_gt_det = False
+cfg.use_gt_det_train_only = False
 cfg.diffusion_init_source = 'extreme'
 cfg.ex_box_jitter_scale = 0.0
 cfg.ex_box_jitter_shift = 0.0
@@ -382,7 +464,12 @@ def parse_cfg(cfg, args):
     grpo_gpu_override = os.environ.get('GRPO_V2_GPU', '').strip()
     if grpo_gpu_override:
         cfg.gpus = [int(grpo_gpu_override)]
-    os.environ['CUDA_VISIBLE_DEVICES'] = ', '.join([str(gpu) for gpu in cfg.gpus])
+    # CUDA rejects the whole list when it contains spaces (it then falls back to
+    # "all devices visible"), so join without a separator space. An externally
+    # provided CUDA_VISIBLE_DEVICES wins: under torchrun the launcher pins the
+    # devices before this runs.
+    if not os.environ.get('CUDA_VISIBLE_DEVICES', '').strip():
+        os.environ['CUDA_VISIBLE_DEVICES'] = ','.join(str(gpu) for gpu in cfg.gpus)
 
     cfg.det_dir = os.path.join(cfg.model_dir, cfg.task, args.det)
 

@@ -20,7 +20,7 @@ def collect_training(poly, ct_01):
 
 
 def prepare_training_init(ret, batch):
-    ct_01 = batch['ct_01'].byte()
+    ct_01 = batch['ct_01'].bool()
     init = {}
     init.update({'i_it_4py': collect_training(batch['i_it_4py'], ct_01)})
     init.update({'c_it_4py': collect_training(batch['c_it_4py'], ct_01)})
@@ -197,7 +197,7 @@ def prepare_training_box(ret, batch, init):
     score = ret['detection'][..., 4]
     batch_size = box.size(0)
     i_gt_4py = batch['i_gt_4py']
-    ct_01 = batch['ct_01'].byte()
+    ct_01 = batch['ct_01'].bool()
     ind = [get_box_match_ind(box[i], score[i], i_gt_4py[i][ct_01[i]]) for i in range(batch_size)]
     box_ind = [ind_[0] for ind_ in ind]
     gt_ind = [ind_[1] for ind_ in ind]
@@ -235,7 +235,7 @@ def prepare_training_box(ret, batch, init):
 
 
 def prepare_training(ret, batch):
-    ct_01 = batch['ct_01'].byte()
+    ct_01 = batch['ct_01'].bool()
     init = {}
     init.update({'i_it_4py': collect_training(batch['i_it_4py'], ct_01)})
     init.update({'c_it_4py': collect_training(batch['c_it_4py'], ct_01)})
@@ -294,17 +294,67 @@ def prepare_testing_evolve(ex):
 
 # 从CNN-map中提取数据，为蛇演化提供信息，这个很重要！！！
 # cnn_feature为 1,64,136,136.
-def get_gcn_feature(cnn_feature, img_poly, ind, h, w):  # h=w=136
-    norm_x = img_poly[..., 0] / (w / 2.) - 1  #  大小放缩至 -1 到 1 之间
-    norm_y = img_poly[..., 1] / (h / 2.) - 1
+_GCN_SAMPLE_CFG = None
+
+
+def _gcn_sample_cfg():
+    """Lazily read point-sampling options from the global config.
+
+    Kept lazy so this module stays importable without a config, and cached
+    because get_gcn_feature() is called many times per forward pass.
+    """
+    global _GCN_SAMPLE_CFG
+    if _GCN_SAMPLE_CFG is None:
+        try:
+            from lib.config import cfg as _cfg
+            mode = str(getattr(_cfg, 'gcn_sample_mode', 'legacy'))
+            padding_mode = str(getattr(_cfg, 'gcn_sample_padding_mode', 'zeros'))
+        except Exception:
+            mode, padding_mode = 'legacy', 'zeros'
+        if mode not in ('legacy', 'half_pixel'):
+            raise ValueError(
+                "cfg.gcn_sample_mode must be 'legacy' or 'half_pixel', got {!r}".format(mode)
+            )
+        if padding_mode not in ('zeros', 'border', 'reflection'):
+            raise ValueError(
+                "cfg.gcn_sample_padding_mode must be zeros/border/reflection, got {!r}".format(padding_mode)
+            )
+        _GCN_SAMPLE_CFG = (mode, padding_mode)
+    return _GCN_SAMPLE_CFG
+
+
+def get_gcn_feature(cnn_feature, img_poly, ind, h, w):
+    """Sample per-point features from a feature map at contour coordinates.
+
+    ``img_poly`` holds continuous coordinates in feature-map pixel units.
+
+    Two coordinate conventions are supported via ``cfg.gcn_sample_mode``:
+
+    * ``legacy`` (default) reproduces the original ResNet/YOLOv8-era formula
+      ``2x/w - 1`` with ``align_corners=False``. This is half a pixel short of
+      the pixel-center convention, a bias that is negligible at stride 4 but
+      not on a coarse MoonViT grid.
+    * ``half_pixel`` uses ``(x + 0.5) * 2/w - 1`` with ``align_corners=False``,
+      which maps integer coordinates onto pixel centers exactly and matches the
+      ``align_corners=True`` grid built in apply_locate_feature_replacement.
+    """
+    mode, padding_mode = _gcn_sample_cfg()
+    if mode == 'half_pixel':
+        norm_x = (img_poly[..., 0] + 0.5) * (2.0 / w) - 1
+        norm_y = (img_poly[..., 1] + 0.5) * (2.0 / h) - 1
+    else:
+        norm_x = img_poly[..., 0] / (w / 2.) - 1  #  大小放缩至 -1 到 1 之间
+        norm_y = img_poly[..., 1] / (h / 2.) - 1
     img_poly = torch.stack([norm_x, norm_y], dim=-1)
 
-    batch_size = cnn_feature.size(0)  # batch_size = 1
+    batch_size = cnn_feature.size(0)
     gcn_feature = torch.zeros([img_poly.size(0), cnn_feature.size(1), img_poly.size(1)]).to(img_poly.device)
-    for i in range(batch_size):   # i只能为0
+    for i in range(batch_size):
         poly = img_poly[ind == i].unsqueeze(0)
 
-        feature = torch.nn.functional.grid_sample(cnn_feature[i:i+1], poly)[0].permute(1, 0, 2)  # 7, 64,40     cnn_feature[i:i+1] 实际上就是 cnn_feature[i]，即当前批次的特征图。这个特征图的形状为 [1, 64, 136, 136]
+        feature = torch.nn.functional.grid_sample(
+            cnn_feature[i:i + 1], poly, padding_mode=padding_mode,
+        )[0].permute(1, 0, 2)
         gcn_feature[ind == i] = feature
     #print(img_poly.size)  # 7,40,2    7个多边形，每个多边形上40个点，每个点两个坐标x,y
     #print(poly.size)  # 1,7,40,2

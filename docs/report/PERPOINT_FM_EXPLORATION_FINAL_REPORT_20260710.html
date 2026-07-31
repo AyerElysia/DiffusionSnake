@@ -1,0 +1,198 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>DiffusionSnake 逐点 FM 探索路线：完整研究与实验总结</title>
+<style>
+:root{--bg:#0d1117;--panel:#161b22;--panel2:#1f2632;--text:#e6edf3;--muted:#8b949e;--blue:#58a6ff;--green:#3fb950;--red:#f85149;--orange:#d29922;--purple:#bc8cff;--cyan:#39c5cf;--border:#30363d;--shadow:rgba(0,0,0,.28)}
+*{box-sizing:border-box}html{scroll-behavior:smooth}body{margin:0;background:var(--bg);color:var(--text);font-family:-apple-system,BlinkMacSystemFont,"Segoe UI","PingFang SC","Microsoft YaHei",Arial,sans-serif;line-height:1.72;font-size:15px}.wrap{max-width:1240px;margin:auto;padding:28px 26px 90px}header{padding:30px 32px;background:linear-gradient(135deg,#162337,#20192b 56%,#17262a);border:1px solid var(--border);border-radius:16px;box-shadow:0 12px 32px var(--shadow)}h1{font-size:30px;line-height:1.3;margin:0 0 9px}h2{font-size:23px;margin:42px 0 16px;padding-bottom:9px;border-bottom:1px solid var(--border)}h3{font-size:18px;margin:28px 0 12px;color:#d2d9e3}h4{font-size:15px;color:var(--blue);margin:18px 0 8px}.subtitle{font-size:16px;color:#c2cad4}.meta{margin-top:12px;color:var(--muted);font-size:13px}.toc{columns:2;column-gap:34px}.toc a{display:block;color:#a9cfff;text-decoration:none;padding:3px 0}.toc a:hover{color:#fff}.panel{background:var(--panel);border:1px solid var(--border);border-radius:12px;padding:20px 22px;margin:16px 0;box-shadow:0 6px 18px var(--shadow)}.tldr{border-left:5px solid var(--blue);background:linear-gradient(135deg,#172131,#22192a)}.success{border-left:5px solid var(--green)}.warn{border-left:5px solid var(--orange)}.danger{border-left:5px solid var(--red)}.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(235px,1fr));gap:14px;margin:17px 0}.kpi{padding:17px 18px;border-radius:11px;background:var(--panel);border:1px solid var(--border)}.kpi .v{font:700 27px/1.2 ui-monospace,SFMono-Regular,Consolas,monospace;color:var(--blue)}.kpi .v.good{color:var(--green)}.kpi .v.bad{color:var(--red)}.kpi .v.warn{color:var(--orange)}.kpi .label{font-weight:600;margin-top:6px}.kpi .sub{font-size:12px;color:var(--muted);margin-top:3px}table{width:100%;border-collapse:collapse;margin:14px 0;font-size:14px;overflow:hidden}th,td{padding:10px 12px;border-bottom:1px solid var(--border);vertical-align:top}th{background:var(--panel2);color:#a9cfff;text-align:left;position:sticky;top:0}tr:hover td{background:rgba(88,166,255,.045)}td.num{text-align:right;font-family:ui-monospace,SFMono-Regular,Consolas,monospace;white-space:nowrap}.best{color:var(--green);font-weight:700}.bad-text{color:var(--red)}.warn-text{color:var(--orange)}.muted{color:var(--muted)}code{font-family:ui-monospace,SFMono-Regular,Consolas,monospace;background:var(--panel2);color:#ffb86b;border:1px solid #343d4c;border-radius:5px;padding:2px 6px;font-size:13px}pre{overflow:auto;background:#111722;border:1px solid var(--border);border-radius:9px;padding:15px 17px;color:#dce6f2;font-size:13px}ul,ol{padding-left:24px}li{margin:5px 0}.formula{text-align:center;font:600 16px ui-monospace,SFMono-Regular,Consolas,monospace;background:#111722;border:1px solid var(--border);padding:15px;border-radius:9px;margin:14px 0;color:#c9e1ff}.timeline{position:relative;margin:20px 0}.timeline:before{content:"";position:absolute;left:13px;top:7px;bottom:7px;width:2px;background:var(--border)}.event{position:relative;padding:0 0 18px 42px}.event:before{content:"";position:absolute;left:6px;top:7px;width:16px;height:16px;border-radius:50%;background:var(--blue);border:3px solid var(--bg)}.event.fail:before{background:var(--red)}.event.partial:before{background:var(--orange)}.event.good:before{background:var(--green)}.event h4{margin:0 0 4px;color:var(--text)}.event p{margin:0;color:#c7ced8}.badge{display:inline-block;border-radius:12px;padding:2px 8px;margin:0 4px 3px 0;font-size:12px;border:1px solid var(--border);background:var(--panel2)}.badge.green{color:#78db8a}.badge.red{color:#ff8984}.badge.orange{color:#f0c45e}.bar-chart{display:grid;gap:10px}.bar-row{display:grid;grid-template-columns:190px 1fr 92px;gap:10px;align-items:center}.bar-track{height:15px;border-radius:10px;background:#242c38;overflow:hidden}.bar{height:100%;border-radius:10px;background:linear-gradient(90deg,var(--blue),var(--cyan))}.bar.green{background:linear-gradient(90deg,#238636,var(--green))}.bar.orange{background:linear-gradient(90deg,#9e6a03,var(--orange))}.bar.red{background:linear-gradient(90deg,#b62324,var(--red))}.bar-value{text-align:right;font-family:ui-monospace,SFMono-Regular,Consolas,monospace}.ci{font-size:12px;color:var(--muted)}.decision{font-size:17px;padding:19px 22px;border-radius:11px;border:1px solid #3d5a45;background:#14221a}.path{word-break:break-all;color:#b9d6ff}.foot{margin-top:48px;border-top:1px solid var(--border);padding-top:18px;color:var(--muted);font-size:13px}@media(max-width:760px){.wrap{padding:14px}.toc{columns:1}.bar-row{grid-template-columns:120px 1fr 76px}header{padding:20px}h1{font-size:24px}}
+</style>
+</head>
+<body><div class="wrap">
+<header>
+<h1>DiffusionSnake 逐点 FM 探索路线：完整研究与实验总结</h1>
+<div class="subtitle">从动作参数化、空间归因、连续逐点 Reward、策略塌缩诊断，到 v15 完整五步末段训练与 177 样本全量评估</div>
+<div class="meta">日期：2026-07-10　·　项目：DiffusionSnake-12-30　·　数据集：1232_final　·　测试样本：177　·　Bootstrap：20,000 次<br>报告范围：逐点 FM velocity scale 路线 v1–v15、deterministic FM、旧逐点 v3、当前最佳 delta-NSD RL</div>
+</header>
+
+<section class="panel danger">
+<h2 style="margin-top:0;border:0">勘误：评估口径更新</h2>
+<p><b>请不要把本报告早期 mean/off 差值当作严格因果证据。</b>旧版逐点报告中部分 off/mean 对比混入了 actual ODE=20 与 ODE=10 的评估路径差异，存在口径混杂。</p>
+<p>后续已统一为 5-step rollout、actual ODE=10，并通过零策略 parity 验证：同一 checkpoint 的 off/mean 逐样本数组完全一致，<code>max_abs=0.0</code>。当前严格比较以后续 <code>report/perpoint_final_eval/</code> 与 <code>report/PERPOINT_FM_BOTTLENECK_ANALYSIS_20260710.html</code> 为准。</p>
+<p>本报告保留为路线演进历史记录；其中关于动作参数化、归因修复、连续 credit 的工程过程仍可参考，但涉及旧 mean/off 数值的因果判断需要按本勘误修正。</p>
+</section>
+
+<section class="panel tldr">
+<h2 style="margin-top:0;border:0">执行摘要</h2>
+<p><b>本轮工作已经把逐点路线中三个基础工程问题解决：</b>动作不会反向、跨区域错误归因被消除、单点微动作不再被栅格 Reward 吞掉。最终一步也获得了可重复的局部方向学习信号。</p>
+<p>但是，<b>局部信号尚未转化为整体 IoU / Dice / mBoundF 收益</b>。v15 相对 deterministic FM 的 NSD 提升成立，但 IoU 没有提升；相对当前最佳 delta-NSD，四项指标均显著更差。</p>
+<div class="decision"><b>最终判定：</b>delta-NSD 继续作为正式强化学习主路线；v15 作为研究性分支保留。它证明“逐点局部学习是可能的”，但目前没有证明“逐点策略优于基线”。</div>
+</section>
+
+<div class="grid">
+<div class="kpi"><div class="v good">0.5396</div><div class="label">最终步 balanced sign accuracy</div><div class="sub">step1020，可重复局部方向信号</div></div>
+<div class="kpi"><div class="v good">+0.001446</div><div class="label">v15 相对同 checkpoint FM 的 NSD</div><div class="sub">95% CI [+0.000124, +0.002786]</div></div>
+<div class="kpi"><div class="v bad">−0.000215</div><div class="label">v15 相对同 checkpoint FM 的 IoU</div><div class="sub">95% CI 跨 0，未证明改善</div></div>
+<div class="kpi"><div class="v bad">−0.002389</div><div class="label">v15 相对 delta-NSD 的 IoU</div><div class="sub">95% CI [−0.003151, −0.001623]</div></div>
+<div class="kpi"><div class="v warn">≈45×</div><div class="label">连续 credit 信号放大</div><div class="sub">v12 相对 v11 首步 point credit std</div></div>
+<div class="kpi"><div class="v good">0</div><div class="label">mask 外梯度</div><div class="sub">合成测试严格为零，跨区域归因修复</div></div>
+</div>
+
+<section class="panel"><h2 style="margin-top:0">目录</h2><div class="toc">
+<a href="#problem">1. 问题与目标</a><a href="#constraints">2. 设计约束</a><a href="#method">3. 最终方法</a><a href="#evolution">4. 版本演进与根因定位</a><a href="#credit">5. 空间归因与 Reward 修复</a><a href="#diagnosis">6. 局部学习诊断</a><a href="#full-eval">7. 177 样本全量评估</a><a href="#statistics">8. 配对统计</a><a href="#interpretation">9. 结果解释</a><a href="#conclusion">10. 最终结论与路线建议</a><a href="#repro">11. 文件与复现索引</a><a href="#validation">12. 验证清单</a>
+</div></section>
+
+<h2 id="problem">1. 问题与目标</h2>
+<p>低频 geom 探索只能用少量 Fourier 模式整体扰动轮廓。它适合低频形变，但难以表达局部凹陷、局部粘连、单个边界段偏移等精修动作。逐点路线的目标是：让策略针对每个轮廓点学习 FM velocity 的微小幅度调节，从而扩大局部探索空间。</p>
+<div class="panel warn"><b>真正困难不只是“动作维度变高”。</b>逐点探索同时引入四个耦合问题：动作可能反向造成锯齿；不同 rollout 扰动不同空间区域导致不可比较；单点动作经过 mask 栅格化后 Reward 几乎为零；类别不平衡会让策略塌缩成所有点统一减速。</div>
+
+<h2 id="constraints">2. 全程保持的设计约束</h2>
+<table><tr><th>约束</th><th>实现</th><th>目的</th></tr>
+<tr><td>动作必须沿 FM velocity</td><td>不是法线噪声，不改变方向基</td><td>保持 FM 与 DeepSnake 的主体结构</td></tr>
+<tr><td>不能反向</td><td><code>scale=tanh(raw)×0.1</code></td><td>multiplier 始终位于 (0.9, 1.1)</td></tr>
+<tr><td>必须是真实五步 rollout</td><td>后一步 state 包含前一步实际动作</td><td>避免退化为单步 RL</td></tr>
+<tr><td>归因必须局部</td><td>共享选区 + pointwise log-prob + pointwise advantage</td><td>杜绝跨区域和选区内部共享标量归因</td></tr>
+<tr><td>Reward 必须有连续分辨率</td><td>点到闭合 GT polyline 的连续距离</td><td>避免单点微动作被像素栅格化吞掉</td></tr>
+<tr><td>不使用额外熵正则</td><td><code>entropy_weight=0</code></td><td>保持实验边界清晰</td></tr>
+<tr><td>不使用 burr 硬惩罚</td><td><code>reward_burr_weight=0</code></td><td>避免高噪声惩罚压制微弱局部信号</td></tr></table>
+
+<h2 id="method">3. 最终方法：v15 末两步逐点 FM Scale</h2>
+<h3>3.1 动作参数化</h3>
+<div class="formula">raw<sub>i</sub> ~ Normal(μ<sub>i</sub>, σ<sub>i</sub>)　→　scale<sub>i</sub> = tanh(raw<sub>i</sub>) × 0.1　→　action<sub>i</sub> = FM<sub>i</sub> × (1 + scale<sub>i</sub>)</div>
+<ul><li>每个点独立产生幅度调节，但动作方向仍由 FM velocity 决定。</li><li>乘子严格限制为 <code>(0.9, 1.1)</code>，适合精修任务的小幅动作。</li><li>log-prob 使用 tanh change-of-variables 修正，PPO ratio 与实际采样分布一致。</li></ul>
+<h3>3.2 五步时序窗口</h3>
+<table><tr><th>Outer step</th><th>fraction</th><th>执行动作</th><th>探索</th><th>进入 PPO</th></tr>
+<tr><td>1</td><td class="num">0.2</td><td>deterministic FM</td><td>否</td><td>否</td></tr>
+<tr><td>2</td><td class="num">0.25</td><td>deterministic FM</td><td>否</td><td>否</td></tr>
+<tr><td>3</td><td class="num">0.3333</td><td>deterministic FM</td><td>否</td><td>否</td></tr>
+<tr><td>4</td><td class="num">0.5</td><td>逐点 FM scale</td><td>是</td><td>是</td></tr>
+<tr><td>5</td><td class="num">1.0</td><td>逐点 FM scale</td><td>是</td><td>是</td></tr></table>
+<p>这不是两步 rollout。五个 state 均真实执行，第四步 state 由前三步 deterministic FM 生成，第五步 state 还包含第四步的探索动作。</p>
+<h3>3.3 连续逐点归因</h3>
+<div class="formula">credit<sub>i</sub> = clamp((d(pure FM point<sub>i</sub>, GT) − d(sampled point<sub>i</sub>, GT)) / 8px, −1, 1)</div>
+<p>正值表示 sampled action 让该点更接近 GT 闭合边界；每个点的 log-prob 只与自己的 credit 配对。</p>
+
+<h2 id="evolution">4. 版本演进与根因定位</h2>
+<div class="timeline">
+<div class="event fail"><h4>v1：逐点加性 velocity 偏移</h4><p>探索 std 与 LR 太小，KL≈0，策略几乎不更新。</p></div>
+<div class="event partial"><h4>v2：逐点乘法 scale</h4><p>梯度打通，但无界高斯导致 multiplier 可能小于 0，出现反向动作和严重 burr。</p></div>
+<div class="event good"><h4>v3：tanh 有界 FM scale</h4><p>动作限制到 (0.9,1.1)，彻底禁止反向；成为后续统一动作基。</p></div>
+<div class="event fail"><h4>v7–v9：发现跨 rollout 空间归因错误</h4><p>不同 rollout 扰动不同区域，却用同组标量 Reward 排序，动作与 Reward 不可比较。</p></div>
+<div class="event partial"><h4>v10：共享 8 点选区 + joint log-prob</h4><p>mask 外梯度严格为零，但 8 点仍共享 contour scalar credit，局部方向接近随机。</p></div>
+<div class="event fail"><h4>v11：真正 point marginal，暴露栅格量化</h4><p>逐点归因正确，但 point credit std 仅 5e−6～9e−5，经常低于 1e−4 floor。</p></div>
+<div class="event partial"><h4>v12：连续边界距离 credit</h4><p>信号放大约 45 倍、几乎全非零；策略却塌缩为所有点减速。</p></div>
+<div class="event partial"><h4>v13：零均值 local residual</h4><p>消除统一减速塌缩，正负 recall 恢复平衡，但整体 balanced accuracy 仍约 0.5。</p></div>
+<div class="event partial"><h4>v14：100× policy LR 探针</h4><p>更新幅度和 gain 放大，但局部方向准确率没有改善，说明瓶颈不只是 LR。</p></div>
+<div class="event good"><h4>v15：完整五步，仅末两步探索与更新</h4><p>最终步获得可重复局部信号；整体性能仍未超过基线。</p></div>
+</div>
+
+<h2 id="credit">5. 空间归因与 Reward 修复的硬证据</h2>
+<div class="grid"><div class="kpi"><div class="v good">严格为 0</div><div class="label">未选点梯度</div><div class="sub">pointwise PPO 合成梯度测试</div></div><div class="kpi"><div class="v warn">4.53e−5</div><div class="label">v11 首步 point credit std</div><div class="sub">被 rasterization 量化压低</div></div><div class="kpi"><div class="v good">0.002016</div><div class="label">v12 首步 point credit std</div><div class="sub">连续距离带来约 45 倍提升</div></div><div class="kpi"><div class="v good">99.84%</div><div class="label">v12 非零 point credit</div><div class="sub">连续 Reward 解除量化瓶颈</div></div></div>
+<table><tr><th>修复项</th><th>修复前</th><th>修复后</th><th>结论</th></tr>
+<tr><td>跨 rollout 区域</td><td>不同 rollout 随机选不同区域</td><td>K=8 共享同一连续 8 点选区</td><td>组内 Reward 可比较</td></tr>
+<tr><td>选区内部归因</td><td>8 点共享 scalar credit</td><td>每点独立 same-state counterfactual</td><td>每个点获得独立 advantage</td></tr>
+<tr><td>PPO 梯度</td><td>联合平均可能稀释/串扰</td><td>pointwise masked loss</td><td>mask 外梯度严格为零</td></tr>
+<tr><td>Reward 分辨率</td><td>CPU raster mask 指标</td><td>点到 GT 线段的连续距离</td><td>微小动作不再被像素量化吞掉</td></tr>
+<tr><td>策略偏置</td><td>global branch 吸收多数减速标签</td><td>轮廓内零均值 local residual</td><td>解除单类塌缩</td></tr></table>
+
+<h2 id="diagnosis">6. v15 局部动作学习诊断</h2>
+<h3>6.1 Step1020 分步结果</h3>
+<table><tr><th>训练步</th><th>fraction</th><th>Preference corr</th><th>Balanced sign acc</th><th>Positive recall</th><th>Negative recall</th><th>Policy gain</th></tr>
+<tr><td>第4步</td><td class="num">0.5</td><td class="num">0.0363</td><td class="num bad-text">0.4749</td><td class="num">0.4667</td><td class="num">0.4831</td><td class="num">+2.42e−6</td></tr>
+<tr><td>第5步</td><td class="num">1.0</td><td class="num best">0.0713</td><td class="num best">0.5396</td><td class="num">0.6330</td><td class="num">0.4463</td><td class="num">+1.12e−6</td></tr>
+<tr><td><b>两步聚合</b></td><td class="num">—</td><td class="num">0.0436</td><td class="num warn-text">0.5038</td><td class="num">0.5436</td><td class="num">0.4641</td><td class="num">+1.77e−6</td></tr></table>
+<div class="bar-chart panel">
+<div class="bar-row"><span>第4步 balanced</span><div class="bar-track"><div class="bar red" style="width:47.49%"></div></div><span class="bar-value">0.4749</span></div>
+<div class="bar-row"><span>随机水平</span><div class="bar-track"><div class="bar orange" style="width:50%"></div></div><span class="bar-value">0.5000</span></div>
+<div class="bar-row"><span>第5步 balanced</span><div class="bar-track"><div class="bar green" style="width:53.96%"></div></div><span class="bar-value">0.5396</span></div>
+</div>
+<p>最终步点级分层参数区间为 <code>[0.5068, 0.5724]</code>，提示最终步信号高于随机；但该区间没有建模同一轮廓内点之间的相关性，因此只作为辅助证据。更稳妥的结论是：<b>最终步存在弱但可重复的局部方向信号，第四步仍没有学好。</b></p>
+
+<h2 id="full-eval">7. 177 样本全量评估</h2>
+<table><tr><th>路线</th><th>IoU</th><th>Dice</th><th>mBoundF</th><th>NSD@2px</th><th>定位</th></tr>
+<tr><td>Deterministic FM</td><td class="num">0.851894</td><td class="num">0.918754</td><td class="num">0.776860</td><td class="num">0.865740</td><td>统一基础基线</td></tr>
+<tr><td>旧逐点 v3</td><td class="num">0.851612</td><td class="num">0.918631</td><td class="num">0.776564</td><td class="num">0.867080</td><td>旧逐点对照</td></tr>
+<tr><td>v12 continuous per-point</td><td class="num">0.851600</td><td class="num">0.918623</td><td class="num">0.776583</td><td class="num">0.867091</td><td>连续 credit、全步训练</td></tr>
+<tr><td>v15 同 checkpoint FM</td><td class="num">0.851832</td><td class="num">0.918716</td><td class="num">0.776885</td><td class="num">0.865654</td><td>最严格 off 对照</td></tr>
+<tr><td>v15 末两步逐点</td><td class="num">0.851617</td><td class="num">0.918634</td><td class="num">0.776641</td><td class="num">0.867100</td><td>最终逐点候选</td></tr>
+<tr><td><b>Delta-NSD RL</b></td><td class="num best">0.854005</td><td class="num best">0.920005</td><td class="num best">0.778915</td><td class="num best">0.868963</td><td><b>当前正式最佳</b></td></tr></table>
+
+<h2 id="statistics">8. 配对 Bootstrap 统计</h2>
+<p>所有比较基于相同 177 个测试样本逐样本相减，20,000 次 bootstrap，seed=<code>20260710</code>。</p>
+<h3>8.1 v15 相对同 checkpoint deterministic FM</h3>
+<table><tr><th>指标</th><th>差值（v15−FM）</th><th>95% CI</th><th>W/T/L</th><th>判定</th></tr>
+<tr><td>IoU</td><td class="num bad-text">−0.000215</td><td class="num">[−0.000940, +0.000530]</td><td class="num">82/0/95</td><td>未改善</td></tr>
+<tr><td>Dice</td><td class="num bad-text">−0.000082</td><td class="num">[−0.000570, +0.000406]</td><td class="num">88/0/89</td><td>未改善</td></tr>
+<tr><td>mBoundF</td><td class="num bad-text">−0.000244</td><td class="num">[−0.001043, +0.000563]</td><td class="num">82/0/95</td><td>未改善</td></tr>
+<tr><td>NSD</td><td class="num best">+0.001446</td><td class="num best">[+0.000124, +0.002786]</td><td class="num">98/0/79</td><td class="best">显著提升</td></tr></table>
+<h3>8.2 v15 相对旧逐点 v3</h3>
+<p>IoU 差 <code>+0.000005</code>，95% CI <code>[−0.000086,+0.000096]</code>；NSD 差 <code>+0.000021</code>，95% CI <code>[−0.000096,+0.000138]</code>。四项均无显著差异，说明 v15 在全量指标上与旧逐点几乎等价。</p>
+<h3>8.3 v15 相对 delta-NSD</h3>
+<table><tr><th>指标</th><th>差值（v15−delta-NSD）</th><th>95% CI</th><th>W/T/L</th><th>判定</th></tr>
+<tr><td>IoU</td><td class="num bad-text">−0.002389</td><td class="num bad-text">[−0.003151, −0.001623]</td><td class="num">53/0/124</td><td class="bad-text">显著更差</td></tr>
+<tr><td>Dice</td><td class="num bad-text">−0.001370</td><td class="num bad-text">[−0.001878, −0.000862]</td><td class="num">54/0/123</td><td class="bad-text">显著更差</td></tr>
+<tr><td>mBoundF</td><td class="num bad-text">−0.002273</td><td class="num bad-text">[−0.003101, −0.001443]</td><td class="num">58/0/119</td><td class="bad-text">显著更差</td></tr>
+<tr><td>NSD</td><td class="num bad-text">−0.001863</td><td class="num bad-text">[−0.003226, −0.000499]</td><td class="num">72/0/105</td><td class="bad-text">显著更差</td></tr></table>
+
+<h2 id="interpretation">9. 为什么局部信号没有转化为整体收益</h2>
+<ol>
+<li><b>第五步可学，第四步仍错误。</b>两步联合策略中，第4步 balanced 低于随机，会污染第5步 state，并抵消最终步的正信号。</li>
+<li><b>连续 credit 优化的是点到 GT 边界距离。</b>它天然更贴近 NSD，因此 NSD 提升而 IoU / Dice / mBoundF 不同步提升并不矛盾。</li>
+<li><b>零均值 local residual 禁止整体增减速。</b>它修复了单类塌缩，但也限制了策略表达；如果某条轮廓大部分点都需要同向微调，零均值会强制相对补偿。</li>
+<li><b>探索只覆盖一个连续 8 点组。</b>空间归因因此干净，但每个训练 batch 的局部覆盖率有限，样本效率仍低。</li>
+<li><b>策略网络能产生非零更新，但局部视觉特征与“应该加速还是减速”的对应关系仍弱。</b>100× LR 只放大参数变化，没有提升方向准确率，排除了“单纯 LR 太小”。</li>
+<li><b>逐点 Reward 与最终任务指标存在错位。</b>连续距离是优秀的归因尺子，却不等价于最终区域质量函数。</li>
+</ol>
+<div class="panel warn"><b>关键区分：</b>“逐点 credit 可分辨”“策略有局部信号”“最终指标优于基线”是三个不同层级。当前已完成前两个层级的一部分，但第三层级没有成立。</div>
+
+<h2 id="conclusion">10. 最终结论与路线建议</h2>
+<table><tr><th>问题</th><th>结论</th></tr>
+<tr><td>动作参数化是否合理？</td><td><span class="badge green">已解决</span> tanh 有界 FM scale 不反向，适合精修幅度。</td></tr>
+<tr><td>是否还有跨区域错误归因？</td><td><span class="badge green">已解决</span>共享选区、pointwise credit、mask 外零梯度。</td></tr>
+<tr><td>单点 Reward 是否有足够分辨率？</td><td><span class="badge green">已解决</span>连续边界距离将信号提升约 45 倍。</td></tr>
+<tr><td>策略是否完全塌缩？</td><td><span class="badge green">已解决</span>零均值 local residual 消除统一减速单类塌缩。</td></tr>
+<tr><td>是否有局部学习信号？</td><td><span class="badge orange">部分成立</span>最终步 balanced=0.5396；第4步仍低于随机。</td></tr>
+<tr><td>是否优于 deterministic FM？</td><td><span class="badge red">否</span>只在 NSD 上显著提高，IoU / Dice / mBoundF 未提高。</td></tr>
+<tr><td>是否优于 delta-NSD？</td><td><span class="badge red">否</span>四项指标均显著更差。</td></tr></table>
+<div class="panel success"><h3 style="margin-top:0">建议的项目决策</h3><ul><li><b>正式强化学习结果与论文主结果：</b>继续使用 delta-NSD。</li><li><b>逐点路线：</b>保留 v15 checkpoint、配置和诊断，作为“局部探索机制研究”与后续方法储备。</li><li><b>不建议：</b>继续无界增加 LR、加大随机幅度、恢复反向动作、回到 raster point Reward。</li><li><b>若以后继续：</b>优先研究“只训练最终一步”的严格受控实验，以及让归因 Reward 与最终 NSD / boundary metric 更直接对齐；新增前需明确确认。</li></ul></div>
+
+<h2 id="repro">11. 文件与复现索引</h2>
+<table><tr><th>类别</th><th>文件</th></tr>
+<tr><td>核心训练</td><td class="path"><code>grpo_train_v5_geom_action.py</code></td></tr>
+<tr><td>逐点策略</td><td class="path"><code>lib/train/per_point_fm_policy.py</code></td></tr>
+<tr><td>逐点 PPO</td><td class="path"><code>lib/train/per_point_ppo.py</code></td></tr>
+<tr><td>连续 credit</td><td class="path"><code>lib/train/continuous_boundary_credit.py</code></td></tr>
+<tr><td>v15 配置</td><td class="path"><code>configs/1232_final_v5_perpoint_fmscale_v15_last2_gpu5.yaml</code></td></tr>
+<tr><td>v15 step1020 checkpoint</td><td class="path"><code>data/outputs/1232_final_v5_perpoint_fmscale_v15_last2_fresh_gpu5/checkpoints/step1020.pt</code></td></tr>
+<tr><td>分步诊断</td><td class="path"><code>report/perpoint_final_eval/v15_step1020_corrected_by_step_diag.json</code></td></tr>
+<tr><td>最终步区间</td><td class="path"><code>report/perpoint_final_eval/v15_step1020_finalstep_sign_ci.json</code></td></tr>
+<tr><td>v15 off/mean 全量评估</td><td class="path"><code>report/perpoint_final_eval/v15_step1020_off/</code><br><code>report/perpoint_final_eval/v15_step1020_mean/</code></td></tr>
+<tr><td>关键配对结果</td><td class="path"><code>report/perpoint_final_eval/v15_step1020_key_paired_comparisons.json</code></td></tr>
+<tr><td>统一统计与曲线</td><td class="path"><code>scripts/analyze_perpoint_grouped_runs.py</code><br><code>report/perpoint_grouped_comparison/</code></td></tr>
+<tr><td>设计记录</td><td class="path"><code>report/perpoint_fm_scale_design.md</code></td></tr></table>
+<h3>主要曲线与对照结果</h3>
+<p class="small">以下图片直接引用本报告同目录下的实验产物；打开 HTML 时无需网络连接。</p>
+<div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(460px,1fr));gap:18px;margin:18px 0">
+<figure class="panel" style="margin:0;padding:14px"><img src="perpoint_grouped_comparison/training_signals.png" alt="逐点 FM 各版本训练信号曲线" style="display:block;width:100%;height:auto;border-radius:8px;border:1px solid var(--border);background:#fff"><figcaption style="margin-top:10px;color:var(--muted)"><b style="color:var(--text)">训练信号：</b>对照各版本 Reward、KL、策略更新与训练稳定性。</figcaption></figure>
+<figure class="panel" style="margin:0;padding:14px"><img src="perpoint_grouped_comparison/point_credit_signals.png" alt="逐点 credit 信号演进曲线" style="display:block;width:100%;height:auto;border-radius:8px;border:1px solid var(--border);background:#fff"><figcaption style="margin-top:10px;color:var(--muted)"><b style="color:var(--text)">逐点 Credit：</b>展示栅格量化、连续边界距离及局部归因修复后的信号变化。</figcaption></figure>
+<figure class="panel" style="margin:0;padding:14px"><img src="perpoint_grouped_comparison/eval_and_local_learning.png" alt="固定评估与局部学习诊断曲线" style="display:block;width:100%;height:auto;border-radius:8px;border:1px solid var(--border);background:#fff"><figcaption style="margin-top:10px;color:var(--muted)"><b style="color:var(--text)">局部学习诊断：</b>固定评估与方向学习指标的联合观察。</figcaption></figure>
+<figure class="panel" style="margin:0;padding:14px"><img src="perpoint_grouped_comparison/full_eval_comparison.png" alt="177 样本全量评估对比" style="display:block;width:100%;height:auto;border-radius:8px;border:1px solid var(--border);background:#fff"><figcaption style="margin-top:10px;color:var(--muted)"><b style="color:var(--text)">全量对比：</b>177 个测试样本上的 IoU、Dice、mBoundF 与 NSD 汇总。</figcaption></figure>
+</div>
+<p class="small">原始图片：<code>training_signals.png</code>、<code>point_credit_signals.png</code>、<code>eval_and_local_learning.png</code>、<code>full_eval_comparison.png</code>，均位于 <code>report/perpoint_grouped_comparison/</code>。</p>
+
+<h2 id="validation">12. 验证清单</h2>
+<ul>
+<li><span class="badge green">通过</span> Python <code>py_compile</code>：训练、策略、PPO、continuous credit、评估与统计脚本。</li>
+<li><span class="badge green">通过</span> <code>tests/test_per_point_ppo.py</code>：选中点有独立梯度，mask 外点梯度严格为零；零均值策略保持局部梯度。</li>
+<li><span class="badge green">通过</span> <code>tests/test_continuous_boundary_credit.py</code>：连续点到闭合 GT polyline 的方向与数值行为。</li>
+<li><span class="badge green">通过</span> 一步 GPU smoke test：完整五步 state 链、末两步 active、PPO ratio、KL、credit 均无异常。</li>
+<li><span class="badge green">通过</span> checkpoint metadata：<code>active_policy_step_indices=[3,4]</code>。</li>
+<li><span class="badge green">通过</span> 评估日志：mean 模式只在 `[3,4]` 应用 policy，off 模式纯 FM。</li>
+<li><span class="badge green">通过</span> 177/177 样本，failed_samples=0。</li>
+<li><span class="badge green">通过</span> 20,000 次 paired bootstrap。</li>
+<li><span class="badge green">通过</span> <code>git diff --check</code>。</li>
+</ul>
+
+<div class="foot">报告生成依据：项目内保存的 checkpoint、JSON、CSV、日志和测试结果。所有数值均来自固定 177 样本评估或保存的训练对齐诊断；未将在线 8-batch fixed eval 当作最终全量结论。<br>生成文件：<code>report/PERPOINT_FM_EXPLORATION_FINAL_REPORT_20260710.html</code></div>
+</div></body></html>

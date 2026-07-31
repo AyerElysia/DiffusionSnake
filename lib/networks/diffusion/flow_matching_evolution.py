@@ -187,9 +187,16 @@ class FlowMatchingEvolution(nn.Module):
             _pp_delta_hidden_mult = float(getattr(global_cfg, 'v4_1_per_point_delta_hidden_mult', 2.0))
             _pp_delta_cyclic = bool(getattr(global_cfg, 'v4_1_per_point_delta_use_cyclic_mixer', True))
             _final_head_type = str(getattr(global_cfg, 'v4_1_final_head_type', 'standard')).strip().lower()
+            _moe_enabled = _final_head_type in ('moe', 'moe_final', 'deepseek_moe')
             _moe_num_experts = int(getattr(global_cfg, 'v4_6_moe_num_experts', 8))
             _moe_top_k = int(getattr(global_cfg, 'v4_6_moe_top_k', 2))
             _moe_balance_weight = float(getattr(global_cfg, 'v4_6_moe_balance_weight', 1e-3))
+            _moe_balance_mode = str(
+                getattr(global_cfg, 'v4_6_moe_balance_mode', 'legacy')
+            ).strip().lower()
+            _moe_hard_phi_ema = float(
+                getattr(global_cfg, 'v4_6_moe_hard_phi_ema_decay', 0.99)
+            )
             _moe_expert_init_std = float(getattr(global_cfg, 'v4_6_moe_expert_init_std', 1e-4))
             _moe_router_noise_std = float(getattr(global_cfg, 'v4_6_moe_router_noise_std', 0.01))
             _moe_point_embed = bool(getattr(global_cfg, 'v4_6_moe_use_point_embed', True))
@@ -212,21 +219,43 @@ class FlowMatchingEvolution(nn.Module):
             _dit_ffn_moe_scale = float(getattr(global_cfg, 'v4_10_dit_ffn_moe_routed_scale', 1.0))
             _dit_ffn_moe_point = bool(getattr(global_cfg, 'v4_10_dit_ffn_moe_use_point_embed', True))
             _dit_ffn_moe_cyclic = bool(getattr(global_cfg, 'v4_10_dit_ffn_moe_use_cyclic_router', True))
+            _proto_moe = bool(getattr(global_cfg, 'v5_1_use_prototype_phi_moe', False))
+            _proto_layers = str(getattr(global_cfg, 'v5_1_prototype_phi_moe_layers', 'odd'))
+            _proto_experts = int(getattr(global_cfg, 'v5_1_prototype_phi_num_experts', 4))
+            _proto_top_k = int(getattr(global_cfg, 'v5_1_prototype_phi_top_k', 1))
+            _proto_hidden = int(getattr(global_cfg, 'v5_1_prototype_phi_hidden_dim', 0))
+            _proto_temp = float(getattr(global_cfg, 'v5_1_prototype_phi_router_temperature', 0.20))
+            _proto_balance = float(getattr(global_cfg, 'v5_1_prototype_phi_balance_weight', 1e-3))
+            _proto_ema = float(getattr(global_cfg, 'v5_1_prototype_phi_ema_decay', 0.99))
+            _proto_contrast = float(getattr(global_cfg, 'v5_1_prototype_phi_contrastive_weight', 1e-3))
+            _moe_summary = (
+                'final_head_moe=True(experts={}, top_k={}, balance={})'.format(
+                    _moe_num_experts, _moe_top_k, _moe_balance_mode
+                )
+                if _moe_enabled
+                else 'final_head_moe=False'
+            )
+            _ffn_moe_summary = (
+                'dit_ffn_moe=True(experts={}, top_k={})'.format(
+                    _dit_ffn_moe_experts, _dit_ffn_moe_top_k
+                )
+                if _dit_ffn_moe
+                else 'dit_ffn_moe=False'
+            )
+            _proto_summary = (
+                'prototype_phi_moe=True(layers={}, experts={}, top_k={})'.format(
+                    _proto_layers, _proto_experts, _proto_top_k
+                )
+                if _proto_moe else 'prototype_phi_moe=False'
+            )
             print(f"[FlowMatchingEvolution] Using DiT Flow Network V4.1 "
-                  f"(V3.4 detail backbone, detail_ctx={_detail_ctx}, "
+                  f"(detail_ctx={_detail_ctx}, "
                   f"detail_mode={_detail_mode}, per_point_delta={_use_pp_delta}, "
                   f"delta_head={_pp_delta_head_type}, delta_scale={_pp_delta_scale}, "
                   f"delta_reg={_pp_delta_reg}, "
-                  f"final_head={_final_head_type}, "
-                  f"moe_experts={_moe_num_experts}, moe_top_k={_moe_top_k}, "
-                  f"moe_shared={_moe_shared_expert}, "
-                  f"moe_route_shared={_moe_route_shared}, "
-                  f"moe_expert_type={_moe_expert_type}, "
-                  f"moe_expert_hidden={_moe_expert_hidden}, "
+                  f"final_head={_final_head_type}, {_moe_summary}, "
                   f"latent_loop={_latent_loop}, latent_loop_steps={_latent_loop_steps}, "
-                  f"s_cond={self._use_s_cond}, "
-                  f"dit_ffn_moe={_dit_ffn_moe}, dit_ffn_moe_experts={_dit_ffn_moe_experts}, "
-                  f"dit_ffn_moe_top_k={_dit_ffn_moe_top_k}, "
+                  f"s_cond={self._use_s_cond}, {_ffn_moe_summary}, {_proto_summary}, "
                   f"ODE steps={ode_steps})")
             self.denoiser = DiTFlowMatchingV4_1(
                 state_dim=dit_state_dim,
@@ -246,6 +275,8 @@ class FlowMatchingEvolution(nn.Module):
                 moe_num_experts=_moe_num_experts,
                 moe_top_k=_moe_top_k,
                 moe_balance_weight=_moe_balance_weight,
+                moe_balance_mode=_moe_balance_mode,
+                moe_hard_phi_ema_decay=_moe_hard_phi_ema,
                 moe_expert_init_std=_moe_expert_init_std,
                 moe_router_noise_std=_moe_router_noise_std,
                 moe_use_point_embed=_moe_point_embed,
@@ -269,6 +300,15 @@ class FlowMatchingEvolution(nn.Module):
                 ffn_moe_routed_scale=_dit_ffn_moe_scale,
                 ffn_moe_use_point_embed=_dit_ffn_moe_point,
                 ffn_moe_use_cyclic_router=_dit_ffn_moe_cyclic,
+                use_prototype_phi_moe=_proto_moe,
+                prototype_phi_moe_layers=_proto_layers,
+                prototype_phi_num_experts=_proto_experts,
+                prototype_phi_top_k=_proto_top_k,
+                prototype_phi_hidden_dim=_proto_hidden,
+                prototype_phi_router_temperature=_proto_temp,
+                prototype_phi_balance_weight=_proto_balance,
+                prototype_phi_ema_decay=_proto_ema,
+                prototype_phi_contrastive_weight=_proto_contrast,
             )
         elif getattr(global_cfg, 'use_dit_v4', False):
             from .dit_denoiser_v4 import DiTFlowMatchingV4
@@ -2406,9 +2446,21 @@ class FlowMatchingEvolution(nn.Module):
                     [torch.roll(i_gt_py[i], -int(best_k[i].item()), 0) for i in range(B_a)], 0
                 )
             else:
-                # Greedy: align by nearest point to oct[0] only
+                # Greedy: align by nearest point to oct[0] only.
+                # Vectorised batched roll: no per-sample .item() (each of those
+                # forces a host<->device sync and stalls the training step).
                 d2 = (i_init_train_py[:, :1, :] - i_gt_py).pow(2).sum(-1)
-                i_gt_py = torch.stack([torch.roll(i_gt_py[i], -int(d2[i].argmin().item()), 0) for i in range(i_gt_py.size(0))], 0)
+                shift = d2.argmin(dim=1)                       # (B,)
+                N_pts = i_gt_py.size(1)
+                gather_idx = (
+                    torch.arange(N_pts, device=i_gt_py.device).unsqueeze(0)
+                    + shift.unsqueeze(1)
+                ) % N_pts                                      # (B, N)
+                i_gt_py = torch.gather(
+                    i_gt_py,
+                    1,
+                    gather_idx.unsqueeze(-1).expand(-1, -1, i_gt_py.size(2)),
+                )
 
             x1_raw = i_gt_py - i_init_train_py
             full_disp_for_s = x1_raw.clone()
@@ -2449,73 +2501,60 @@ class FlowMatchingEvolution(nn.Module):
                         zero_mask = (draw >= zero_start) & (draw < zero_start + zero_p)
                         exact_zero_mask = draw >= (zero_start + zero_p)
 
-                        frac = torch.zeros(B, 1, 1, device=device, dtype=full_disp.dtype)
+                        # Vectorised, sync-free sampling. The previous version
+                        # called mask.any() / mask.sum().item() per category;
+                        # every one of those forces a host<->device sync and
+                        # stalls the step. Here per-sample [lo, hi] bounds are
+                        # gathered from the masks and a single uniform draw is
+                        # rescaled, which is distribution-equivalent.
+                        def _bounds(min_name, max_name, default_min, default_max):
+                            lo_v = min(max(float(getattr(global_cfg, min_name, default_min)), 0.0), 0.999)
+                            hi_v = min(max(float(getattr(global_cfg, max_name, default_max)), lo_v), 0.999)
+                            return lo_v, hi_v
 
-                        def _sample_frac(mask, min_name, max_name, default_min, default_max):
-                            if not mask.any():
-                                return
-                            min_frac = min(max(float(getattr(global_cfg, min_name, default_min)), 0.0), 0.999)
-                            max_frac = min(max(float(getattr(global_cfg, max_name, default_max)), min_frac), 0.999)
-                            frac[mask] = torch.empty(
-                                int(mask.sum().item()), 1, 1,
-                                device=device, dtype=full_disp.dtype,
-                            ).uniform_(min_frac, max_frac)
+                        cont_lo, cont_hi = _bounds(
+                            'v4_9_continuous_min_frac', 'v4_9_continuous_max_frac', 0.05, 0.85)
+                        far_lo, far_hi = _bounds(
+                            'v4_9_hard_far_min_frac', 'v4_9_hard_far_max_frac', 0.0, 0.20)
+                        zero_lo, zero_hi = _bounds(
+                            'v4_9_near_zero_min_frac', 'v4_9_near_zero_max_frac', 0.95, 0.995)
+                        small_lo = min(max(self._small_disp_min_frac, 0.0), 0.999)
+                        small_hi = min(max(self._small_disp_max_frac, small_lo), 0.999)
 
-                        _sample_frac(
-                            cont_mask,
-                            'v4_9_continuous_min_frac',
-                            'v4_9_continuous_max_frac',
-                            0.05,
-                            0.85,
-                        )
-                        if disc_mask.any():
-                            fractions = getattr(global_cfg, 'v4_9_discrete_fractions', None)
-                            if fractions is None:
-                                fractions = getattr(global_cfg, 'iterative_fractions', None)
-                            if fractions:
-                                frac_choices = torch.tensor(
-                                    [float(f) for f in fractions],
-                                    device=device,
-                                    dtype=full_disp.dtype,
-                                ).clamp_(0.0, 0.999)
-                                choice_idx = torch.randint(
-                                    0,
-                                    int(frac_choices.numel()),
-                                    (int(disc_mask.sum().item()),),
-                                    device=device,
-                                )
-                                frac[disc_mask] = frac_choices[choice_idx].view(-1, 1, 1)
-                            else:
-                                situations = torch.randint(
-                                    0,
-                                    iter_steps,
-                                    (int(disc_mask.sum().item()),),
-                                    device=device,
-                                )
-                                frac[disc_mask] = situations.to(dtype=full_disp.dtype).view(-1, 1, 1) / float(max(iter_steps, 1))
-                        if small_mask.any():
-                            min_frac = min(max(self._small_disp_min_frac, 0.0), 0.999)
-                            max_frac = min(max(self._small_disp_max_frac, min_frac), 0.999)
-                            frac[small_mask] = torch.empty(
-                                int(small_mask.sum().item()), 1, 1,
-                                device=device, dtype=full_disp.dtype,
-                            ).uniform_(min_frac, max_frac)
-                        _sample_frac(
-                            far_mask,
-                            'v4_9_hard_far_min_frac',
-                            'v4_9_hard_far_max_frac',
-                            0.0,
-                            0.20,
-                        )
-                        _sample_frac(
-                            zero_mask,
-                            'v4_9_near_zero_min_frac',
-                            'v4_9_near_zero_max_frac',
-                            0.95,
-                            0.995,
-                        )
-                        if exact_zero_mask.any():
-                            frac[exact_zero_mask] = 1.0
+                        lo = torch.zeros(B, device=device, dtype=full_disp.dtype)
+                        hi = torch.zeros(B, device=device, dtype=full_disp.dtype)
+                        for _mask, (_lo, _hi) in (
+                                (cont_mask, (cont_lo, cont_hi)),
+                                (small_mask, (small_lo, small_hi)),
+                                (far_mask, (far_lo, far_hi)),
+                                (zero_mask, (zero_lo, zero_hi)),
+                        ):
+                            lo = torch.where(_mask, lo.new_full((), _lo), lo)
+                            hi = torch.where(_mask, hi.new_full((), _hi), hi)
+
+                        u = torch.rand(B, device=device, dtype=full_disp.dtype)
+                        frac = (lo + u * (hi - lo)).view(B, 1, 1)
+
+                        fractions = getattr(global_cfg, 'v4_9_discrete_fractions', None)
+                        if fractions is None:
+                            fractions = getattr(global_cfg, 'iterative_fractions', None)
+                        if fractions:
+                            frac_choices = torch.tensor(
+                                [float(f) for f in fractions],
+                                device=device,
+                                dtype=full_disp.dtype,
+                            ).clamp_(0.0, 0.999)
+                            choice_idx = torch.randint(
+                                0, frac_choices.numel(), (B,), device=device)
+                            disc_frac = frac_choices[choice_idx]
+                        else:
+                            disc_frac = torch.randint(
+                                0, iter_steps, (B,), device=device
+                            ).to(dtype=full_disp.dtype) / float(max(iter_steps, 1))
+                        frac = torch.where(
+                            disc_mask.view(B, 1, 1), disc_frac.view(B, 1, 1), frac)
+                        frac = torch.where(
+                            exact_zero_mask.view(B, 1, 1), frac.new_full((), 1.0), frac)
                         used_mixed_iter_interp = True
                     else:
                         situations = torch.randint(0, iter_steps, (B,), device=device)

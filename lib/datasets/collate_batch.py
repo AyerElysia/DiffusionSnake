@@ -14,10 +14,13 @@ def snake_collator(batch):
         missing = [b.get('img_path', '<unknown>') for b in batch if 'locate_feat' not in b]
         if missing:
             raise KeyError(f"locate_feat is missing for batch samples: {missing}")
+        # Variable spatial sizes across slices (different CT geometries).
+        # Keep as a Python list so batch_size>1 works without breaking grid_sample math.
+        # The model loops per-sample in apply_locate_feature_replacement.
         ret.update({
-            'locate_feat': torch.stack([
+            'locate_feat': [
                 torch.as_tensor(b['locate_feat'], dtype=torch.float16) for b in batch
-            ], dim=0),
+            ],
             'locate_feat_grid_hw': default_collate([b['locate_feat_grid_hw'] for b in batch]),
             'locate_feat_orig_hw': default_collate([b['locate_feat_orig_hw'] for b in batch]),
             'locate_feat_resized_hw': default_collate([b['locate_feat_resized_hw'] for b in batch]),
@@ -73,9 +76,9 @@ def snake_collator(batch):
     wh = torch.zeros([batch_size, ct_num, 2], dtype=torch.float)
     ct_cls = torch.zeros([batch_size, ct_num], dtype=torch.int64)
     ct_ind = torch.zeros([batch_size, ct_num], dtype=torch.int64)
-    ct_01 = torch.zeros([batch_size, ct_num], dtype=torch.uint8)
+    ct_01 = torch.zeros([batch_size, ct_num], dtype=torch.bool)
     for i in range(batch_size):
-        ct_01[i, :meta['ct_num'][i]] = 1
+        ct_01[i, :meta['ct_num'][i]] = True
 
     if ct_num != 0:
         wh[ct_01] = torch.Tensor(sum([b['wh'] for b in truncated], []))

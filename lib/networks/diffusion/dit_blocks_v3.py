@@ -18,6 +18,7 @@ from .dit_blocks_v2 import (
     CyclicRoPE1D,
     modulate
 )
+from .prototype_phi_moe import PrototypePhiMoE
 
 
 class RoutedFFNMoE(nn.Module):
@@ -157,6 +158,14 @@ class DiTBlockV3(nn.Module):
         ffn_moe_routed_scale: float = 1.0,
         ffn_moe_use_point_embed: bool = True,
         ffn_moe_use_cyclic_router: bool = True,
+        use_prototype_phi_moe: bool = False,
+        prototype_phi_num_experts: int = 4,
+        prototype_phi_top_k: int = 1,
+        prototype_phi_hidden_dim: int = 0,
+        prototype_phi_router_temperature: float = 0.20,
+        prototype_phi_balance_weight: float = 1e-3,
+        prototype_phi_ema_decay: float = 0.99,
+        prototype_phi_contrastive_weight: float = 1e-3,
     ):
         super().__init__()
         self.dim = dim
@@ -205,6 +214,26 @@ class DiTBlockV3(nn.Module):
             )
         else:
             self.ffn_moe = None
+
+        self.prototype_phi_moe = None
+        if bool(use_prototype_phi_moe):
+            self.prototype_phi_moe = PrototypePhiMoE(
+                dim=dim,
+                num_experts=prototype_phi_num_experts,
+                top_k=prototype_phi_top_k,
+                expert_hidden_dim=prototype_phi_hidden_dim,
+                router_temperature=prototype_phi_router_temperature,
+                phi_weight=prototype_phi_balance_weight,
+                phi_ema_decay=prototype_phi_ema_decay,
+                contrastive_weight=prototype_phi_contrastive_weight,
+            )
+
+        if self.prototype_phi_moe is not None:
+            if self.ffn_moe is not None:
+                raise ValueError("prototype Phi-MoE and legacy FFN-MoE are mutually exclusive")
+            # Dense checkpoint weights are copied into experts by the loader.
+            # Do not retain an inactive dense FFN in the actual MoE layer.
+            self.mlp = None
 
         # adaLN-Zero: 9 parameters (Back to V2 Order)
         # (shift_sa, scale_sa, gate_sa, shift_ca, scale_ca, gate_ca, shift_ff, scale_ff, gate_ff)
@@ -301,14 +330,20 @@ class DiTBlockV3(nn.Module):
 
         # 3. FFN
         x_ff = modulate(self.norm3(x), shift_ff, scale_ff)
-        ffn_out = self.mlp(x_ff)
-        if self.ffn_moe is not None:
-            ffn_out = ffn_out + self.ffn_moe(x_ff, t_emb)
+        if self.prototype_phi_moe is not None:
+            ffn_out = self.prototype_phi_moe(x_ff)
+        else:
+            ffn_out = self.mlp(x_ff)
+            if self.ffn_moe is not None:
+                ffn_out = ffn_out + self.ffn_moe(x_ff, t_emb)
         x = x + gate_ff.unsqueeze(1) * ffn_out
 
         return x
 
     def reg_loss(self) -> torch.Tensor:
-        if self.ffn_moe is None:
-            return self.adaLN_modulation[-1].weight.new_zeros(())
-        return self.ffn_moe.reg_loss()
+        loss = self.adaLN_modulation[-1].weight.new_zeros(())
+        if self.ffn_moe is not None:
+            loss = loss + self.ffn_moe.reg_loss()
+        if self.prototype_phi_moe is not None:
+            loss = loss + self.prototype_phi_moe.reg_loss()
+        return loss
