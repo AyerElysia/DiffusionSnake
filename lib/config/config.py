@@ -85,6 +85,17 @@ cfg.locate_feat_cache_root = 'data/locate_feat_cache'
 cfg.locate_feat_cache_dir = ''
 cfg.locate_feat_keys = ['feat']
 cfg.locate_feat_dim = 2304
+# Optional offline LocateAnything detection source. The default preserves the
+# inherited detector path byte-for-byte; cached detections are evaluation-only.
+cfg.box_source = 'detector'
+cfg.locany_cache_path = ''
+cfg.locany_min_score = 1e-4
+cfg.locany_min_box_side = 1.0
+cfg.locany_min_box_area = 4.0
+cfg.locany_nms_iou = 0.5
+cfg.locany_max_detections = 32
+cfg.locany_class_aware_nms = True
+cfg.locany_missing = 'error'
 # Upsampling factor inside LocateFeatReplacer (PixelShuffle). MoonViT grids are
 # coarse (patch 14 -> ~10.6 original pixels per cell), so 2 leaves neighbouring
 # contour points inside a single feature cell. 4 halves that effective stride.

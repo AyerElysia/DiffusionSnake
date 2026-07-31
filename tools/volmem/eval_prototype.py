@@ -30,6 +30,17 @@ def parse_args():
         default="autoregressive",
     )
     parser.add_argument("--box-mode", choices=("gt", "predicted"), default="predicted")
+    parser.add_argument(
+        "--box-source",
+        choices=("detector", "locany_cached"),
+        default=None,
+        help="Override cfg.box_source for this evaluation only",
+    )
+    parser.add_argument(
+        "--locany-cache-path",
+        default="",
+        help="Canonical LocateAnything cache used with --box-source locany_cached",
+    )
     parser.add_argument("--result-dir", required=True)
     parser.add_argument("--device", default="cuda")
     parser.add_argument("--max-volumes", type=int, default=None)
@@ -54,6 +65,7 @@ from lib.train.trainers.make_trainer import _wrapper_factory
 from lib.utils.snake import snake_config
 from volmem.adapters import (
     V46cContourAdapter,
+    build_detection_provider,
     configure_single_slice_compatibility,
     make_single_slice_dataset_class,
 )
@@ -92,8 +104,13 @@ def load_checkpoint_strict(model, checkpoint_path):
 def build_model(device):
     base_network = make_network(cfg)
     slice_wrapper = _wrapper_factory(cfg, base_network)
+    detection_cache, detection_policy = build_detection_provider(cfg)
     model = VolMemSnake(
-        contour_adapter=V46cContourAdapter(slice_wrapper),
+        contour_adapter=V46cContourAdapter(
+            slice_wrapper,
+            detection_cache=detection_cache,
+            detection_policy=detection_policy,
+        ),
         feature_dim=int(cfg.locate_feat_dim),
         memory_dim=int(cfg.volmem.memory_dim),
         memory_capacity=int(cfg.volmem.memory_capacity),
@@ -160,6 +177,12 @@ def token_evidence(sample, pred_mask, device):
 def main():
     configure_single_slice_compatibility(cfg)
     configure_box_mode(cfg, ARGS.box_mode)
+    if ARGS.box_source is not None:
+        cfg.box_source = ARGS.box_source
+    if ARGS.locany_cache_path:
+        cfg.locany_cache_path = ARGS.locany_cache_path
+    if str(cfg.box_source).strip().lower() == "locany_cached" and ARGS.box_mode != "predicted":
+        raise ValueError("locany_cached requires --box-mode predicted")
     cfg.test.dataset = "VolMemVal" if ARGS.split == "val" else "VolMemTest"
     cfg.test.batch_size = 1
     cfg.train.num_workers = 0

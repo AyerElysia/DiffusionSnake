@@ -1503,6 +1503,57 @@ class Network(nn.Module):
 
         return output
 
+    def apply_external_detection(self, output, batch):
+        """Override detector boxes with a validated evaluation-only [B,N,6] tensor."""
+        if batch is None or batch.get('external_detection') is None:
+            return output
+        if self.training:
+            raise RuntimeError(
+                'external_detection is evaluation-only until class-aware '
+                'one-to-one training initialization is implemented'
+            )
+        if self.should_use_gt_detection(
+            getattr(cfg, 'use_gt_det', False),
+            getattr(cfg, 'use_gt_det_train_only', False),
+            self.training,
+            batch,
+        ):
+            raise ValueError('external_detection and active GT detection are mutually exclusive')
+        detection = batch['external_detection']
+        if not torch.is_tensor(detection) or detection.dim() != 3 or detection.size(-1) != 6:
+            raise ValueError('external_detection must be a [B,N,6] tensor')
+        if detection.size(0) != batch['inp'].size(0):
+            raise ValueError('external_detection batch dimension must match inp')
+        if not torch.isfinite(detection).all():
+            raise ValueError('external_detection must contain only finite values')
+        detection = detection.to(device=batch['inp'].device, dtype=batch['inp'].dtype)
+        valid = detection[..., 4] > 1e-4
+        padded = ~valid
+        if padded.any() and not torch.all(detection[padded] == 0):
+            raise ValueError('external_detection padding rows must be all zero')
+        if valid.any():
+            valid_rows = detection[valid]
+            if not torch.all(valid_rows[:, 2] > valid_rows[:, 0]) or not torch.all(
+                valid_rows[:, 3] > valid_rows[:, 1]
+            ):
+                raise ValueError('external_detection valid boxes must have positive area')
+            classes = valid_rows[:, 5]
+            if not torch.all(classes == classes.round()) or not torch.all(
+                (classes >= 0) & (classes <= 24)
+            ):
+                raise ValueError('external_detection class_id must be an integer in [0,24]')
+        output['detection'] = detection
+        output['ct'] = (
+            (detection[..., :2] + detection[..., 2:4]) * 0.5
+            if detection.size(1) > 0
+            else detection.new_zeros((detection.size(0), 0, 2))
+        )
+        output['external_detection_source'] = batch.get(
+            'external_detection_source',
+            'external',
+        )
+        return output
+
     def forward(self, x, batch=None):
         if self.detector_backend == 'samsnake_fm':
             if bool(getattr(cfg, 'samsnake_freeze_dla', False)):
@@ -1536,6 +1587,7 @@ class Network(nn.Module):
                 batch,
             ):
                 self.use_gt_detection(output, batch)
+            output = self.apply_external_detection(output, batch)
             output = self.attach_extreme_prediction(output, cnn_feature, batch)
 
             if batch is not None:
@@ -1653,6 +1705,7 @@ class Network(nn.Module):
                 output['mask_logits'] = mask_logits
             if use_gt_detection:
                 self.use_gt_detection(output, batch)
+            output = self.apply_external_detection(output, batch)
             output = self.attach_extreme_prediction(output, det_cnn_feature, batch)
             if (not self.training) and str(getattr(cfg, 'contour_init_method', 'octagon')).strip().lower() == 'sam':
                 from lib.utils.snake.sam_init import attach_sam_testing_init
@@ -1728,6 +1781,7 @@ class Network(nn.Module):
         ):
             self.use_gt_detection(output, batch)
 
+        output = self.apply_external_detection(output, batch)
         output = self.attach_extreme_prediction(output, det_cnn_feature, batch)
 
         if (not self.training) and str(getattr(cfg, 'contour_init_method', 'octagon')).strip().lower() == 'sam':
