@@ -9,6 +9,7 @@ zero-init residual improvements:
 import math
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 
 from .dit_blocks_v2 import CyclicRoPE1D, RMSNorm, SwiGLU, modulate
 from .dit_denoiser_v3 import DiTDenoiserV3
@@ -136,6 +137,460 @@ class StrongPerPointDeltaHead(nn.Module):
         return self.reg_weight * reg
 
 
+class DenseResidualFinalHead(nn.Module):
+    """Dense capacity control for output-head MoE experiments.
+
+    The legacy final-layer names are retained so the proven shared linear
+    predictor loads exactly.  A single zero-near-initialized MLP predicts a
+    residual displacement.  Choosing hidden_dim=1024 matches the routed MLP
+    parameter pool of four hidden-256 experts to within a few parameters.
+    """
+
+    def __init__(
+        self,
+        dim: int = 256,
+        out_dim: int = 2,
+        hidden_dim: int = 1024,
+        residual_init_std: float = 1e-4,
+    ):
+        super().__init__()
+        self.norm = RMSNorm(dim)
+        self.linear = nn.Linear(dim, out_dim)
+        self.adaLN = nn.Sequential(
+            nn.SiLU(),
+            nn.Linear(dim, 2 * dim, bias=True),
+        )
+        self.residual_mlp = nn.Sequential(
+            nn.Linear(dim, int(hidden_dim)),
+            nn.SiLU(),
+            nn.Linear(int(hidden_dim), out_dim),
+        )
+
+        nn.init.constant_(self.adaLN[-1].weight, 0)
+        nn.init.constant_(self.adaLN[-1].bias, 0)
+        nn.init.constant_(self.linear.weight, 0)
+        nn.init.constant_(self.linear.bias, 0)
+        nn.init.xavier_uniform_(self.residual_mlp[0].weight)
+        nn.init.zeros_(self.residual_mlp[0].bias)
+        nn.init.normal_(self.residual_mlp[-1].weight, std=float(residual_init_std))
+        nn.init.normal_(self.residual_mlp[-1].bias, std=float(residual_init_std))
+
+    def forward(self, x: torch.Tensor, t_emb: torch.Tensor) -> torch.Tensor:
+        shift, scale = self.adaLN(t_emb).chunk(2, dim=1)
+        x = modulate(self.norm(x), shift, scale)
+        return self.linear(x) + self.residual_mlp(x)
+
+    def reg_loss(self) -> torch.Tensor:
+        return self.linear.weight.new_zeros(())
+
+
+class SharedDenseSparseResidualHead(nn.Module):
+    """Dense shared predictor plus a small, truly sparse contour adapter.
+
+    The shared path is identical to :class:`DenseResidualFinalHead`.  A single
+    expert is selected for each complete contour and only selected experts are
+    executed.  Expert output layers are zero initialized, so copying a trained
+    dense head into this module preserves its function exactly at step zero.
+
+    Expert-load balancing uses a small non-trainable routing bias updated from
+    an EMA of hard assignments.  This avoids an auxiliary loss competing with
+    the displacement objective while still pushing persistently idle experts
+    back toward the decision boundary.
+    """
+
+    def __init__(
+        self,
+        dim: int = 256,
+        out_dim: int = 2,
+        shared_hidden_dim: int = 1024,
+        num_experts: int = 4,
+        expert_hidden_dim: int = 128,
+        router_temperature: float = 0.50,
+        load_ema_decay: float = 0.99,
+        balance_bias_step: float = 1e-3,
+        balance_bias_limit: float = 0.10,
+        expert_scale: float = 1.0,
+    ):
+        super().__init__()
+        self.dim = int(dim)
+        self.out_dim = int(out_dim)
+        self.num_experts = int(max(2, num_experts))
+        self.router_temperature = float(max(router_temperature, 1e-4))
+        self.load_ema_decay = float(min(max(load_ema_decay, 0.0), 0.99999))
+        self.balance_bias_step = float(max(balance_bias_step, 0.0))
+        self.balance_bias_limit = float(max(balance_bias_limit, 0.0))
+        self.expert_scale = float(expert_scale)
+
+        # Keep these names identical to DenseResidualFinalHead for direct,
+        # function-preserving state transfer.
+        self.norm = RMSNorm(self.dim)
+        self.linear = nn.Linear(self.dim, self.out_dim)
+        self.adaLN = nn.Sequential(
+            nn.SiLU(),
+            nn.Linear(self.dim, 2 * self.dim, bias=True),
+        )
+        self.residual_mlp = nn.Sequential(
+            nn.Linear(self.dim, int(shared_hidden_dim)),
+            nn.SiLU(),
+            nn.Linear(int(shared_hidden_dim), self.out_dim),
+        )
+
+        hidden_dim = int(max(16, expert_hidden_dim))
+        self.router_norm = RMSNorm(self.dim)
+        self.router = nn.Linear(self.dim, self.num_experts, bias=False)
+        self.experts = nn.ModuleList([
+            nn.Sequential(
+                nn.Linear(self.dim, hidden_dim),
+                nn.SiLU(),
+                nn.Linear(hidden_dim, self.out_dim),
+            )
+            for _ in range(self.num_experts)
+        ])
+
+        nn.init.constant_(self.adaLN[-1].weight, 0)
+        nn.init.constant_(self.adaLN[-1].bias, 0)
+        nn.init.constant_(self.linear.weight, 0)
+        nn.init.constant_(self.linear.bias, 0)
+        nn.init.xavier_uniform_(self.residual_mlp[0].weight)
+        nn.init.zeros_(self.residual_mlp[0].bias)
+        nn.init.zeros_(self.residual_mlp[-1].weight)
+        nn.init.zeros_(self.residual_mlp[-1].bias)
+        nn.init.normal_(self.router.weight, std=1e-3)
+        for expert in self.experts:
+            nn.init.xavier_uniform_(expert[0].weight)
+            nn.init.zeros_(expert[0].bias)
+            nn.init.zeros_(expert[-1].weight)
+            nn.init.zeros_(expert[-1].bias)
+
+        uniform = torch.full((self.num_experts,), 1.0 / self.num_experts)
+        self.register_buffer("load_ema", uniform.clone())
+        self.register_buffer("routing_bias", torch.zeros(self.num_experts))
+        self.register_buffer("_diag_hard_sum", torch.zeros(self.num_experts), persistent=False)
+        self.register_buffer("_diag_contours", torch.zeros(()), persistent=False)
+        self.register_buffer("_diag_calls", torch.zeros(()), persistent=False)
+        self._routing_diagnostics_enabled = True
+
+    def enable_routing_diagnostics(self, enabled: bool = True) -> None:
+        self._routing_diagnostics_enabled = bool(enabled)
+
+    @torch.no_grad()
+    def reset_routing_diagnostics(self) -> None:
+        self._diag_hard_sum.zero_()
+        self._diag_contours.zero_()
+        self._diag_calls.zero_()
+
+    @torch.no_grad()
+    def _observe_and_balance(self, top1_idx: torch.Tensor) -> None:
+        hard = F.one_hot(top1_idx, num_classes=self.num_experts).float().mean(dim=0)
+        if self.training:
+            self.load_ema.mul_(self.load_ema_decay).add_(
+                hard * (1.0 - self.load_ema_decay)
+            )
+            if self.balance_bias_step > 0:
+                target = hard.new_full(hard.shape, 1.0 / self.num_experts)
+                self.routing_bias.add_(self.balance_bias_step * (target - hard))
+                self.routing_bias.sub_(self.routing_bias.mean())
+                self.routing_bias.clamp_(
+                    min=-self.balance_bias_limit,
+                    max=self.balance_bias_limit,
+                )
+        if self.training or self._routing_diagnostics_enabled:
+            contours = float(top1_idx.numel())
+            self._diag_hard_sum.add_(hard * contours)
+            self._diag_contours.add_(contours)
+            self._diag_calls.add_(1)
+
+    def forward(self, x: torch.Tensor, t_emb: torch.Tensor) -> torch.Tensor:
+        shift, scale = self.adaLN(t_emb).chunk(2, dim=1)
+        x = modulate(self.norm(x), shift, scale)
+        base = self.linear(x) + self.residual_mlp(x)
+
+        descriptor = self.router_norm(x.float().mean(dim=1))
+        # Cosine routing bounds logit magnitude.  The balancing bias can then
+        # always recover an idle expert instead of being overwhelmed by an
+        # unconstrained router weight norm.
+        descriptor = F.normalize(descriptor, dim=-1)
+        router_weight = F.normalize(self.router.weight.float(), dim=-1)
+        logits = F.linear(descriptor, router_weight) / self.router_temperature
+        logits = logits + self.routing_bias.to(device=logits.device, dtype=logits.dtype)
+        probs = torch.softmax(logits, dim=-1)
+        top1_idx = logits.argmax(dim=-1)
+        hard_gate = F.one_hot(top1_idx, num_classes=self.num_experts).to(probs.dtype)
+        # Exact one-hot forward routing with a softmax straight-through gradient.
+        gates = hard_gate + probs - probs.detach()
+
+        delta = torch.zeros_like(base)
+        for expert_id, expert in enumerate(self.experts):
+            contour_ids = torch.nonzero(top1_idx == expert_id, as_tuple=False).flatten()
+            if contour_ids.numel() == 0:
+                continue
+            expert_out = expert(x[contour_ids])
+            weight = gates[contour_ids, expert_id].to(x.dtype).view(-1, 1, 1)
+            delta.index_add_(0, contour_ids, expert_out * weight)
+        self._observe_and_balance(top1_idx)
+        return base + self.expert_scale * delta
+
+    def reg_loss(self) -> torch.Tensor:
+        return self.linear.weight.new_zeros(())
+
+    @torch.no_grad()
+    def routing_diagnostics(self):
+        hard = self._diag_hard_sum / self._diag_contours.clamp_min(1.0)
+        entropy = -(hard.clamp_min(1e-12) * hard.clamp_min(1e-12).log()).sum()
+        return {
+            "soft_load": self.load_ema.detach().cpu(),
+            "hard_load": hard.detach().cpu(),
+            "top1_load": hard.detach().cpu(),
+            "normalized_entropy": (entropy / math.log(self.num_experts)).detach().cpu(),
+            "hard_cv": (
+                hard.std(unbiased=False) / hard.mean().clamp_min(1e-12)
+            ).detach().cpu(),
+            "dead_experts_lt_1pct": (hard < 0.01).sum().detach().cpu(),
+            "contours": self._diag_contours.detach().cpu(),
+            "calls": self._diag_calls.detach().cpu(),
+            "routing_bias": self.routing_bias.detach().cpu(),
+        }
+
+
+class ModernSparseResidualHead(nn.Module):
+    """Contour-consistent, truly sparse residual displacement experts.
+
+    A shared linear head models the common vector field.  A contour-level
+    prototype router selects a small set of nonlinear residual experts.  The
+    selected contour indices are formed before expert execution, so unselected
+    experts do not run.  This differs from the legacy output MoE, which computes
+    every expert before its Top-K gather.
+    """
+
+    def __init__(
+        self,
+        dim: int = 256,
+        out_dim: int = 2,
+        num_experts: int = 4,
+        top_k: int = 2,
+        expert_hidden_dim: int = 256,
+        router_temperature: float = 0.20,
+        balance_weight: float = 1e-3,
+        phi_ema_decay: float = 0.99,
+        contrastive_weight: float = 1e-3,
+        contrastive_temperature: float = 0.07,
+        expert_init_std: float = 1e-4,
+    ):
+        super().__init__()
+        self.dim = int(dim)
+        self.out_dim = int(out_dim)
+        self.num_experts = int(max(2, num_experts))
+        self.top_k = int(max(1, min(top_k, self.num_experts)))
+        self.router_temperature = float(max(router_temperature, 1e-4))
+        self.balance_weight = float(max(balance_weight, 0.0))
+        self.phi_ema_decay = float(min(max(phi_ema_decay, 0.0), 0.99999))
+        self.contrastive_weight = float(max(contrastive_weight, 0.0))
+        self.contrastive_temperature = float(max(contrastive_temperature, 1e-4))
+
+        # Compatibility names: these load from the same V3.4/V4.6 checkpoint
+        # tensors as the standard and legacy-MoE final heads.
+        self.norm = RMSNorm(self.dim)
+        self.linear = nn.Linear(self.dim, self.out_dim)
+        self.adaLN = nn.Sequential(
+            nn.SiLU(),
+            nn.Linear(self.dim, 2 * self.dim, bias=True),
+        )
+
+        hidden_dim = int(max(16, expert_hidden_dim))
+        self.prototypes = nn.Parameter(torch.empty(self.num_experts, self.dim))
+        self.experts = nn.ModuleList([
+            nn.Sequential(
+                nn.Linear(self.dim, hidden_dim),
+                nn.SiLU(),
+                nn.Linear(hidden_dim, self.out_dim),
+            )
+            for _ in range(self.num_experts)
+        ])
+
+        nn.init.constant_(self.adaLN[-1].weight, 0)
+        nn.init.constant_(self.adaLN[-1].bias, 0)
+        nn.init.constant_(self.linear.weight, 0)
+        nn.init.constant_(self.linear.bias, 0)
+        nn.init.normal_(self.prototypes, std=0.02)
+        for expert in self.experts:
+            nn.init.xavier_uniform_(expert[0].weight)
+            nn.init.zeros_(expert[0].bias)
+            nn.init.normal_(expert[-1].weight, std=float(expert_init_std))
+            nn.init.normal_(expert[-1].bias, std=float(expert_init_std))
+
+        uniform = torch.full((self.num_experts,), 1.0 / self.num_experts)
+        self.register_buffer("phi_ema_prob", uniform.clone())
+        self.register_buffer("_prototypes_initialized", torch.tensor(False))
+        self.register_buffer("_diag_soft_sum", torch.zeros(self.num_experts), persistent=False)
+        self.register_buffer("_diag_hard_sum", torch.zeros(self.num_experts), persistent=False)
+        self.register_buffer("_diag_top1_sum", torch.zeros(self.num_experts), persistent=False)
+        self.register_buffer("_diag_contours", torch.zeros(()), persistent=False)
+        self.register_buffer("_diag_calls", torch.zeros(()), persistent=False)
+        self._last_aux_loss = None
+        self._routing_diagnostics_enabled = True
+
+    def enable_routing_diagnostics(self, enabled: bool = True) -> None:
+        self._routing_diagnostics_enabled = bool(enabled)
+
+    @torch.no_grad()
+    def _initialize_prototypes_from_data(self, descriptors: torch.Tensor) -> None:
+        if bool(self._prototypes_initialized.item()):
+            return
+        points = F.normalize(descriptors.detach().float(), dim=-1)
+        if points.shape[0] == 0:
+            return
+        centered = points - points.mean(dim=0, keepdim=True)
+        first = int(centered.square().sum(dim=-1).argmax().item())
+        centers = [points[first]]
+        min_distance = 1.0 - points @ centers[0]
+        for _ in range(1, self.num_experts):
+            next_id = int(min_distance.argmax().item())
+            centers.append(points[next_id])
+            min_distance = torch.minimum(
+                min_distance,
+                1.0 - points @ centers[-1],
+            )
+        center_mat = torch.stack(centers)
+        for _ in range(4):
+            assignment = torch.argmax(points @ center_mat.transpose(0, 1), dim=-1)
+            updated = []
+            for expert_id in range(self.num_experts):
+                mask = assignment == expert_id
+                candidate = points[mask].mean(dim=0) if bool(mask.any()) else center_mat[expert_id]
+                updated.append(F.normalize(candidate, dim=0))
+            center_mat = torch.stack(updated)
+        self.prototypes.copy_(center_mat.to(self.prototypes))
+        self._prototypes_initialized.fill_(True)
+
+    def _phi_balancing_loss(self, probs: torch.Tensor) -> torch.Tensor:
+        if self.balance_weight <= 0:
+            return probs.new_zeros(())
+        batch_prob = probs.float().mean(dim=0)
+        with torch.no_grad():
+            self.phi_ema_prob.mul_(self.phi_ema_decay).add_(
+                batch_prob.detach() * (1.0 - self.phi_ema_decay)
+            )
+            self.phi_ema_prob.div_(self.phi_ema_prob.sum().clamp_min(1e-12))
+        price = self.phi_ema_prob.clamp_min(1e-8).log().add(1.0).detach()
+        price = price - price.mean()
+        return (
+            self.balance_weight
+            * float(self.num_experts)
+            * torch.sum(batch_prob * price)
+        ).to(probs.dtype)
+
+    def _routing_contrastive_loss(
+        self,
+        descriptors: torch.Tensor,
+        top1_idx: torch.Tensor,
+    ) -> torch.Tensor:
+        if self.contrastive_weight <= 0:
+            return descriptors.new_zeros(())
+        centroids = []
+        valid_ids = []
+        for expert_id in range(self.num_experts):
+            mask = top1_idx == expert_id
+            if bool(mask.any()):
+                centroids.append(descriptors[mask].mean(dim=0))
+                valid_ids.append(expert_id)
+        if len(valid_ids) < 2:
+            return descriptors.new_zeros(())
+        centroid_mat = F.normalize(torch.stack(centroids).float(), dim=-1)
+        prototype_mat = F.normalize(self.prototypes[valid_ids].float(), dim=-1)
+        logits = prototype_mat @ centroid_mat.transpose(0, 1)
+        labels = torch.arange(len(valid_ids), device=descriptors.device)
+        return F.cross_entropy(
+            logits / self.contrastive_temperature,
+            labels,
+        ).to(descriptors.dtype)
+
+    @torch.no_grad()
+    def _update_diagnostics(self, probs: torch.Tensor, top_idx: torch.Tensor) -> None:
+        contours = float(probs.shape[0])
+        soft = probs.float().mean(dim=0)
+        one_hot = F.one_hot(top_idx, num_classes=self.num_experts).float()
+        hard = one_hot.mean(dim=(0, 1))
+        top1 = one_hot[:, 0].mean(dim=0)
+        self._diag_soft_sum.add_(soft * contours)
+        self._diag_hard_sum.add_(hard * contours)
+        self._diag_top1_sum.add_(top1 * contours)
+        self._diag_contours.add_(contours)
+        self._diag_calls.add_(1)
+
+    def forward(self, x: torch.Tensor, t_emb: torch.Tensor) -> torch.Tensor:
+        shift, scale = self.adaLN(t_emb).chunk(2, dim=1)
+        x = modulate(self.norm(x), shift, scale)
+        base = self.linear(x)
+
+        descriptors = x.float().mean(dim=1)
+        descriptors = F.layer_norm(descriptors, (self.dim,))
+        self._initialize_prototypes_from_data(descriptors)
+        descriptor_unit = F.normalize(descriptors, dim=-1)
+        prototype_unit = F.normalize(self.prototypes.float(), dim=-1)
+        logits = (
+            descriptor_unit @ prototype_unit.transpose(0, 1)
+        ) / self.router_temperature
+
+        observe_routing = self.training or self._routing_diagnostics_enabled
+        probs = torch.softmax(logits, dim=-1) if observe_routing else None
+        top_values, top_idx = torch.topk(logits, k=self.top_k, dim=-1)
+        gates = (
+            torch.ones_like(top_values)
+            if self.top_k == 1
+            else torch.softmax(top_values, dim=-1)
+        )
+
+        # Route first, then execute only experts that received contours.
+        delta = torch.zeros_like(base)
+        for expert_id, expert in enumerate(self.experts):
+            contour_slot = torch.nonzero(top_idx == expert_id, as_tuple=False)
+            if contour_slot.numel() == 0:
+                continue
+            contour_ids = contour_slot[:, 0]
+            slots = contour_slot[:, 1]
+            expert_out = expert(x[contour_ids])
+            weights = gates[contour_ids, slots].to(x.dtype).view(-1, 1, 1)
+            delta.index_add_(0, contour_ids, expert_out * weights)
+
+        if self.training:
+            phi = self._phi_balancing_loss(probs)
+            contrastive = self._routing_contrastive_loss(descriptors, top_idx[:, 0])
+            self._last_aux_loss = phi + self.contrastive_weight * contrastive
+        else:
+            self._last_aux_loss = x.new_zeros(())
+        if observe_routing:
+            self._update_diagnostics(probs, top_idx)
+        return base + delta
+
+    def reg_loss(self) -> torch.Tensor:
+        if self._last_aux_loss is None:
+            return self.prototypes.new_zeros(())
+        loss = self._last_aux_loss
+        self._last_aux_loss = None
+        return loss
+
+    @torch.no_grad()
+    def routing_diagnostics(self):
+        denom = self._diag_contours.clamp_min(1.0)
+        soft = self._diag_soft_sum / denom
+        hard = self._diag_hard_sum / denom
+        top1 = self._diag_top1_sum / denom
+        entropy = -(soft.clamp_min(1e-12) * soft.clamp_min(1e-12).log()).sum()
+        return {
+            "soft_load": soft.detach().cpu(),
+            "hard_load": hard.detach().cpu(),
+            "top1_load": top1.detach().cpu(),
+            "normalized_entropy": (entropy / math.log(self.num_experts)).detach().cpu(),
+            "hard_cv": (
+                hard.std(unbiased=False) / hard.mean().clamp_min(1e-12)
+            ).detach().cpu(),
+            "dead_experts_lt_1pct": (hard < 0.01).sum().detach().cpu(),
+            "contours": self._diag_contours.detach().cpu(),
+            "calls": self._diag_calls.detach().cpu(),
+            "phi_ema_prob": self.phi_ema_prob.detach().cpu(),
+        }
+
+
 class MoEFinalHead(nn.Module):
     """Pure MoE replacement for the final displacement head.
 
@@ -253,6 +708,7 @@ class MoEFinalHead(nn.Module):
         self._capture_conditional_routing = False
         self._conditional_routing_context = None
         self._conditional_routing_events = []
+        self._routing_diagnostics_enabled = True
 
         nn.init.constant_(self.adaLN[-1].weight, 0)
         nn.init.constant_(self.adaLN[-1].bias, 0)
@@ -286,6 +742,10 @@ class MoEFinalHead(nn.Module):
         self._capture_conditional_routing = bool(enabled)
         self._conditional_routing_context = None
         self._conditional_routing_events = []
+
+    def enable_routing_diagnostics(self, enabled: bool = True) -> None:
+        """Toggle inference-only routing observers without changing outputs."""
+        self._routing_diagnostics_enabled = bool(enabled)
 
     def set_conditional_routing_context(
         self,
@@ -378,7 +838,6 @@ class MoEFinalHead(nn.Module):
         if self.training and self.router_noise_std > 0:
             router_logits = router_logits + torch.randn_like(router_logits) * self.router_noise_std
 
-        probs = torch.softmax(router_logits, dim=-1)
         top_vals, top_idx = torch.topk(router_logits, k=self.top_k, dim=-1)
         top_gates = torch.softmax(top_vals, dim=-1)
         gather_idx = top_idx.unsqueeze(-1).expand(-1, -1, -1, expert_out.shape[-1])
@@ -391,6 +850,16 @@ class MoEFinalHead(nn.Module):
         else:
             out = routed_out
 
+        observe_routing = (
+            self.training
+            or self._routing_diagnostics_enabled
+            or self._capture_conditional_routing
+        )
+        if not observe_routing:
+            self._last_aux_loss = None
+            return out
+
+        probs = torch.softmax(router_logits, dim=-1)
         self._last_aux_loss = self._compute_balance_loss(probs, top_idx)
         with torch.no_grad():
             tokens = float(probs.shape[0] * probs.shape[1])

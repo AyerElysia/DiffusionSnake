@@ -5,7 +5,9 @@ PROJECT_ROOT="/home/medteam/Zhrch/DiffusionSnake-12-30"
 CFG_FILE="configs/volmem/verse_memflowdit_v0_5_minimal_gpu6.yaml"
 OUTPUT_DIR="data/outputs/volmem/verse_memflowdit_v0_5_minimal_gpu6"
 LOG_FILE="${OUTPUT_DIR}/train_20260731_gpu6.log"
-MAX_STEPS=100000
+# Two-day-budget default. The active 2026-07-31 run is additionally guarded
+# by stop_training_at_limit.py, so wall-clock time remains the hard limit.
+MAX_STEPS="${MAX_STEPS:-6800}"
 SAVE_EVERY=100
 CHUNKS_PER_STEP=12
 KEEP_RECENT=20

@@ -299,6 +299,21 @@ cfg.v5_1_prototype_phi_router_temperature = 0.20
 cfg.v5_1_prototype_phi_balance_weight = 1e-3
 cfg.v5_1_prototype_phi_ema_decay = 0.99
 cfg.v5_1_prototype_phi_contrastive_weight = 1e-3
+cfg.v5_1_prototype_phi_use_shared_expert = False
+cfg.v5_1_prototype_phi_shared_hidden_dim = 0
+
+# V5.2 research: causal output-head comparison.  The dense residual width of
+# 1024 matches the total MLP parameters of four hidden-256 routed experts;
+# modern_moe uses contour-level prototype routing and true sparse dispatch.
+cfg.v5_2_output_dense_residual_hidden_dim = 1024
+cfg.v5_2_output_moe_num_experts = 4
+cfg.v5_2_output_moe_top_k = 2
+cfg.v5_2_output_moe_hidden_dim = 256
+cfg.v5_2_output_moe_router_temperature = 0.20
+cfg.v5_2_output_moe_balance_weight = 1e-3
+cfg.v5_2_output_moe_phi_ema_decay = 0.99
+cfg.v5_2_output_moe_contrastive_weight = 1e-3
+cfg.v5_2_output_moe_expert_init_std = 1e-4
 
 # V4.6d: route shared expert together with routed experts instead of always-on residual addition.
 cfg.v4_6_moe_route_shared_expert = False

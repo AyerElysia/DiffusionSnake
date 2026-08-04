@@ -207,6 +207,54 @@ class FlowMatchingEvolution(nn.Module):
             _moe_routed_scale = float(getattr(global_cfg, 'v4_6_moe_routed_expert_scale', 1.0))
             _moe_expert_type = str(getattr(global_cfg, 'v4_6_moe_expert_type', 'linear')).strip().lower()
             _moe_expert_hidden = int(getattr(global_cfg, 'v4_6_moe_expert_hidden_dim', 256))
+            _dense_residual_hidden = int(
+                getattr(global_cfg, 'v5_2_output_dense_residual_hidden_dim', 1024)
+            )
+            _shared_sparse_experts = int(
+                getattr(global_cfg, 'v5_3_output_shared_sparse_num_experts', 4)
+            )
+            _shared_sparse_hidden = int(
+                getattr(global_cfg, 'v5_3_output_shared_sparse_hidden_dim', 128)
+            )
+            _shared_sparse_temp = float(
+                getattr(global_cfg, 'v5_3_output_shared_sparse_router_temperature', 0.50)
+            )
+            _shared_sparse_ema = float(
+                getattr(global_cfg, 'v5_3_output_shared_sparse_load_ema_decay', 0.99)
+            )
+            _shared_sparse_step = float(
+                getattr(global_cfg, 'v5_3_output_shared_sparse_balance_bias_step', 1e-3)
+            )
+            _shared_sparse_limit = float(
+                getattr(global_cfg, 'v5_3_output_shared_sparse_balance_bias_limit', 0.10)
+            )
+            _shared_sparse_scale = float(
+                getattr(global_cfg, 'v5_3_output_shared_sparse_expert_scale', 1.0)
+            )
+            _modern_output_experts = int(
+                getattr(global_cfg, 'v5_2_output_moe_num_experts', 4)
+            )
+            _modern_output_top_k = int(
+                getattr(global_cfg, 'v5_2_output_moe_top_k', 2)
+            )
+            _modern_output_hidden = int(
+                getattr(global_cfg, 'v5_2_output_moe_hidden_dim', 256)
+            )
+            _modern_output_temp = float(
+                getattr(global_cfg, 'v5_2_output_moe_router_temperature', 0.20)
+            )
+            _modern_output_balance = float(
+                getattr(global_cfg, 'v5_2_output_moe_balance_weight', 1e-3)
+            )
+            _modern_output_ema = float(
+                getattr(global_cfg, 'v5_2_output_moe_phi_ema_decay', 0.99)
+            )
+            _modern_output_contrast = float(
+                getattr(global_cfg, 'v5_2_output_moe_contrastive_weight', 1e-3)
+            )
+            _modern_output_init_std = float(
+                getattr(global_cfg, 'v5_2_output_moe_expert_init_std', 1e-4)
+            )
             _latent_loop = bool(getattr(global_cfg, 'v4_7_use_latent_loop', False))
             _latent_loop_steps = int(getattr(global_cfg, 'v4_7_latent_loop_steps', 4))
             _dit_ffn_moe = bool(getattr(global_cfg, 'v4_10_use_dit_ffn_moe', False))
@@ -228,12 +276,30 @@ class FlowMatchingEvolution(nn.Module):
             _proto_balance = float(getattr(global_cfg, 'v5_1_prototype_phi_balance_weight', 1e-3))
             _proto_ema = float(getattr(global_cfg, 'v5_1_prototype_phi_ema_decay', 0.99))
             _proto_contrast = float(getattr(global_cfg, 'v5_1_prototype_phi_contrastive_weight', 1e-3))
+            _proto_shared = bool(getattr(global_cfg, 'v5_1_prototype_phi_use_shared_expert', False))
+            _proto_shared_hidden = int(getattr(global_cfg, 'v5_1_prototype_phi_shared_hidden_dim', 0))
             _moe_summary = (
                 'final_head_moe=True(experts={}, top_k={}, balance={})'.format(
                     _moe_num_experts, _moe_top_k, _moe_balance_mode
                 )
                 if _moe_enabled
                 else 'final_head_moe=False'
+            )
+            _modern_output_summary = (
+                'modern_output_moe=True(experts={}, top_k={})'.format(
+                    _modern_output_experts, _modern_output_top_k
+                )
+                if _final_head_type in ('modern_moe', 'modern_sparse_moe', 'contour_moe')
+                else 'modern_output_moe=False'
+            )
+            _shared_sparse_summary = (
+                'shared_sparse_output=True(experts={}, top_k=1, hidden={})'.format(
+                    _shared_sparse_experts, _shared_sparse_hidden
+                )
+                if _final_head_type in (
+                    'shared_sparse', 'shared_sparse_residual', 'dense_sparse_residual'
+                )
+                else 'shared_sparse_output=False'
             )
             _ffn_moe_summary = (
                 'dit_ffn_moe=True(experts={}, top_k={})'.format(
@@ -243,8 +309,8 @@ class FlowMatchingEvolution(nn.Module):
                 else 'dit_ffn_moe=False'
             )
             _proto_summary = (
-                'prototype_phi_moe=True(layers={}, experts={}, top_k={})'.format(
-                    _proto_layers, _proto_experts, _proto_top_k
+                'prototype_phi_moe=True(layers={}, experts={}, top_k={}, shared={})'.format(
+                    _proto_layers, _proto_experts, _proto_top_k, _proto_shared
                 )
                 if _proto_moe else 'prototype_phi_moe=False'
             )
@@ -253,7 +319,8 @@ class FlowMatchingEvolution(nn.Module):
                   f"detail_mode={_detail_mode}, per_point_delta={_use_pp_delta}, "
                   f"delta_head={_pp_delta_head_type}, delta_scale={_pp_delta_scale}, "
                   f"delta_reg={_pp_delta_reg}, "
-                  f"final_head={_final_head_type}, {_moe_summary}, "
+                  f"final_head={_final_head_type}, {_moe_summary}, {_modern_output_summary}, "
+                  f"{_shared_sparse_summary}, "
                   f"latent_loop={_latent_loop}, latent_loop_steps={_latent_loop_steps}, "
                   f"s_cond={self._use_s_cond}, {_ffn_moe_summary}, {_proto_summary}, "
                   f"ODE steps={ode_steps})")
@@ -287,6 +354,22 @@ class FlowMatchingEvolution(nn.Module):
                 moe_routed_expert_scale=_moe_routed_scale,
                 moe_expert_type=_moe_expert_type,
                 moe_expert_hidden_dim=_moe_expert_hidden,
+                dense_residual_hidden_dim=_dense_residual_hidden,
+                shared_sparse_num_experts=_shared_sparse_experts,
+                shared_sparse_expert_hidden_dim=_shared_sparse_hidden,
+                shared_sparse_router_temperature=_shared_sparse_temp,
+                shared_sparse_load_ema_decay=_shared_sparse_ema,
+                shared_sparse_balance_bias_step=_shared_sparse_step,
+                shared_sparse_balance_bias_limit=_shared_sparse_limit,
+                shared_sparse_expert_scale=_shared_sparse_scale,
+                modern_output_num_experts=_modern_output_experts,
+                modern_output_top_k=_modern_output_top_k,
+                modern_output_hidden_dim=_modern_output_hidden,
+                modern_output_router_temperature=_modern_output_temp,
+                modern_output_balance_weight=_modern_output_balance,
+                modern_output_phi_ema_decay=_modern_output_ema,
+                modern_output_contrastive_weight=_modern_output_contrast,
+                modern_output_expert_init_std=_modern_output_init_std,
                 use_latent_loop=_latent_loop,
                 latent_loop_steps=_latent_loop_steps,
                 use_s_conditioning=self._use_s_cond,
@@ -309,6 +392,8 @@ class FlowMatchingEvolution(nn.Module):
                 prototype_phi_balance_weight=_proto_balance,
                 prototype_phi_ema_decay=_proto_ema,
                 prototype_phi_contrastive_weight=_proto_contrast,
+                prototype_phi_use_shared_expert=_proto_shared,
+                prototype_phi_shared_hidden_dim=_proto_shared_hidden,
             )
         elif getattr(global_cfg, 'use_dit_v4', False):
             from .dit_denoiser_v4 import DiTFlowMatchingV4

@@ -60,6 +60,8 @@ class DiTDenoiserV3(nn.Module):
         prototype_phi_balance_weight: float = 1e-3,
         prototype_phi_ema_decay: float = 0.99,
         prototype_phi_contrastive_weight: float = 1e-3,
+        prototype_phi_use_shared_expert: bool = False,
+        prototype_phi_shared_hidden_dim: int = 0,
         **kwargs,  # Accept but ignore extra kwargs for compatibility
     ):
         super().__init__()
@@ -133,6 +135,8 @@ class DiTDenoiserV3(nn.Module):
                 prototype_phi_balance_weight=prototype_phi_balance_weight,
                 prototype_phi_ema_decay=prototype_phi_ema_decay,
                 prototype_phi_contrastive_weight=prototype_phi_contrastive_weight,
+                prototype_phi_use_shared_expert=prototype_phi_use_shared_expert,
+                prototype_phi_shared_hidden_dim=prototype_phi_shared_hidden_dim,
             )
             for i in range(num_layers)
         ])

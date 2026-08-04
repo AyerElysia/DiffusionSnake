@@ -82,6 +82,30 @@ class VolMemContractTests(unittest.TestCase):
         self.assertIsNotNone(encoder.key_proj.weight.grad)
         self.assertGreater(float(encoder.key_proj.weight.grad.abs().sum()), 0.0)
 
+    def test_balanced_memory_encoder_keeps_mask_as_separate_signal(self):
+        encoder = SliceMemoryEncoder(
+            4,
+            8,
+            mask_channels=2,
+            pool_size=2,
+            fusion_mode="balanced_add",
+            mask_evidence_scale=0.25,
+        )
+        self.assertEqual(encoder.key_proj.in_channels, 4)
+        self.assertEqual(encoder.mask_key_proj.in_channels, 2)
+        features = torch.zeros(1, 4, 4, 4)
+        empty_mask = torch.zeros(1, 2, 4, 4)
+        sparse_mask = empty_mask.clone()
+        sparse_mask[:, 1, 0, 0] = 1.0
+        meta = SliceSequenceMeta("case_a", 0, 0.0, "index", "ascending")
+        empty_state = encoder(features, empty_mask, meta)
+        sparse_state = encoder(features, sparse_mask, meta)
+        self.assertTrue(torch.equal(empty_state.key, torch.zeros_like(empty_state.key)))
+        self.assertGreater(
+            float((sparse_state.key - empty_state.key).abs().mean()),
+            0.01,
+        )
+
     def test_sequence_meta_rejects_non_spatial_direction(self):
         meta = SliceSequenceMeta("case_a", 0, 0.0, "index", "forward")
         with self.assertRaises(ValueError):

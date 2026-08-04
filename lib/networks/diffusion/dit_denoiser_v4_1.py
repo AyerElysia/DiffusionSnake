@@ -9,7 +9,15 @@ import torch.nn as nn
 
 from .dit_blocks import SinusoidalTimeEmbedding
 from .dit_denoiser_v3_4 import DiTFlowMatchingV3_4
-from .dit_denoiser_v4 import LatentLoopBlock, MoEFinalHead, PerPointDeltaHead, StrongPerPointDeltaHead
+from .dit_denoiser_v4 import (
+    DenseResidualFinalHead,
+    LatentLoopBlock,
+    ModernSparseResidualHead,
+    MoEFinalHead,
+    PerPointDeltaHead,
+    SharedDenseSparseResidualHead,
+    StrongPerPointDeltaHead,
+)
 
 
 class DiTFlowMatchingV4_1(DiTFlowMatchingV3_4):
@@ -41,6 +49,22 @@ class DiTFlowMatchingV4_1(DiTFlowMatchingV3_4):
         moe_routed_expert_scale: float = 1.0,
         moe_expert_type: str = 'linear',
         moe_expert_hidden_dim: int = 256,
+        dense_residual_hidden_dim: int = 1024,
+        shared_sparse_num_experts: int = 4,
+        shared_sparse_expert_hidden_dim: int = 128,
+        shared_sparse_router_temperature: float = 0.50,
+        shared_sparse_load_ema_decay: float = 0.99,
+        shared_sparse_balance_bias_step: float = 1e-3,
+        shared_sparse_balance_bias_limit: float = 0.10,
+        shared_sparse_expert_scale: float = 1.0,
+        modern_output_num_experts: int = 4,
+        modern_output_top_k: int = 2,
+        modern_output_hidden_dim: int = 256,
+        modern_output_router_temperature: float = 0.20,
+        modern_output_balance_weight: float = 1e-3,
+        modern_output_phi_ema_decay: float = 0.99,
+        modern_output_contrastive_weight: float = 1e-3,
+        modern_output_expert_init_std: float = 1e-4,
         use_latent_loop: bool = False,
         latent_loop_steps: int = 4,
         use_s_conditioning: bool = False,
@@ -50,7 +74,22 @@ class DiTFlowMatchingV4_1(DiTFlowMatchingV3_4):
         self.num_points = int(num_points)
         self.final_head_type = str(final_head_type).strip().lower()
         self.use_moe_final_head = self.final_head_type in ('moe', 'moe_final', 'deepseek_moe')
-        self.use_per_point_delta = bool(use_per_point_delta) and not self.use_moe_final_head
+        self.use_dense_residual_final_head = self.final_head_type in (
+            'dense_residual', 'dense_residual_mlp'
+        )
+        self.use_shared_sparse_final_head = self.final_head_type in (
+            'shared_sparse', 'shared_sparse_residual', 'dense_sparse_residual'
+        )
+        self.use_modern_sparse_final_head = self.final_head_type in (
+            'modern_moe', 'modern_sparse_moe', 'contour_moe'
+        )
+        self.use_custom_final_head = (
+            self.use_moe_final_head
+            or self.use_dense_residual_final_head
+            or self.use_shared_sparse_final_head
+            or self.use_modern_sparse_final_head
+        )
+        self.use_per_point_delta = bool(use_per_point_delta) and not self.use_custom_final_head
         self.per_point_delta_head_type = str(per_point_delta_head_type).strip().lower()
         self.use_latent_loop = bool(use_latent_loop)
         self.latent_loop_steps = int(max(1, latent_loop_steps))
@@ -85,6 +124,39 @@ class DiTFlowMatchingV4_1(DiTFlowMatchingV3_4):
                 routed_expert_scale=moe_routed_expert_scale,
                 expert_type=moe_expert_type,
                 expert_hidden_dim=moe_expert_hidden_dim,
+            )
+        elif self.use_dense_residual_final_head:
+            self.final_layer = DenseResidualFinalHead(
+                dim=self.state_dim,
+                out_dim=2,
+                hidden_dim=dense_residual_hidden_dim,
+                residual_init_std=modern_output_expert_init_std,
+            )
+        elif self.use_shared_sparse_final_head:
+            self.final_layer = SharedDenseSparseResidualHead(
+                dim=self.state_dim,
+                out_dim=2,
+                shared_hidden_dim=dense_residual_hidden_dim,
+                num_experts=shared_sparse_num_experts,
+                expert_hidden_dim=shared_sparse_expert_hidden_dim,
+                router_temperature=shared_sparse_router_temperature,
+                load_ema_decay=shared_sparse_load_ema_decay,
+                balance_bias_step=shared_sparse_balance_bias_step,
+                balance_bias_limit=shared_sparse_balance_bias_limit,
+                expert_scale=shared_sparse_expert_scale,
+            )
+        elif self.use_modern_sparse_final_head:
+            self.final_layer = ModernSparseResidualHead(
+                dim=self.state_dim,
+                out_dim=2,
+                num_experts=modern_output_num_experts,
+                top_k=modern_output_top_k,
+                expert_hidden_dim=modern_output_hidden_dim,
+                router_temperature=modern_output_router_temperature,
+                balance_weight=modern_output_balance_weight,
+                phi_ema_decay=modern_output_phi_ema_decay,
+                contrastive_weight=modern_output_contrastive_weight,
+                expert_init_std=modern_output_expert_init_std,
             )
 
         if self.use_latent_loop:

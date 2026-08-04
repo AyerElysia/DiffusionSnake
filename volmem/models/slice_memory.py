@@ -16,14 +16,27 @@ class SliceMemoryEncoder(nn.Module):
         memory_dim: int,
         mask_channels: int = 1,
         pool_size: int = 8,
+        fusion_mode: str = "concat",
+        mask_evidence_scale: float = 0.25,
     ) -> None:
         super().__init__()
         self.feature_dim = int(feature_dim)
         self.memory_dim = int(memory_dim)
         self.mask_channels = int(mask_channels)
         self.pool_size = int(pool_size)
+        self.fusion_mode = str(fusion_mode).strip().lower()
+        if self.fusion_mode not in ("concat", "balanced_add", "evidence_value"):
+            raise ValueError(
+                "fusion_mode must be 'concat', 'balanced_add' or 'evidence_value'"
+            )
+        self.mask_evidence_scale = float(mask_evidence_scale)
+        if self.mask_evidence_scale < 0.0:
+            raise ValueError("mask_evidence_scale must be non-negative")
+        projection_channels = self.feature_dim + self.mask_channels
+        if self.fusion_mode != "concat":
+            projection_channels = self.feature_dim
         self.key_proj = nn.Conv2d(
-            self.feature_dim + self.mask_channels,
+            projection_channels,
             self.memory_dim,
             kernel_size=1,
             bias=False,
@@ -31,9 +44,13 @@ class SliceMemoryEncoder(nn.Module):
         normalization_groups = min(8, self.memory_dim)
         while self.memory_dim % normalization_groups != 0:
             normalization_groups -= 1
+        value_input_channels = (
+            self.mask_channels
+            if self.fusion_mode == "evidence_value" else projection_channels
+        )
         self.value_proj = nn.Sequential(
             nn.Conv2d(
-                self.feature_dim + self.mask_channels,
+                value_input_channels,
                 self.memory_dim,
                 kernel_size=1,
                 bias=False,
@@ -41,6 +58,30 @@ class SliceMemoryEncoder(nn.Module):
             nn.GroupNorm(normalization_groups, self.memory_dim),
             nn.GELU(),
         )
+        if self.fusion_mode in ("balanced_add", "evidence_value"):
+            self.mask_key_proj = nn.Conv2d(
+                self.mask_channels,
+                self.memory_dim,
+                kernel_size=1,
+                bias=False,
+            )
+            self.mask_key_norm = nn.GroupNorm(
+                normalization_groups,
+                self.memory_dim,
+                affine=False,
+            )
+            if self.fusion_mode == "balanced_add":
+                self.mask_value_proj = nn.Conv2d(
+                    self.mask_channels,
+                    self.memory_dim,
+                    kernel_size=1,
+                    bias=False,
+                )
+                self.mask_value_norm = nn.GroupNorm(
+                    normalization_groups,
+                    self.memory_dim,
+                    affine=False,
+                )
 
     def forward(
         self,
@@ -57,24 +98,57 @@ class SliceMemoryEncoder(nn.Module):
             slice_features,
             (self.pool_size, self.pool_size),
         )
-        mask_evidence = F.interpolate(
-            mask_evidence.to(
-                device=slice_features.device,
-                dtype=slice_features.dtype,
-            ),
-            size=(self.pool_size, self.pool_size),
-            mode="bilinear",
-            align_corners=False,
+        mask_evidence = mask_evidence.to(
+            device=slice_features.device,
+            dtype=slice_features.dtype,
         )
+        if self.fusion_mode in ("balanced_add", "evidence_value"):
+            mask_evidence = F.adaptive_max_pool2d(
+                mask_evidence,
+                (self.pool_size, self.pool_size),
+            )
+        else:
+            mask_evidence = F.interpolate(
+                mask_evidence,
+                size=(self.pool_size, self.pool_size),
+                mode="bilinear",
+                align_corners=False,
+            )
         if mask_evidence.size(1) != self.mask_channels:
             raise ValueError(
                 "mask_evidence channels {} != configured {}".format(
                     mask_evidence.size(1), self.mask_channels
                 )
             )
-        fused = torch.cat([pooled_features, mask_evidence], dim=1)
-        key = self.key_proj(fused)
-        value = self.value_proj(fused)
+        if self.fusion_mode == "concat":
+            fused = torch.cat([pooled_features, mask_evidence], dim=1)
+            key = self.key_proj(fused)
+            value = self.value_proj(fused)
+        elif self.fusion_mode == "balanced_add":
+            has_evidence = (
+                mask_evidence.abs().sum(dim=(1, 2, 3), keepdim=True) > 0
+            ).to(dtype=pooled_features.dtype)
+            mask_key = self.mask_key_norm(self.mask_key_proj(mask_evidence))
+            mask_value = self.mask_value_norm(self.mask_value_proj(mask_evidence))
+            mask_key = mask_key * has_evidence
+            mask_value = mask_value * has_evidence
+            key = self.key_proj(pooled_features) + (
+                self.mask_evidence_scale * mask_key
+            )
+            value_pre = self.value_proj[0](pooled_features) + (
+                self.mask_evidence_scale * mask_value
+            )
+            value = self.value_proj[2](self.value_proj[1](value_pre))
+        else:
+            has_evidence = (
+                mask_evidence.abs().sum(dim=(1, 2, 3), keepdim=True) > 0
+            ).to(dtype=pooled_features.dtype)
+            mask_key = self.mask_key_norm(self.mask_key_proj(mask_evidence))
+            key = self.key_proj(pooled_features) + (
+                self.mask_evidence_scale * mask_key * has_evidence
+            )
+            value = self.value_proj(mask_evidence)
+            value = self.mask_evidence_scale * value * has_evidence
         return SliceMemoryState(
             volume_id=meta.volume_id,
             slice_index=meta.slice_index,

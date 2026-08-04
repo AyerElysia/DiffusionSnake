@@ -15,6 +15,7 @@ class SliceMemoryState:
     key: torch.Tensor
     value: torch.Tensor
     valid_mask: Optional[torch.Tensor] = None
+    is_global: bool = False
 
 
 @dataclass(frozen=True)

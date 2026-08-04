@@ -25,6 +25,11 @@ class MemFlowDiTSnake(nn.Module):
         memory_pool_size: int = 8,
         dit_state_dim: int = 256,
         distance_scale: float = 4.0,
+        distance_mode: str = "signed",
+        memory_mask_fusion_mode: str = "concat",
+        memory_mask_evidence_scale: float = 0.25,
+        memory_position_in_values: bool = True,
+        memory_global_pool_size: int = 0,
     ) -> None:
         super().__init__()
         self.contour_adapter = contour_adapter
@@ -33,6 +38,8 @@ class MemFlowDiTSnake(nn.Module):
             memory_dim=memory_dim,
             mask_channels=mask_channels,
             pool_size=memory_pool_size,
+            fusion_mode=memory_mask_fusion_mode,
+            mask_evidence_scale=memory_mask_evidence_scale,
         )
         self.memflow_controller = install_memflow_dit(
             contour_adapter=contour_adapter,
@@ -40,15 +47,22 @@ class MemFlowDiTSnake(nn.Module):
             state_dim=dit_state_dim,
             num_heads=memory_heads,
             distance_scale=distance_scale,
+            distance_mode=distance_mode,
+        )
+        self.memflow_controller.set_value_position_scale(
+            1.0 if bool(memory_position_in_values) else 0.0
         )
         self.memory_capacity = int(memory_capacity)
+        self.memory_global_pool_size = int(memory_global_pool_size)
         self.mask_channels = int(mask_channels)
         self.memory_pool_size = int(memory_pool_size)
 
     def new_banks(self, volume_ids: Sequence[str]) -> List[SliceMemoryBank]:
         banks = []
         for volume_id in volume_ids:
-            bank = SliceMemoryBank(self.memory_capacity)
+            bank = SliceMemoryBank(
+                self.memory_capacity, self.memory_global_pool_size
+            )
             bank.reset(str(volume_id))
             banks.append(bank)
         return banks
@@ -97,6 +111,9 @@ class MemFlowDiTSnake(nn.Module):
             ),
             "memflow_active_states": loss.detach().new_tensor(
                 float(self.memflow_controller.active_state_count)
+            ),
+            "memflow_global_source_slices": loss.detach().new_tensor(
+                float(sum(bank.global_count for bank in banks)) / float(len(banks))
             ),
             "volmem_prediction_evidence_fraction": loss.detach().new_tensor(
                 float(prediction_evidence_fraction)

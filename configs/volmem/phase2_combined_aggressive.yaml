@@ -1,0 +1,21 @@
+# 激进组合方案
+# Safe_B (chunks 20) + MoE 剪枝 + 混合精度
+# 预期: 1.6-1.8x 加速
+
+model_name: 'MemFlowDiT'
+
+# Safe_B 配置
+chunks_per_step: 20
+
+# MoE 剪枝
+num_experts: 4
+num_active_experts: 2
+top_k: 1
+use_balance_loss: false
+
+# 混合精度
+use_mixed_precision: true
+moe_precision: 'float16'
+memory_encoder_precision: 'float16'
+
+memory_capacity: 4

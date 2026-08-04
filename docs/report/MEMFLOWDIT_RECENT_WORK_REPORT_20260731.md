@@ -183,7 +183,7 @@ v0.4/v0.5 改为：
 
 这不是严格单变量消融，因为特征层和细节机制同时变化；它能支持“简化没有破坏主路径，并显著恢复已加载基线能力”，不能单独证明全部增益来自 layer 18。
 
-v0.5 已作为正式训练重新启动，最大训练步数为 100,000。2026-07-31 约 09:52 核对时：
+v0.5 已作为正式训练重新启动。启动时曾设置 100,000 step，但该上限按最新训练预算要求已经取消：当前运行采用“双硬限制”，在 **step 6800** 或 **2026-08-02 04:00（Asia/Shanghai）** 二者先到时停止，总训练墙钟时间不超过两天。以后启动脚本的默认上限也已改为 6800。2026-07-31 约 09:52 首次核对时：
 
 - 进程：PID `1572713`
 - 物理 GPU：6
@@ -194,7 +194,36 @@ v0.5 已作为正式训练重新启动，最大训练步数为 100,000。2026-07
 - 最近 100 step 平均 memory read delta：0.000182
 - 训练中无 NaN、无崩溃
 
-当前仍需等待更充分训练后做新的固定 seed、GT-box、memory-off 与 autoregressive 全量评估。不能仅凭烟测宣布最终视觉质量已经解决。
+上述两天限制由独立 watchdog 约束当前既有进程，因此不需要重启训练，也不会破坏现有优化器连续状态。达到 step 上限时会等待对应的整百 checkpoint 落盘再停止；若先达到墙钟期限，则直接停止并保留此前最近的整百 checkpoint。
+
+本轮随后在 step 1600 完成了新的固定 seed、GT-box、memory-off 与 autoregressive 配对评估。它比早期烟测可靠，但仍只有 3 个体积，不能据此宣布最终视觉质量已经解决。
+
+### 4.1 step 1600 最新落盘评估
+
+2026-07-31 对正式 v0.5 最新不可变 checkpoint `step_001600.pt` 做了固定 `seed=20260731`、GT box、3 个完整体积、333 张切片的配对评估。两组唯一变量为 memory mode。
+
+| 设置 | 体积 Dice | 体积 IoU | 前景切片 Dice | class mean Dice |
+|---|---:|---:|---:|---:|
+| memory-off | **0.792168** | **0.656264** | 0.765609 | 0.747620 |
+| autoregressive | 0.792125 | 0.656225 | **0.765794** | **0.747883** |
+| autoregressive - off | -0.000043 | -0.000039 | +0.000185 | +0.000263 |
+
+自回归平均 memory read delta 为 `0.0000965`，说明记忆分支确实执行了读取；但体积主指标变化只有 `-0.000043`，当前仍不能认为记忆产生了可重复净收益。
+
+memory-off 的逐体积 Dice 为：
+
+- `sub-verse010`：0.791492；
+- `sub-verse011`：0.815618；
+- `sub-verse013`：0.769394。
+
+同为 GT box、memory-off 的前两个体积上，旧 v0.3 step 3250 Dice 为 0.722742；当前 v0.5 step 1600 对应两体积均值为 0.803555，绝对提高 0.080813。这一结果强烈支持完整目标和简洁主线修复的有效性，但仍不是只改变单一数据变量的严格消融。
+
+新的误差形态也发生了变化。memory-off 三个体积的预测/GT 前景比为 1.087、1.035、1.078；旧 v0.3 的对应诊断主要是 0.82–0.85 的系统性欠分割。说明 largest-only 数据损失已经不再主导结果，但当前出现了约 3.5%–8.7% 的轻度前景过量，需要在后续全量可视化中重点检查边界外扩，而不是继续沿用“缺失连通域”这一旧解释。
+
+结果位置：
+
+- `data/outputs/volmem/verse_memflowdit_v0_5_minimal_gpu6/eval_step_001600_gt_off_3vol_seed20260731/summary.json`
+- `data/outputs/volmem/verse_memflowdit_v0_5_minimal_gpu6/eval_step_001600_gt_autoregressive_3vol_seed20260731/summary.json`
 
 ---
 
@@ -463,7 +492,7 @@ v0.6 联合候选同时使用：
 
 ### 9.1 当前主线
 
-继续运行：
+在两天硬预算内继续运行：
 
 `configs/volmem/verse_memflowdit_v0_5_minimal_gpu6.yaml`
 
@@ -472,6 +501,7 @@ v0.6 联合候选同时使用：
 - 它已经包含最重要的数据目标、边界采样和记忆证据修复；
 - 正式训练已经启动，不应中途改变参数结构和优化器状态；
 - 当前首要任务仍是验证“正确数据目标 + 简洁 MoonViT 主路径”经过充分训练后的真实上限。
+- 当前运行不再追求 100,000 step；有效上限是 step 6800 或 2026-08-02 04:00 二者先到。
 
 ### 9.2 下一次独立候选
 
@@ -577,3 +607,65 @@ v0.6 联合候选同时使用：
 因此，当前最重要的技术结论可以概括为：
 
 > 之前差的演化效果既有训练量不足的问题，但更先验、更严重的是训练目标被数据管线系统性裁残；MoE 则已被消融证明是当前输出映射的重要组成部分，但旧路由监控和均衡损失不足以防止 hard 激活退化。新的主线必须同时保证数据目标完整、结构简洁，并用真实 hard 路由统计约束 MoE 的长期可训练性。
+
+---
+
+## 十二、3D Memory 与并行推理补充（2026-07-31 晚）
+
+完整设计、实现、运行记录和逐项指标见：
+
+- `docs/report/MEMFLOWDIT_PARALLEL_3D_MEMORY_EXPERIMENT_20260731.md`
+
+严格同噪声、GT-box、固定 3 个 validation volumes 的配对结果显示：旧 v0.5 step2300 的 parallel-off Volume Dice 为 `0.796574`，feature-only、GT-oracle、predicted bidirectional Memory 分别为 `0.796354`、`0.796343`、`0.796363`，三种 Memory 均无收益，且 read delta 都约为 `1.089e-4`。旧自回归相对顺序 off 下降 `0.000276` Dice，吞吐下降 17.7%。因此当前问题不是 bank 太小，也不能主要归因于预测误差累积；更直接的原因是 26 通道稀疏 mask 在 1152 通道 MoonViT 特征中被数值淹没，随后 Memory residual 又被近零输出投影二次压低。
+
+已实现参数无关的 causal/bidirectional/shuffled 选择、冻结两遍预测、feature-only 一遍双向推理和按 volume 同噪声评估。并行关闭 Memory 的吞吐达到 `1.789 slice/s`，约为顺序 off 的 4.5 倍，证明“整卷批量并行”本身值得保留；但 predicted two-pass 只有 `0.859 slice/s` 且无精度收益，因此不进入主线。
+
+新的 v0.7 仅把 feature 与 mask 分开投影、对 mask 单独归一化并固定比例相加，没有增加 router、长期 bank 或法向细节分支。首次 run 在 step9 发现长训练遗留的 4500-step 预测证据爬升不适合本轮 2000-step/两天上限，已完整归档并将正式日程修正为 step250 开始、750 steps 爬升、step1000 后保持 50% predicted evidence。v0.5/v0.6 原训练未受影响。后续只有在 v0.7 的 causal GT-oracle 明确转正后，才允许继续扫描 bank 大小与更复杂的选择策略。
+
+2026-08-01 补充：v0.7 step500 的 3-volume、GT-box、同 seed 因果门槛已经完成。off Volume Dice 为 `0.790857`，causal GT-oracle 为 `0.790106`，差值 `-0.000750`；三个 volume 的差值均非正，吞吐下降 7.9%。因此 balanced entrance 虽把活跃区间的 Memory read delta 提高到约 `2.7e-4` 至 `3.1e-4`，更新方向仍然有害，step500 不能称为有效 Memory。训练暂时继续到预测证据达到 50% 的 step1000 再做最终 gate；若仍不转正，停止 v0.7 并淘汰该方案。完整故障与实验记录仍以专项报告第 8.6 节为准。
+
+2026-08-01 Bank 复核补充：用户关于 K4 历史范围过窄的怀疑部分成立。三个验证体积的矢状位间距分别约为 1/2/3 mm，最近 K4 实际只覆盖 3/6/9 mm；更关键的是当前实现只传入 slice index，完全丢失了毫米间距，使相同 index 距离在不同体积中被错误地视为同一种三维几何关系。论文审计也不支持把全部原始历史无限平铺：SAM 2 使用受限空间 Memory 与间隔旧帧，RMem 直接报告扩张 bank 会被冗余和混淆特征拖累，XMem 则把长期历史压缩保存。现已增加“固定 K4、保留最近层并间隔采样旧层”的诊断模式，并用同 checkpoint 同噪声对照 recent K4、strided K4、K8/K16 与单体积 all-history；正式候选优先考虑物理毫米坐标下的有界多尺度历史，而不是无上限原始 bank。完整数据审计、token 预算和预设判据见 Memory 专项报告第 10 节。
+
+2026-08-01 进一步结论：同一 v0.7 step500、sub-verse010、GT-box、同噪声配对已经排除“只因 bank 太小”。off 为 `0.791592`；GT recent K4/K8/K16 分别为 `0.791451/0.789947/0.788471`，差值随容量扩大到 `-0.003120`；固定 token 但扩大跨度的 strided K4 为 `0.789143`；all-history 为 `0.790383`，前景 slice Dice 下降 `0.009363`、吞吐下降 28.6%，且误差随历史长度增大。feature-only K4 比 off 低 `0.001551`，加入 GT mask 后恢复 `0.001411`，说明 mask evidence 已有益，真正有害的是历史 MoonViT feature/距离内容路径。
+
+据此已实现并启动简洁 v0.8：MoonViT 只作 key，class-aware mask 只作 value，距离只进 key，位置改为 NIfTI 毫米坐标，bank 有界为 K7；不增加 selector、双 bank、router 或法向分支。全量物理清单覆盖 160 volumes/26,589 slices。14 项单测与最终 smoke 通过；正式训练从 v0.5 step2300 初始化并将 Memory read 清零，以严格 2D identity 起步。GPU5 train PID `2745777`、watchdog PID `2745778`，最晚 `2026-08-03T07:00:00+08:00` 或 step2000 停止；启动后 step1–8 数值稳定，read delta 由 0 平滑打开到约 `5e-5`–`6e-5`。v0.7 GPU1 训练未停止，检查时到 step800。完整表格、失败 smoke 原因、论文依据和运行路径见 Memory 专项报告第 10.4–10.7 节。
+
+v0.8 step100 的 1-volume、GT-box、同噪声 off/oracle K7 门槛已由不可变守护脚本启动等待，PID `2748662`，输出目录为 `data/outputs/volmem/diagnostics/memflowdit_v08_step000100_gt_gate/`；脚本启动后不再覆盖原文件。
+
+---
+
+## 十三、v0.8 最终结论与 v0.9 compact 3D 尝试（2026-08-02）
+
+v0.7/v0.8 均已自然训练到 step2000。v0.8 的最终判断不再依赖早期 step100：对 step1900 和 step2000 分别做同 checkpoint、同噪声、GT-box 的 off/oracle K7 门控。Volume Dice 差值仅为 `+0.000402/+0.000111`；step2000 的前景 slice Dice 反而 `-0.002234`、class Dice `-0.001027`，吞吐下降 19.4%。它没有达到预设的 `+0.001`、前景同向、减速不超过 10% 门槛，因此 v0.8 不再续训，也不能称为有效 3D Memory。
+
+这次失败进一步确认：真实毫米位置和 evidence-only value 修复了数据语义，却不足以让“多张局部历史图”自动升级为有效三维状态。继续增大 raw bank 已被 K8/K16/all-history 反证，下一步应压缩旧历史，而不是保存更多原始 token。
+
+v0.9 因而只增加一个参数无关的 compact 摘要：保留最近 K4 的 256 个局部 token，把全部更老且非空的 mask evidence 在线平均成 4×4 的 16 个全局 token，总预算固定为 272。全局 token 不写入伪造 slice distance；空切片由 valid mask 屏蔽；没有 selector、双 bank attention、额外 router、法向细节或几何分支。零训练探针中 K4+G16 的 Volume Δ 为 `+0.000180`，略优于 K7+G16 的 `+0.000160`，且 token 更少，因此正式配置选择 K4+G16。旧权重下前景指标仍为负，这一探针只用于选容量，不作为有效性结论。
+
+17 项 Memory 单测和 2-step smoke 已通过。正式训练从 v0.8 step2000 的 `461/461` 完整权重继续适配，GPU6 PID `3403812`，watchdog PID `3403813`，最晚 step2000 或 `2026-08-03T23:50:00+08:00` 停止。首步 loss `0.003758`、read delta `0.000191`、显存 `12.98GB`，8 个并行 bank 均实际读到 `4 local + 1 global`。
+
+step100 已挂三路守护评估（PID `3404945`）：
+
+1. Memory off；
+2. oracle local K4；
+3. oracle local K4 + global16。
+
+输出目录为 `data/outputs/volmem/diagnostics/memflowdit_v09_step000100_compact_gate/`。只有第三路相对 off 达到 `+0.001`、前景同向，并且相对第二路存在可复现额外增益，才认为 compact global token 值得继续；否则停止继续堆叠长期模块。
+
+---
+
+## 十四、v0.9 step100 门控：compact global 尚未生效（2026-08-02）
+
+三路同 checkpoint、GT-box、sub-verse010、同 seed 的评估已经完成：off / local K4 / local K4+global16 的 Volume Dice 分别为 `0.794863 / 0.793886 / 0.793874`。local K4 相对 off 为 `-0.000977`；加入 global16 后相对 off 为 `-0.000989`，相对 local K4 仅 `-0.0000119`。compact 的前景 slice Dice 相对 off 为 `-0.001912`，吞吐下降 18.2%。三项预设门槛全部未通过。
+
+这意味着目前不能保证 Memory 有效：局部历史仍在轻微伤害结果，16 个全局 token 也没有提供额外净收益。global state、非空 valid mask 和独立 token 路径均已实际运行，因此不能把零增益归因于“代码没走到”；更可能是简单均值摘要没有保留可判别结构，或 controller 尚未学会条件性使用历史。
+
+考虑到新增路径只适配了 100 steps，v0.9 暂时不停，但设置了明确的最终止损点：只训练到 step500 再做固定 3-volume 的 off / K4 / K4+G16 复核。watcher PID 为 `3422258`，结果目录为 `data/outputs/volmem/diagnostics/memflowdit_v09_step000500_compact_gate_3vol/`。若仍未达到 `Volume +0.001、前景同向、减速不超过 10%`，立即停止 v0.9，并淘汰当前 compact 在线均值方案，不再通过增加 bank 或 token 数量掩盖失败。
+
+---
+
+## 十五、v0.9 最终止损与 MoE 成本审计（2026-08-02）
+
+v0.9 step500 的 3-volume 门控已经完成：off / local K4 / K4+G16 的 Volume Dice 分别为 `0.789150 / 0.789112 / 0.789166`。compact 相对 off 仅 `+0.000016`，相对 local 仅 `+0.000054`；虽然前景 slice Dice 为 `+0.001310`，吞吐仍下降 18.09%，没有达到 Volume `+0.001` 与减速不超过 10% 的门槛。自动止损守护在结果落盘后核对 PID 与配置并发送 SIGTERM，训练于 step608 停止。当前 compact 在线均值方案正式淘汰，Memory 不能声称有效。
+
+另完成独立 MoE 成本审计。当前联合候选是输出头 8 专家 Top-2，加奇数 3 层 E4 Top-1，并非 6 层全 MoE。相对 output-MoE dense DiT，总参数增长 12.00%，训练峰值显存仅增长 0.61%，参数成本可接受；但 batch1 新增减速为 7.79%，batch8 新增减速为 15.68%。旧输出头还会先计算全部 8 个专家再 Top-2 gather，是并行扩展的主要冗余。完整表格、代码根因和准入决策见 `docs/report/MOE_COST_AUDIT_20260802.md`。

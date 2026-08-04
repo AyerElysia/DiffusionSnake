@@ -1,3 +1,5 @@
+import csv
+
 import cv2
 import numpy as np
 
@@ -93,6 +95,41 @@ def make_single_slice_dataset_class():
     from lib.datasets.sagittal_2d_fixed.snake import Dataset as LegacyDataset
 
     class SingleSliceCompatibilityDataset(LegacyDataset):
+        def __init__(self, *args, **kwargs):
+            super().__init__(*args, **kwargs)
+            if str(getattr(cfg.volmem, "position_unit", "index")) != "mm":
+                return
+            geometry = {}
+            with open(self.ann_file, "r", encoding="utf-8", newline="") as handle:
+                reader = csv.DictReader(handle)
+                required = {"case_id", "slice_idx", "slice_position_mm"}
+                missing = required.difference(reader.fieldnames or ())
+                if missing:
+                    raise ValueError(
+                        "physical slice manifest is missing columns: {}".format(
+                            sorted(missing)
+                        )
+                    )
+                for raw in reader:
+                    if raw.get("split") != self.manifest_split:
+                        continue
+                    key = (str(raw["case_id"]), int(raw["slice_idx"]))
+                    if key in geometry:
+                        raise ValueError(
+                            "duplicate physical slice geometry for {}".format(key)
+                        )
+                    geometry[key] = {
+                        "slice_position_mm": float(raw["slice_position_mm"]),
+                        "slice_spacing_mm": float(raw["slice_spacing_mm"]),
+                    }
+            for row in self.records:
+                key = (str(row["case_id"]), int(row["slice_idx"]))
+                if key not in geometry:
+                    raise ValueError(
+                        "missing physical slice geometry for {}".format(key)
+                    )
+                row.update(geometry[key])
+
         def _neighbor_rows(self, center_row):
             return [center_row, center_row, center_row]
 

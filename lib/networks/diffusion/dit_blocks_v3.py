@@ -166,6 +166,8 @@ class DiTBlockV3(nn.Module):
         prototype_phi_balance_weight: float = 1e-3,
         prototype_phi_ema_decay: float = 0.99,
         prototype_phi_contrastive_weight: float = 1e-3,
+        prototype_phi_use_shared_expert: bool = False,
+        prototype_phi_shared_hidden_dim: int = 0,
     ):
         super().__init__()
         self.dim = dim
@@ -226,6 +228,8 @@ class DiTBlockV3(nn.Module):
                 phi_weight=prototype_phi_balance_weight,
                 phi_ema_decay=prototype_phi_ema_decay,
                 contrastive_weight=prototype_phi_contrastive_weight,
+                use_shared_expert=prototype_phi_use_shared_expert,
+                shared_hidden_dim=prototype_phi_shared_hidden_dim,
             )
 
         if self.prototype_phi_moe is not None:

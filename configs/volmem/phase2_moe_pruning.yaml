@@ -1,0 +1,12 @@
+# MoE 专家剪枝配置
+# 目标: 减少活跃专家数，简化路由 → 预期 1.2x 加速
+
+model_name: 'MemFlowDiT'
+num_experts: 4  # 从 8 → 4
+num_active_experts: 2  # 只激活 2 个
+top_k: 1  # 从 2 → 1（只选最好的）
+use_balance_loss: false  # 禁用平衡损失
+
+# 其他参数保持默认
+chunks_per_step: 12
+memory_capacity: 4

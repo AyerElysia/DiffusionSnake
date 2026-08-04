@@ -4,6 +4,7 @@ import atexit
 import gc
 import hashlib
 import json
+import math
 import os
 import pathlib
 import random
@@ -42,6 +43,16 @@ def parse_args():
         default=-1.0,
         help="Test-only override; negative values use the configured schedule.",
     )
+    parser.add_argument(
+        "--init-memflow-ckpt",
+        default="",
+        help="Initialize the complete MemFlowDiT model from a prior branch checkpoint.",
+    )
+    parser.add_argument(
+        "--reset-memory-read",
+        action="store_true",
+        help="Zero Memory attention outputs after checkpoint migration for an exact 2D start.",
+    )
     return parser.parse_args()
 
 
@@ -74,8 +85,8 @@ def validate_config():
         raise RuntimeError("VolMem training requires prototype maturity or higher")
     if bool(cfg.volmem.native_3d_network):
         raise ValueError("prototype must remain slice-sequential")
-    if str(cfg.volmem.position_unit) != "index":
-        raise ValueError("current manifest supports position_unit=index only")
+    if str(cfg.volmem.position_unit) not in ("index", "mm"):
+        raise ValueError("position_unit must be index or mm")
     feature_keys = list(cfg.locate_feat_keys)
     if feature_keys not in (["layer_18"], ["layer_18", "layer_26"]):
         raise ValueError("VolMem supports MoonViT layer_18, optionally with layer_26")
@@ -107,6 +118,19 @@ def move_batch(batch, device):
     return batch
 
 
+def sequence_position(record, slice_index):
+    position_unit = str(cfg.volmem.position_unit)
+    if position_unit == "index":
+        return float(slice_index)
+    value = record.get("slice_position_mm")
+    if value is None or str(value).strip() == "":
+        raise ValueError("mm position requires slice_position_mm in the manifest")
+    position = float(value)
+    if not math.isfinite(position):
+        raise ValueError("slice_position_mm must be finite")
+    return position
+
+
 def load_initial_weights(module, checkpoint_path):
     obj = torch.load(checkpoint_path, map_location="cpu")
     state = obj.get("state_dict") or obj.get("model") or obj.get("net") or obj
@@ -118,10 +142,35 @@ def load_initial_weights(module, checkpoint_path):
     }
     adapted = []
 
-    # A prototype-Phi MoE layer contains no inactive dense FFN.  When starting
-    # from the proven dense checkpoint, clone each dense SwiGLU tensor into all
-    # routed experts here, before optimizer construction.  New MoE checkpoints
-    # already contain the expert keys and therefore bypass this bridge.
+    # Bridge the proven dense SwiGLU into either the original routed-only MoE or
+    # the compute-matched shared+routed variant.  For the latter, the shared
+    # branch receives the first hidden channels and every routed branch receives
+    # the remainder (zero padded to a hardware-friendly width).  Their sum is
+    # therefore exactly the dense FFN at initialization.
+    shared_marker = ".prototype_phi_moe.shared_expert."
+    shared_hidden_by_prefix = {}
+    for target_key, target_value in current.items():
+        if shared_marker not in target_key or target_key in compatible:
+            continue
+        prefix, tensor_suffix = target_key.split(shared_marker, 1)
+        source_key = "{}.mlp.{}".format(prefix, tensor_suffix)
+        source_value = state.get(source_key)
+        if source_value is None:
+            continue
+        bridged = torch.zeros_like(target_value)
+        if tensor_suffix in ("w1.weight", "v.weight"):
+            count = min(target_value.size(0), source_value.size(0))
+            bridged[:count].copy_(source_value[:count].to(bridged))
+            shared_hidden_by_prefix[prefix] = int(count)
+        elif tensor_suffix == "w2.weight":
+            count = min(target_value.size(1), source_value.size(1))
+            bridged[:, :count].copy_(source_value[:, :count].to(bridged))
+            shared_hidden_by_prefix[prefix] = int(count)
+        else:
+            continue
+        compatible[target_key] = bridged
+        adapted.append("{}<-{}[:{}]".format(target_key, source_key, count))
+
     expert_marker = ".prototype_phi_moe.experts."
     for target_key, target_value in current.items():
         if expert_marker not in target_key or target_key in compatible:
@@ -132,12 +181,29 @@ def load_initial_weights(module, checkpoint_path):
             continue
         source_key = "{}.mlp.{}".format(prefix, expert_parts[1])
         source_value = state.get(source_key)
-        if (
-            source_value is not None
-            and tuple(source_value.shape) == tuple(target_value.shape)
-        ):
+        if source_value is None:
+            continue
+        if tuple(source_value.shape) == tuple(target_value.shape):
             compatible[target_key] = source_value
             adapted.append("{}<-{}".format(target_key, source_key))
+            continue
+        start = int(shared_hidden_by_prefix.get(prefix, 0))
+        if start <= 0:
+            continue
+        bridged = torch.zeros_like(target_value)
+        tensor_suffix = expert_parts[1]
+        if tensor_suffix in ("w1.weight", "v.weight"):
+            count = min(target_value.size(0), max(source_value.size(0) - start, 0))
+            bridged[:count].copy_(source_value[start:start + count].to(bridged))
+        elif tensor_suffix == "w2.weight":
+            count = min(target_value.size(1), max(source_value.size(1) - start, 0))
+            bridged[:, :count].copy_(source_value[:, start:start + count].to(bridged))
+        else:
+            continue
+        compatible[target_key] = bridged
+        adapted.append(
+            "{}<-{}[{}:{}]".format(target_key, source_key, start, start + count)
+        )
 
     projection_key = "locate_feat_replacer.proj.0.weight"
     if projection_key in state and projection_key in current:
@@ -193,6 +259,93 @@ def load_initial_weights(module, checkpoint_path):
         )
 
 
+def load_memflow_weights(model, checkpoint_path):
+    obj = torch.load(checkpoint_path, map_location="cpu")
+    source = obj.get("state_dict") or obj
+    source = {
+        str(key).replace("module.", "", 1) if str(key).startswith("module.") else str(key): value
+        for key, value in source.items()
+    }
+    target = model.state_dict()
+    compatible = {
+        key: value
+        for key, value in source.items()
+        if key in target and tuple(value.shape) == tuple(target[key].shape)
+    }
+    adapted = []
+    for key in (
+        "memory_encoder.key_proj.weight",
+        "memory_encoder.value_proj.0.weight",
+    ):
+        source_value = source.get(key)
+        target_value = target.get(key)
+        if (
+            source_value is not None
+            and target_value is not None
+            and source_value.ndim == 4
+            and target_value.ndim == 4
+            and source_value.size(0) == target_value.size(0)
+            and source_value.size(1) > target_value.size(1)
+            and tuple(source_value.shape[2:]) == tuple(target_value.shape[2:])
+        ):
+            compatible[key] = source_value[:, :target_value.size(1)].clone()
+            adapted.append(key + "<-feature_channels")
+    for target_key, source_key in (
+        ("memory_encoder.mask_key_proj.weight", "memory_encoder.key_proj.weight"),
+        ("memory_encoder.mask_value_proj.weight", "memory_encoder.value_proj.0.weight"),
+    ):
+        source_value = source.get(source_key)
+        target_value = target.get(target_key)
+        if source_value is None or target_value is None:
+            continue
+        if (
+            source_value.ndim == 4
+            and target_value.ndim == 4
+            and source_value.size(0) == target_value.size(0)
+            and source_value.size(1) >= target_value.size(1)
+            and tuple(source_value.shape[2:]) == tuple(target_value.shape[2:])
+        ):
+            compatible[target_key] = source_value[:, -target_value.size(1):].clone()
+            adapted.append(target_key + "<-legacy_mask_channels")
+    evidence_value_target = "memory_encoder.value_proj.0.weight"
+    if evidence_value_target in target:
+        target_value = target[evidence_value_target]
+        source_key = "memory_encoder.mask_value_proj.weight"
+        source_value = source.get(source_key)
+        if source_value is None:
+            source_key = "memory_encoder.value_proj.0.weight"
+            source_value = source.get(source_key)
+        if (
+            source_value is not None
+            and source_value.ndim == 4
+            and target_value.ndim == 4
+            and source_value.size(0) == target_value.size(0)
+            and source_value.size(1) >= target_value.size(1)
+            and tuple(source_value.shape[2:]) == tuple(target_value.shape[2:])
+        ):
+            compatible[evidence_value_target] = source_value[
+                :, -target_value.size(1):
+            ].clone()
+            adapted.append(evidence_value_target + "<-" + source_key)
+    info = model.load_state_dict(compatible, strict=False)
+    if len(compatible) < int(len(target) * 0.80):
+        raise RuntimeError(
+            "MemFlow checkpoint compatibility below 80%: {}/{}".format(
+                len(compatible), len(target)
+            )
+        )
+    print(
+        "[memflow-init] checkpoint={} compatible={}/{} missing={} adapted={}".format(
+            checkpoint_path,
+            len(compatible),
+            len(target),
+            len(info.missing_keys),
+            ",".join(adapted) if adapted else "none",
+        ),
+        flush=True,
+    )
+
+
 def build_optimizer(model):
     if str(cfg.train.optim).strip().lower() != "adamw":
         raise ValueError("MemFlowDiT formal training currently requires AdamW")
@@ -232,6 +385,12 @@ def build_optimizer(model):
         flush=True,
     )
     return torch.optim.AdamW(groups, lr=base_lr, weight_decay=weight_decay)
+
+
+def reset_memory_read(model):
+    for adapter in model.memflow_controller.adapters:
+        torch.nn.init.zeros_(adapter.output_proj.weight)
+        torch.nn.init.zeros_(adapter.output_proj.bias)
 
 
 def apply_warmup(optimizer, step):
@@ -335,7 +494,13 @@ def main():
     )
 
     base_network = make_network(cfg)
-    load_initial_weights(base_network, str(cfg.resume_path))
+    if ARGS.init_memflow_ckpt:
+        print(
+            "[init] skipping 2D resume_path because a full MemFlow checkpoint was provided",
+            flush=True,
+        )
+    else:
+        load_initial_weights(base_network, str(cfg.resume_path))
     slice_wrapper = _wrapper_factory(cfg, base_network)
     contour_adapter = V46cContourAdapter(slice_wrapper)
     model = MemFlowDiTSnake(
@@ -348,7 +513,27 @@ def main():
         memory_pool_size=int(cfg.volmem.memory_pool_size),
         dit_state_dim=int(cfg.dit_state_dim),
         distance_scale=float(cfg.volmem.relative_distance_scale),
+        distance_mode=str(
+            getattr(cfg.volmem, "relative_distance_mode", "signed")
+        ),
+        memory_mask_fusion_mode=str(
+            getattr(cfg.volmem, "memory_mask_fusion_mode", "concat")
+        ),
+        memory_mask_evidence_scale=float(
+            getattr(cfg.volmem, "memory_mask_evidence_scale", 0.25)
+        ),
+        memory_position_in_values=bool(
+            getattr(cfg.volmem, "memory_position_in_values", True)
+        ),
+        memory_global_pool_size=int(
+            getattr(cfg.volmem, "memory_global_pool_size", 0)
+        ),
     ).to(device).train()
+    if ARGS.init_memflow_ckpt:
+        load_memflow_weights(model, ARGS.init_memflow_ckpt)
+    if ARGS.reset_memory_read:
+        reset_memory_read(model)
+        print("[memflow-init] Memory read outputs reset to exact 2D identity", flush=True)
 
     optimizer = build_optimizer(model)
     scaler = torch.cuda.amp.GradScaler(enabled=bool(cfg.use_amp))
@@ -422,12 +607,32 @@ def main():
         "source_tracked_dirty": bool(tracked_status.strip()),
         "runtime_file_hashes": runtime_file_hashes,
         "seed": int(ARGS.seed),
+        "init_memflow_checkpoint": str(ARGS.init_memflow_ckpt),
         "max_steps": int(ARGS.max_steps),
         "chunks_per_step": int(chunks_per_step),
         "chunk_length": int(chunk_length),
         "gradient_accumulation_steps": int(gradient_accumulation),
         "memory_mask_channels": int(cfg.volmem.mask_channels),
+        "memory_distance_mode": str(
+            getattr(cfg.volmem, "relative_distance_mode", "signed")
+        ),
+        "memory_mask_fusion_mode": str(
+            getattr(cfg.volmem, "memory_mask_fusion_mode", "concat")
+        ),
+        "memory_mask_evidence_scale": float(
+            getattr(cfg.volmem, "memory_mask_evidence_scale", 0.25)
+        ),
+        "memory_global_pool_size": int(
+            getattr(cfg.volmem, "memory_global_pool_size", 0)
+        ),
+        "prediction_evidence_start_step": int(
+            getattr(cfg.volmem, "prediction_evidence_start_step", 0)
+        ),
+        "prediction_evidence_ramp_steps": int(
+            getattr(cfg.volmem, "prediction_evidence_ramp_steps", 1)
+        ),
         "prediction_evidence_max_prob": float(cfg.volmem.prediction_evidence_max_prob),
+        "reset_memory_read": bool(ARGS.reset_memory_read),
     }
     manifest_path.write_text(
         json.dumps(run_manifest, ensure_ascii=False, indent=2) + chr(10),
@@ -464,8 +669,11 @@ def main():
                 SliceSequenceMeta(
                     volume_id=window[0],
                     slice_index=int(window[1][offset]),
-                    slice_position=float(window[1][offset]),
-                    position_unit="index",
+                    slice_position=sequence_position(
+                        dataset.records[window[2][offset]],
+                        window[1][offset],
+                    ),
+                    position_unit=str(cfg.volmem.position_unit),
                     sequence_direction="ascending",
                 )
                 for window in windows

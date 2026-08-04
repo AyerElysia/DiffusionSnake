@@ -30,14 +30,24 @@ class PrototypePhiMoE(nn.Module):
         phi_ema_decay: float = 0.99,
         contrastive_weight: float = 1e-3,
         contrastive_temperature: float = 0.07,
+        use_shared_expert: bool = False,
+        shared_hidden_dim: int = 0,
     ):
         super().__init__()
         self.dim = int(dim)
         self.num_experts = int(max(2, num_experts))
         self.top_k = int(max(1, min(top_k, self.num_experts)))
-        if int(expert_hidden_dim) <= 0:
-            expert_hidden_dim = int(math.ceil((self.dim * 8.0 / 3.0) / 64.0) * 64)
+        dense_hidden_dim = int(math.ceil((self.dim * 8.0 / 3.0) / 64.0) * 64)
+        self.use_shared_expert = bool(use_shared_expert)
+        if self.use_shared_expert:
+            if int(shared_hidden_dim) <= 0:
+                shared_hidden_dim = int(math.ceil((dense_hidden_dim / 2.0) / 64.0) * 64)
+            if int(expert_hidden_dim) <= 0:
+                expert_hidden_dim = int(shared_hidden_dim)
+        elif int(expert_hidden_dim) <= 0:
+            expert_hidden_dim = dense_hidden_dim
         self.expert_hidden_dim = int(expert_hidden_dim)
+        self.shared_hidden_dim = int(shared_hidden_dim) if self.use_shared_expert else 0
         self.router_temperature = float(max(router_temperature, 1e-4))
         self.phi_weight = float(max(phi_weight, 0.0))
         self.phi_ema_decay = float(min(max(phi_ema_decay, 0.0), 0.99999))
@@ -49,6 +59,10 @@ class PrototypePhiMoE(nn.Module):
             SwiGLU(dim=self.dim, hidden_dim=self.expert_hidden_dim)
             for _ in range(self.num_experts)
         ])
+        self.shared_expert = (
+            SwiGLU(dim=self.dim, hidden_dim=self.shared_hidden_dim)
+            if self.use_shared_expert else None
+        )
         nn.init.normal_(self.prototypes, std=0.02)
 
         uniform = torch.full((self.num_experts,), 1.0 / self.num_experts)
@@ -203,7 +217,10 @@ class PrototypePhiMoE(nn.Module):
         else:
             self._last_aux_loss = x.new_zeros(())
         self._update_diagnostics(probs, top_idx[:, 0])
-        return output.view_as(x)
+        output = output.view_as(x)
+        if self.shared_expert is not None:
+            output = output + self.shared_expert(x)
+        return output
 
     def reg_loss(self) -> torch.Tensor:
         if self._last_aux_loss is None:

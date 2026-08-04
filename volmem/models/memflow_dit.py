@@ -54,7 +54,14 @@ class MemoryCrossAttention(nn.Module):
         self._cached_value: Optional[torch.Tensor] = None
         self._cached_valid: Optional[torch.Tensor] = None
         self._contour_indices: Optional[torch.Tensor] = None
+        self.read_scale = 1.0
         self.last_delta = 0.0
+
+    def set_read_scale(self, scale: float) -> None:
+        scale = float(scale)
+        if scale < 0.0:
+            raise ValueError("Memory read scale must be non-negative")
+        self.read_scale = scale
 
     def set_slice_memory(
         self,
@@ -132,7 +139,7 @@ class MemoryCrossAttention(nn.Module):
             point_count,
             self.dim,
         )
-        residual = self.output_proj(attended)
+        residual = self.output_proj(attended) * self.read_scale
         has_memory = valid.any(dim=1).to(dtype=residual.dtype).view(-1, 1, 1)
         residual = residual * has_memory
         self.last_delta = float(residual.detach().abs().mean().item())
@@ -149,6 +156,7 @@ class MemFlowDiTController(nn.Module):
         state_dim: int,
         num_heads: int,
         distance_scale: float,
+        distance_mode: str = "signed",
     ) -> None:
         super().__init__()
         if int(memory_dim) != int(state_dim):
@@ -158,6 +166,10 @@ class MemFlowDiTController(nn.Module):
             self.memory_dim,
             distance_scale=distance_scale,
         )
+        self.distance_mode = str(distance_mode).strip().lower()
+        if self.distance_mode not in ("signed", "absolute"):
+            raise ValueError("distance_mode must be 'signed' or 'absolute'")
+        self.value_position_scale = 1.0
         self.adapters = nn.ModuleList([
             MemoryCrossAttention(state_dim, num_heads) for _ in dit_blocks
         ])
@@ -182,7 +194,7 @@ class MemFlowDiTController(nn.Module):
     ) -> None:
         if len(banks) != len(metas):
             raise ValueError("parallel MemFlowDiT inputs must have identical lengths")
-        packed: List[Tuple[Optional[torch.Tensor], Optional[torch.Tensor]]] = []
+        packed = []
         token_counts: List[int] = []
         reference = None
         active_states = 0
@@ -192,6 +204,7 @@ class MemFlowDiTController(nn.Module):
                 raise ValueError("memory bank volume does not match slice metadata")
             keys = []
             values = []
+            valid_tokens = []
             for state in bank.states():
                 if (
                     state.volume_id != meta.volume_id
@@ -209,16 +222,37 @@ class MemFlowDiTController(nn.Module):
                     (key.size(0),),
                     meta.slice_position - state.slice_position,
                 )
+                if self.distance_mode == "absolute":
+                    delta_z = delta_z.abs()
                 position = self.distance_encoding(delta_z)
-                keys.append(key + position)
-                values.append(value + position)
+                if state.valid_mask is None:
+                    state_valid = torch.ones(
+                        key.size(0), dtype=torch.bool, device=key.device
+                    )
+                else:
+                    state_valid = state.valid_mask.reshape(-1).to(
+                        device=key.device, dtype=torch.bool
+                    )
+                valid_tokens.append(state_valid)
+                if state.is_global:
+                    # A global token summarizes a physical span, so assigning
+                    # one synthetic slice distance would be geometrically false.
+                    keys.append(key)
+                    values.append(value)
+                else:
+                    keys.append(key + position)
+                    values.append(value + self.value_position_scale * position)
                 reference = key
                 active_states += 1
             if keys:
-                packed.append((torch.cat(keys, dim=0), torch.cat(values, dim=0)))
+                packed.append((
+                    torch.cat(keys, dim=0),
+                    torch.cat(values, dim=0),
+                    torch.cat(valid_tokens, dim=0),
+                ))
                 token_counts.append(packed[-1][0].size(0))
             else:
-                packed.append((None, None))
+                packed.append((None, None, None))
                 token_counts.append(0)
         self.active_state_count = active_states
         if reference is None:
@@ -234,18 +268,28 @@ class MemFlowDiTController(nn.Module):
             dtype=torch.bool,
             device=reference.device,
         )
-        for index, ((key, value), count) in enumerate(zip(packed, token_counts)):
+        for index, ((key, value, valid), count) in enumerate(zip(packed, token_counts)):
             if count == 0:
                 continue
             key_batch[index, :count] = key
             value_batch[index, :count] = value
-            valid_batch[index, :count] = True
+            valid_batch[index, :count] = valid
         for adapter in self.adapters:
             adapter.set_slice_memory(key_batch, value_batch, valid_batch)
 
     def set_contour_indices(self, contour_indices: Optional[torch.Tensor]) -> None:
         for adapter in self.adapters:
             adapter.set_contour_indices(contour_indices)
+
+    def set_read_scale(self, scale: float) -> None:
+        for adapter in self.adapters:
+            adapter.set_read_scale(scale)
+
+    def set_value_position_scale(self, scale: float) -> None:
+        scale = float(scale)
+        if scale < 0.0:
+            raise ValueError("Memory value-position scale must be non-negative")
+        self.value_position_scale = scale
 
     def mean_read_delta(self) -> float:
         if not self.adapters:
@@ -285,6 +329,7 @@ def install_memflow_dit(
     state_dim: int,
     num_heads: int,
     distance_scale: float,
+    distance_mode: str = "signed",
 ) -> MemFlowDiTController:
     """Install MemFlowDiT only on this adapter's Flow evolution instance."""
     network = contour_adapter.slice_loss_wrapper.net
@@ -301,6 +346,7 @@ def install_memflow_dit(
         state_dim=state_dim,
         num_heads=num_heads,
         distance_scale=distance_scale,
+        distance_mode=distance_mode,
     )
     evolution.denoiser = MemFlowDiTDenoiser(denoiser, controller)
     return controller
