@@ -1,6 +1,25 @@
 # DiffusionSnake: 基于扩散模型的轮廓演化网络
 
-端到端的医学图像分割框架，融合 **YOLO 检测** + **扩散模型轮廓演化**。支持多种 DiT 去噪器版本和初始化策略。
+端到端的医学图像分割框架，融合 **检测（YOLO / LocateAnything）** + **Flow Matching 轮廓演化**。支持多种 DiT 去噪器版本和初始化策略，当前主战场已从 BTCV 腹部 CT 迁移到 **矢状位椎体分割（VerSe）**。
+
+## 当前主线状态（2026-08-04）
+
+- **主线结构冻结**：Dense-6 DiT + H1 Dense Residual 输出头（蒸馏自 E8 Top-2 输出 MoE，相对误差 0.48%），推理调度 8-NFE AB2（2 outer × 4 inner）。详见 `docs/report/FLOW_MAIN_HANDOVER_STATUS_20260804.md`。
+- **历史最佳锚点**：v0.5 step2300 / H1，Volume Dice **0.7967**（3 验证体积、333 slices、GT box、Memory-off、seed 20260731）。
+- **第一贡献**：Flow Matching 轮廓演化（内层 ODE 积分 × 外层 Snake 迭代精修）；**第二贡献**：Contour RL（GRPO 几何质量后训练）。详见 `docs/report/INNOVATION_SUMMARY.md`。
+- **已淘汰路线**：输出 MoE（被 H1 蒸馏严格支配）、3D Memory v0.7/v0.8/v0.9（严格门控下均无净收益，见 `docs/report/FLOW_MEMORY_3D_READONLY_REVIEW_20260804.md`）。
+- **进行中**：Detector Stage A 端到端损失因子隔离（coverage/geometry/class 四条件对照，见 `docs/report/DETECTOR_STAGE_A_STATUS_20260804.md`）；DiT FFN 结构对照（Dense-6 / Odd-3 MoE / All-6 / 共享专家）。
+
+### 论文层级与创新点
+
+| 层级 | 内容 | 状态 |
+|------|------|------|
+| 第一贡献 | Flow Matching 轮廓演化（FM × DeepSnake 两层 ODE 融合） | ✅ 已成立 |
+| 第二贡献 | Contour RL（GRPO 几何质量奖励后训练） | 🔶 有实现，瓶颈已诊断 |
+| 第三层级 | 伪 3D / 顺序体数据能力扩展（跨切片传播、整卷并行） | 🕐 方向已定 |
+| 系统支撑 | 检测器（LocateAnything 接入）与推理加速 | 性能支撑，非核心创新 |
+
+---
 
 ## V2 归档状态（2026-04-19）
 
@@ -14,6 +33,7 @@ V2 系列网络、配置和专用脚本已从主线移出并封存在：
 
 ## 目录
 
+- [当前主线状态（2026-08-04）](#当前主线状态2026-08-04)
 - [整体架构](#整体架构)
 - [详细流程](#详细流程)
   - [1. 数据加载与预处理](#1-数据加载与预处理)
@@ -874,6 +894,19 @@ python verify_octagon_v3.py
 | `sync_logs_to_wandb.py` | JSON 日志同步至 WandB |
 | `lib/networks/vision_mamba2/` | Vision Mamba2 集成 |
 
+### 近期工作留档（docs/report/）
+
+| 报告 | 内容 |
+|------|------|
+| `INNOVATION_SUMMARY.md` | 三大创新点总结（论文 Contributions 形式） |
+| `FLOW_MAIN_HANDOVER_STATUS_20260804.md` | Flow 主线职责、Dense-6 + H1 冻结、归因规则 |
+| `DETECTOR_STAGE_A_STATUS_20260804.md` | 检测器 Stage A：契约冻结与四条件隔离 |
+| `OUTPUT_HEAD_DISTILLATION_H0_H1_H2_20260803.md` | 输出头蒸馏实验（H1 胜出） |
+| `MEMFLOWDIT_RECENT_WORK_REPORT_20260731.md` | 数据根因修复、MoE 消融、Memory v0.7–v0.9 全程记录 |
+| `FLOW_MEMORY_3D_READONLY_REVIEW_20260804.md` | Memory / 3D 只读复核与淘汰结论 |
+| `LOCATEANYTHING_DIFFUSIONSNAKE_INTEGRATION_REPORT_2026-07-31.md` | LocateAnything 检测接入契约 |
+| `MEMFLOWDIT_NEXT_STAGE_EXECUTION_20260803.md` | DiT FFN 对照、Memory 因果审计执行链 |
+
 ---
 
 ## 可视化
@@ -901,6 +934,16 @@ visual/
 
 ## 更新日志
 
+- **2026-08-04**: Flow 主线接管记录与职责划分（演化/加速/检测/RL/论文统筹五任务）；Detector Stage A 目标契约统一（Flow interface manifest v1.1）与四条件损失因子隔离；Flow 接口与 H1 checkpoint 冻结
+- **2026-08-03**: 输出头 H0/H1/H2 蒸馏实验：H1 Dense Residual 质量保持且吞吐 +27.7%，H2 被严格支配，H1 成为主线输出头；DiT FFN D1 四组结构对照自动链启动；Memory 因果审计
+- **2026-08-02**: MoE 成本审计（参数 +12%、batch8 减速 15.68%）；3D Memory v0.8/v0.9 严格门控失败止损淘汰
+- **2026-07-31**: MemFlowDiT 综合报告：数据工程根因修复（largest-only 只保留 81.88% 前景 → 99.5%+，v0.5 step1600 Dice 0.792）；MoE 重要性消融（关闭 routed experts Dice -0.129）；DiT FFN-MoE E4K1 prototype 路由（1000 step 无死专家）；输出头 hard-φ 去退化（hard CV 0.91→0.57）；并行 3D Memory 实验（无净收益，整卷并行吞吐 4.5×）；LocateAnything 检测接入（external_detection [B,N,6] 契约）
+- **2026-07-29**: VolMem v0.2 切片记忆原型基线；v0.3 memory-conditioned Flow DiT 原型
+- **2026-07-21**: MoonViT 冻结特征伪 3D 矢状位正式训练（layer18 center-only，border 采样修复）
+- **2026-07-10**: RL 修复 sampled_feat 转置 bug，移除法向方向策略，新增 NSD 奖励
+- **2026-07-07**: per-point FM 尺度策略（tanh 有界）与训练配置
+- **2026-06-24**: Geom Bridge 几何位置桥范式（init→GT 直线桥，单桥单轮廓 0.98 IoU sanity）；RL 探索更新
+- **2026-06-13**: GRPO v5 几何动作（低频 Fourier 法向扰动）与信用分配诊断；Locate 集成与 E 系列评估报告
 - **2026-04-17**: V3.5 傅里叶空间扩散 pipeline 完成，推理测试 & 配置
 - **2026-04-16**: V3.3 Circular Conv1d 平滑约束 (V3.3a/b 变体)；边缘感知平滑后处理；单样本过拟合训练流程 (V2~V3.5)
 - **2026-04-15**: 单样本过拟合配置批量创建；批量推理对比脚本
