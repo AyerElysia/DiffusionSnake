@@ -1,841 +1,105 @@
-# DiffusionSnake: 基于扩散模型的轮廓演化网络
+# DiffusionSnake: Flow Matching 轮廓演化框架
 
-端到端的医学图像分割框架，融合 **检测（YOLO / LocateAnything）** + **Flow Matching 轮廓演化**。支持多种 DiT 去噪器版本和初始化策略，当前主战场已从 BTCV 腹部 CT 迁移到 **矢状位椎体分割（VerSe）**。
+端到端医学图像实例轮廓分割框架：**检测 → 框初始化 → Flow Matching 轮廓演化**。
+用 Flow Matching (FM) 重构 DeepSnake 式轮廓演化：内层为 FM 的 ODE 连续速度场积分，外层保留 Snake "边爬边采特征" 的迭代精修，两层 ODE 融合是本工作的核心方法贡献。
 
-## 当前主线状态（2026-08-04）
+当前主战场已从早期 BTCV 腹部 CT（V1–V3.5 扩散原型）迁移到 **VerSe 矢状位椎体分割**（25 类，C1–C7 / T1–T12 / L1–L6）。
 
-- **主线结构冻结**：Dense-6 DiT + H1 Dense Residual 输出头（蒸馏自 E8 Top-2 输出 MoE，相对误差 0.48%），推理调度 8-NFE AB2（2 outer × 4 inner）。详见 `docs/report/FLOW_MAIN_HANDOVER_STATUS_20260804.md`。
-- **历史最佳锚点**：v0.5 step2300 / H1，Volume Dice **0.7967**（3 验证体积、333 slices、GT box、Memory-off、seed 20260731）。
-- **第一贡献**：Flow Matching 轮廓演化（内层 ODE 积分 × 外层 Snake 迭代精修）；**第二贡献**：Contour RL（GRPO 几何质量后训练）。详见 `docs/report/INNOVATION_SUMMARY.md`。
-- **已淘汰路线**：输出 MoE（被 H1 蒸馏严格支配）、3D Memory v0.7/v0.8/v0.9（严格门控下均无净收益，见 `docs/report/FLOW_MEMORY_3D_READONLY_REVIEW_20260804.md`）。
-- **进行中**：Detector Stage A 端到端损失因子隔离（coverage/geometry/class 四条件对照，见 `docs/report/DETECTOR_STAGE_A_STATUS_20260804.md`）；DiT FFN 结构对照（Dense-6 / Odd-3 MoE / All-6 / 共享专家）。
+---
 
-### 论文层级与创新点
+## 论文贡献层级
 
 | 层级 | 内容 | 状态 |
 |------|------|------|
-| 第一贡献 | Flow Matching 轮廓演化（FM × DeepSnake 两层 ODE 融合） | ✅ 已成立 |
-| 第二贡献 | Contour RL（GRPO 几何质量奖励后训练） | 🔶 有实现，瓶颈已诊断 |
-| 第三层级 | 伪 3D / 顺序体数据能力扩展（跨切片传播、整卷并行） | 🕐 方向已定 |
+| 第一贡献 | **Flow Matching 轮廓演化**：FM 速度场建模 `init → GT` 位移，推理约 8 NFE；外层按 fractions 多轮推进并在当前轮廓位置重新采样图像特征 | ✅ 已成立 |
+| 第二贡献 | **Contour RL**：GRPO 后训练，以不可微几何质量（IoU / 曲率 / 毛刺 / NSD）为奖励 | 🔶 有实现，瓶颈已诊断 |
+| 第三层级 | 伪 3D / 顺序体数据能力扩展（跨切片传播、整卷并行推理） | 🕐 方向已定 |
 | 系统支撑 | 检测器（LocateAnything 接入）与推理加速 | 性能支撑，非核心创新 |
 
----
-
-## V2 归档状态（2026-04-19）
-
-V2 系列网络、配置和专用脚本已从主线移出并封存在：
-`archive/v2_legacy_2026-04-19/snapshot/`
-
-恢复说明见：
-`archive/v2_legacy_2026-04-19/README.md`
+贡献详述见 `docs/report/INNOVATION_SUMMARY.md`。
 
 ---
 
-## 目录
+## 当前主线状态（2026-08-05）
 
-- [当前主线状态（2026-08-04）](#当前主线状态2026-08-04)
-- [整体架构](#整体架构)
-- [详细流程](#详细流程)
-  - [1. 数据加载与预处理](#1-数据加载与预处理)
-  - [2. YOLO 检测模块](#2-yolo-检测模块)
-  - [3. 初始化轮廓生成](#3-初始化轮廓生成)
-  - [4. 扩散模型演化](#4-扩散模型演化)
-  - [5. 训练与推理](#5-训练与推理)
-    - [5.1 训练流程](#51-训练流程)
-    - [5.2 推理流程](#52-推理流程)
-    - [5.3 边缘感知平滑后处理](#53-边缘感知平滑后处理)
-    - [5.4 单样本过拟合训练](#54-单样本过拟合训练)
-    - [5.5 位移场归一化](#55-位移场归一化)
-    - [5.6 GRPO 强化学习训练](#53-grpo-强化学习训练-实验性)
-- [模型版本详解](#模型版本详解)
-- [配置文件说明](#配置文件说明)
-- [快速开始](#快速开始)
-- [关键文件索引](#关键文件索引)
+### 冻结主线
 
----
+- **结构**：Dense-6 DiT + H1 Dense Residual 输出头（由 E8 Top-2 输出 MoE 蒸馏而来，函数相对误差 0.48%）。
+- **Checkpoint**：`data/outputs/volmem/output_head_h0_h1_h2_20260803/distilled/h1_distilled_full.pt`（SHA256 `5e28f12d…`）。
+- **推理调度**：AB2，2 outer × 4 inner = **8 NFE**，outer fractions `[0.6667, 1.0]`，每个 outer 在更新后的轮廓位置重采特征。
+- **特征**：冻结 MoonViT layer-18（center-only），离线缓存读取。
+- **接口契约**：Flow interface manifest v1.1（`label_id 1..25 → flow_class_id 0..24`）。
+- 冻结细节见 `docs/report/FLOW_MAIN_HANDOVER_STATUS_20260804.md` 与 `docs/report/FLOW_GT_ORACLE_AND_INTERFACE_STATUS_20260804.md`。
 
-## 整体架构
+### 关键数字（均 GT box、Memory-off、seed 20260731）
 
-```
-┌─────────────────────────────────────────────────────────────────────────────┐
-│                           DiffusionSnake 整体架构                            │
-├─────────────────────────────────────────────────────────────────────────────┤
-│                                                                             │
-│  输入图像 (H×W×3)                                                           │
-│       │                                                                     │
-│       ▼                                                                     │
-│  ┌─────────────────────────────────────────────────────────────────────┐   │
-│  │                     YOLOv8-P2 检测网络                               │   │
-│  │  ┌─────────────┐    ┌─────────────┐    ┌─────────────────────────┐  │   │
-│  │  │ Backbone    │───▶│ Neck (PAN)  │───▶│ Detect Head (P2-P5)     │  │   │
-│  │  │ (CSPDarknet)│    │             │    │ - P2: stride=4 (细粒度) │  │   │
-│  │  └─────────────┘    └─────────────┘    │ - P3-P5: 多尺度         │  │   │
-│  │                                         └─────────────────────────┘  │   │
-│  └─────────────────────────────────────────────────────────────────────┘   │
-│       │                                                                     │
-│       ├──▶ 检测结果: [B, N, 6] (x1,y1,x2,y2,score,cls)                      │
-│       │                                                                     │
-│       └──▶ P2 特征图: [B, 64+nc, H/4, W/4]                                  │
-│              │                                                              │
-│              ▼                                                              │
-│         ┌────────────┐                                                      │
-│         │ CNN Proj   │  1×1 Conv: 64+nc → 64                                │
-│         └────────────┘                                                      │
-│              │                                                              │
-│              ▼                                                              │
-│         cnn_feature: [B, 64, H/4, W/4]                                      │
-│                                                                             │
-│  ┌─────────────────────────────────────────────────────────────────────┐   │
-│  │                     初始化轮廓生成                                    │   │
-│  │                                                                      │   │
-│  │   检测框 ──▶ get_init() ──▶ 4点矩形/菱形 ──▶ get_octagon() ──▶ 12点 │   │
-│  │                                  │                     │             │   │
-│  │                                  ▼                     ▼             │   │
-│  │                           V1/V2: 矩形            V3: 八边形          │   │
-│  │                                  │                     │             │   │
-│  │                                  └─────────┬───────────┘             │   │
-│  │                                            ▼                         │   │
-│  │                                   uniform_upsample()                  │   │
-│  │                                            │                         │   │
-│  │                                            ▼                         │   │
-│  │                              init_poly: [N, 128, 2]                  │   │
-│  └─────────────────────────────────────────────────────────────────────┘   │
-│              │                                                              │
-│              ▼                                                              │
-│  ┌─────────────────────────────────────────────────────────────────────┐   │
-│  │                     扩散模型演化 (DiT Denoiser)                       │   │
-│  │                                                                      │   │
-│  │   ┌──────────────────────────────────────────────────────────────┐  │   │
-│  │   │  输入:                                                        │  │   │
-│  │   │  - init_poly: 初始轮廓 [N, 128, 2]                            │  │   │
-│  │   │  - cnn_feature: 视觉特征 [B, 64, H/4, W/4]                    │  │   │
-│  │   │  - t: 时间步 [N]                                              │  │   │
-│  │   │  - x_t: 带噪声位移场 [N, 128, 2]                              │  │   │
-│  │   └──────────────────────────────────────────────────────────────┘  │   │
-│  │                              │                                       │   │
-│  │                              ▼                                       │   │
-│  │   ┌──────────────────────────────────────────────────────────────┐  │   │
-│  │   │  DiT Denoiser (V1/V2/V3):                                     │  │   │
-│  │   │                                                                │  │   │
-│  │   │  1. 时间嵌入: Sinusoidal + MLP → t_emb                        │  │   │
-│  │   │  2. 视觉编码:                                                  │  │   │
-│  │   │     - Global: Perceiver / SpatialAnchor → [256, dim]          │  │   │
-│  │   │     - Local: grid_sample from cnn_feature → [N, 64, 128]      │  │   │
-│  │   │  3. 点嵌入: SeparatePointEmbedding (坐标+特征独立)            │  │   │
-│  │   │  4. 位置编码: CyclicRoPE (闭环轮廓拓扑)                       │  │   │
-│  │   │  5. DiT Blocks ×6: Cross-Attention + Self-Attention + FFN     │  │   │
-│  │   │  6. Output Head: 预测噪声 eps [N, 128, 2]                      │  │   │
-│  │   └──────────────────────────────────────────────────────────────┘  │   │
-│  │                              │                                       │   │
-│  │                              ▼                                       │   │
-│  │   ┌──────────────────────────────────────────────────────────────┐  │   │
-│  │   │  DDPM/DDIM 采样:                                              │  │   │
-│  │   │  - 训练: 预测噪声，MSE Loss                                   │  │   │
-│  │   │  - 推理: 50步 DDIM 去噪 → disp_pred                           │  │   │
-│  │   └──────────────────────────────────────────────────────────────┘  │   │
-│  │                              │                                       │   │
-│  │                              ▼                                       │   │
-│  │                    disp_pred: [N, 128, 2]                            │   │
-│  └─────────────────────────────────────────────────────────────────────┘   │
-│              │                                                              │
-│              ▼                                                              │
-│      pred_poly = init_poly + disp_pred                                      │
-│              │                                                              │
-│              ▼                                                              │
-│      最终轮廓: [N, 128, 2]                                                   │
-│                                                                             │
-└─────────────────────────────────────────────────────────────────────────────┘
-```
+| 实验 | 协议 | Volume Dice |
+|------|------|---:|
+| GT-oracle 三病例隔离上界 | 3 例 / 333 slices / 8-NFE AB2 | 0.7940（0.7960 / 0.8168 / 0.7691） |
+| full-38 D 条件（完整 GT） | 38 例 / 6160 slices / 31,772 实例 | 0.7940（mean-volume）；NSD@2 0.8094 |
+| v0.5 step2300 / H1 历史锚点 | 3 例 / Batch-8 | 0.7967 |
+
+### Detector Stage A 端到端损失归因（full-38，2026-08-05）
+
+**结论：当前端到端损失主要来自检测器覆盖不足，其次是 matched box 定位几何，不能归因于 Flow。**
+
+| 因子 | mean-volume Dice 损失 | NSD@2 损失 |
+|------|---:|---:|
+| D→A coverage（检测覆盖，recall 0.4165） | 0.1293 | 0.1767 |
+| A→B geometry（框定位，oracle class） | 0.0894 | 0.0636 |
+| D→B 合计 | 0.2190 | 0.2406 |
+
+38/38 病例方向一致为下降，10,000 次 paired bootstrap 95% CI 均不跨 0。条件 C（predicted class）因无已登记分类器 blocked。详见 `docs/report/DETECTOR_STAGE_A_AB_ATTRIBUTION_STATUS_20260805.md`。
+
+### 已淘汰路线（有严格证据，不再回退）
+
+- **输出 MoE**：H1 蒸馏严格支配（质量保持、头参数 -63.6%、Batch-8 吞吐 +27.7%）。
+- **3D Memory v0.7 / v0.8 / v0.9**：严格门控（Volume +0.001、前景同向、减速 ≤10%）下均无净收益；整卷并行吞吐 4.5× 保留为加速支撑。
+- **数据管线 largest-only**：旧管线只保留 81.88% 前景，是早期演化失败的根因；修复后（每类 top-4 significant components、面积 ≥2、cap 32）前景保留 99.5%+。
 
 ---
 
-## 详细流程
-
-### 1. 数据加载与预处理
-
-**入口文件**: `lib/datasets/dataset_catalog.py`
-
-项目使用 **COCO 格式 JSON 标注** + 图像目录的数据结构：
-
-```python
-# dataset_catalog.py 中的条目示例
-{
-    'data_root': 'path/to/images/',          # 图像目录
-    'ann_file': 'path/to/annotations.json',   # COCO 格式标注
-}
-```
-
-实际数据路径在 `dataset_catalog.py` 中配置。当前本机 BTCV 数据位于:
-- 训练: `/mnt/sdb1/leijh/DiffusionSnake/Datasets/BTCV/btcv_png_new_snake`
-- 测试: `/mnt/sdb1/leijh/DiffusionSnake/Datasets/BTCV/btcv_png_test_new_snake`
-
-> 注意: `dataset_catalog.py` 中仍保留部分旧机器路径 (`/home/medteam/Zhrch/...`)，
-> 迁移数据时需同步更新。
-
-**数据处理流程**:
+## 方法流水线
 
 ```
-原始图像 (H×W×3)
-    │
-    ├──▶ 数据增强 (随机翻转、缩放、颜色抖动)
-    │
-    ├──▶ Resize 到 (800, 800)
-    │
-    └──▶ 归一化 (mean/std)
-          │
-          ▼
-    inp: [3, 800, 800]  (输入网络)
-
-
-原始掩码
-    │
-    ├──▶ 二值化 → 多边形轮廓提取
-    │
-    ├──▶ 提取极点 (Top, Left, Bottom, Right)
-    │
-    ├──▶ 构造初始化轮廓:
-    │    octagon = get_octagon(extreme_points)  # 12点
-    │    init_poly = uniformsample(octagon, 128)  # 上采样到128点
-    │
-    └──▶ 构造 GT 轮廓:
-         gt_poly = uniformsample(polygon, 128)
+矢状位切片
+   │
+   ├─▶ MoonViT (冻结, layer-18) ──▶ 视觉特征（离线缓存）
+   │
+   ├─▶ 检测：LocateAnything 离线预测 ──▶ external_detection [B,N,6]
+   │        (x1,y1,x2,y2,score,class_id)；隔离实验用 GT box
+   │
+   ├─▶ 框初始化：box → 4 点矩形 → 1/4 分辨率 Flow 网格 → 128 点均匀上采样轮廓
+   │
+   └─▶ Flow Matching 演化（两层 ODE）
+        ├─ 内层：FM 速度场 v(x_t, t)，AB2 积分 4 NFE（≈推理 8 步内）
+        ├─ 外层：fractions [0.6667, 1.0] 多轮推进，每轮在当前轮廓位置重采特征
+        └─ 输出头 H1：linear(x + residual_mlp(x)) → 位移 → 最终轮廓 [N, 128, 2]
 ```
 
-**关键字段说明**:
+训练目标：归一化位移 `x1 = (GT − init) / contour_scale`，线性插值 `x_t = (1−t)·x0 + t·x1`，速度目标 `v = x1 − x0`，损失 `MSE(v_pred, v)`。
+几何先验：闭环拓扑位置编码（CyclicRoPE）、轮廓点序、法向/切向局部上下文采样。
 
-| 字段 | 形状 | 说明 |
-|------|------|------|
-| `inp` | [B, 3, 800, 800] | 输入图像 |
-| `i_it_py` | [N, 128, 2] | 初始化轮廓 (八边形上采样) |
-| `i_gt_py` | [N, 128, 2] | GT 目标轮廓 |
-| `ct_01` | [B, M] | 有效实例掩码 |
-| `orig_img` | [B, H, W, 3] | 原始图像 (可视化用) |
+### 数据契约（sagittal_2d_fixed）
+
+- 每类最多 4 个显著连通域，raw contour area ≥2，单切片全局 cap 32；
+- 输出网格多边形面积 > `min_poly_area_output: 0.5`，退化框剔除；
+- `label_id 1..25`（解剖 mask 标签）→ `instance_id`；`flow_class_id = label_id − 1`；
+- 特征采样统一 `border` padding（修复旧 zero-padding 边界断点）。
 
 ---
 
-### 2. YOLO 检测模块
-
-**入口文件**: `lib/networks/snake/ct_snake.py`
-
-```python
-class Network(nn.Module):
-    def __init__(self, ...):
-        # YOLOv8-P2: 包含 P2 层，stride=4
-        yolo_yaml = 'lib/networks/YOLOV8/cfg/models/v8/yolov8-p2.yaml'
-        self.yolo = DetectionModel(cfg=yolo_yaml, ch=3, nc=num_classes)
-
-        # P2 特征投影: 64+nc → 64
-        self.cnn_proj = nn.Conv2d(64 + nc, 64, kernel_size=1)
-```
-
-**前向传播流程**:
-
-```
-输入: x [B, 3, H, W]
-      │
-      ▼
-┌─────────────────────────────────────┐
-│           YOLOv8-P2                 │
-│  - Backbone: CSPDarknet             │
-│  - Neck: PAN (双向特征金字塔)        │
-│  - Head: Detect (P2, P3, P4, P5)    │
-└─────────────────────────────────────┘
-      │
-      ├──▶ yolo_y: [B, 4+nc, HW]  (检测输出)
-      │
-      └──▶ yolo_feats: List[[B, C_i, H_i, W_i]]  (多尺度特征)
-            │
-            └──▶ p2 = yolo_feats[0]  [B, 64+nc, H/4, W/4]
-                  │
-                  ▼
-            cnn_feature = cnn_proj(p2)  [B, 64, H/4, W/4]
-```
-
-**NMS 后处理**:
-
-```python
-# 使用 YOLO 内置 NMS
-from lib.networks.YOLOV8.utils.ops import non_max_suppression
-
-detection = non_max_suppression(
-    pred,
-    conf_thres=0.01,      # 置信度阈值
-    iou_thres=0.45,       # NMS IoU 阈值
-    max_det=100,          # 最大检测数
-)
-# detection: [B, N, 6] → (x1, y1, x2, y2, score, cls)
-```
-
----
-
-### 3. 初始化轮廓生成
-
-**入口文件**: `lib/utils/snake/snake_decode.py`
-
-#### 3.1 从检测框到初始形状
-
-```python
-def get_init(box):
-    """
-    box: [..., 4] → (x1, y1, x2, y2)
-
-    根据 snake_config.init 选择初始化方式:
-    - 'quadrangle': 菱形 (4点)
-    - 'octagon': 八边形 (12点) [V3默认]
-    - 'box': 矩形 (4点)
-    """
-    if snake_config.init == 'quadrangle':
-        return get_quadrangle(box)  # 菱形
-    elif snake_config.init == 'octagon':
-        ex = get_quadrangle(box)
-        return get_octagon(ex)       # 八边形 [V3]
-    else:
-        return get_box(box)          # 矩形
-```
-
-#### 3.2 八边形构造 (V3)
-
-```python
-def get_octagon(ex):
-    """
-    ex: [..., 4, 2]  极点顺序: Top, Left, Bottom, Right
-
-    输出: [..., 12, 2]  canonical octagon (DeepSnake 风格)
-
-    算法:
-    1. 计算宽高: w = R.x - L.x, h = B.y - T.y
-    2. 对每个极点，向两侧延伸 w/8 或 h/8
-    3. 使用 min/max 裁剪，防止越过相邻极点边界
-    """
-    w = ex[..., 3, 0] - ex[..., 1, 0]  # Right.x - Left.x
-    h = ex[..., 2, 1] - ex[..., 0, 1]  # Bottom.y - Top.y
-    x = 8.0  # 延伸系数
-
-    octagon = [
-        # Top 极点附近 (2点)
-        ex[..., 0, 0], ex[..., 0, 1],
-        max(ex[..., 0, 0] - w/x, l), ex[..., 0, 1],
-
-        # Left 极点附近 (3点)
-        ex[..., 1, 0], max(ex[..., 1, 1] - h/x, t),
-        ex[..., 1, 0], ex[..., 1, 1],
-        ex[..., 1, 0], min(ex[..., 1, 1] + h/x, b),
-
-        # Bottom 极点附近 (3点)
-        max(ex[..., 2, 0] - w/x, l), ex[..., 2, 1],
-        ex[..., 2, 0], ex[..., 2, 1],
-        min(ex[..., 2, 0] + w/x, r), ex[..., 2, 1],
-
-        # Right 极点附近 (3点)
-        ex[..., 3, 0], min(ex[..., 3, 1] + h/x, b),
-        ex[..., 3, 0], ex[..., 3, 1],
-        ex[..., 3, 0], max(ex[..., 3, 1] - h/x, t),
-
-        # 回到 Top (1点)
-        min(ex[..., 0, 0] + w/x, r), ex[..., 0, 1],
-    ]
-    return torch.stack(octagon, dim=-1).view(*ex.shape[:-2], 12, 2)
-```
-
-#### 3.3 上采样到 128 点
-
-```python
-def uniform_upsample(poly, p_num):
-    """
-    poly: [B, N, V, 2]  V 可以是 4 (矩形) 或 12 (八边形)
-    p_num: 128
-
-    输出: [B, N, 128, 2]
-
-    算法: 按边长比例均匀采样
-    """
-    # 计算每条边的长度
-    edge_len = (next_poly - poly).pow(2).sum(3).sqrt()
-
-    # 按比例分配点数
-    edge_num = round(edge_len * p_num / total_edge_len)
-
-    # 在每条边上均匀采样
-    ...
-```
-
----
-
-### 4. 扩散模型演化
-
-**入口文件**: `lib/networks/diffusion/pretrain_evolution.py`
-
-#### 4.1 训练阶段
-
-```python
-def forward(self, output, cnn_feature, batch):
-    # 1. 准备训练数据
-    init = snake_gcn_utils.prepare_training(output, batch)
-    i_it_py = init['i_it_py']  # 初始轮廓 [N, 128, 2]
-    i_gt_py = init['i_gt_py']  # GT 轮廓 [N, 128, 2]
-
-    # 2. 方向对齐 (顺时针/逆时针)
-    area_init = signed_area(i_it_py)
-    area_gt = signed_area(i_gt_py)
-    if orient_mismatch:
-        i_gt_py = torch.flip(i_gt_py, dims=[1])
-
-    # 3. 起点对齐 (最近点 roll)
-    d2 = (i_it_py[:, :1] - i_gt_py).pow(2).sum(-1)
-    nearest = argmin(d2, dim=1)
-    i_gt_py = torch.roll(i_gt_py, shifts=-nearest, dims=1)
-
-    # 4. 计算目标位移场
-    x0 = i_gt_py - i_it_py  # [N, 128, 2]
-    x0 = normalize_disp(x0)  # 归一化
-
-    # 5. 加噪
-    t = torch.randint(0, T, (N,))  # 随机时间步
-    noise = torch.randn_like(x0)
-    x_t = add_noise(x0, noise, t)  # q(x_t | x_0)
-
-    # 6. 预测噪声
-    eps_pred, L = predict_eps(cnn_feature, i_it_py, c_it_py, py_ind, x_t, t)
-
-    # 7. 计算损失
-    loss = F.mse_loss(eps_pred, noise)
-
-    return loss
-```
-
-#### 4.2 推理阶段
-
-```python
-def sample_disp(self, cnn_feature, i_it_py, c_it_py, py_ind, steps=50):
-    """
-    DDIM 采样
-
-    输入:
-    - cnn_feature: [B, 64, H/4, W/4]
-    - i_it_py: [N, 128, 2] 初始轮廓
-
-    输出:
-    - disp: [N, 128, 2] 预测位移场
-    """
-    # 1. 从纯噪声开始
-    x = torch.randn(N, 128, 2)
-
-    # 2. 设置 DDIM 调度器
-    self.scheduler.set_timesteps(steps)
-
-    # 3. 逐步去噪
-    for t in self.scheduler.timesteps:  # [1000, 980, ..., 0]
-        # 预测噪声
-        eps_pred, _ = self.predict_eps(cnn_feature, i_it_py, c_it_py, py_ind, x, t)
-
-        # DDIM step
-        x = self.scheduler.step(model_output=eps_pred, timestep=t, sample=x).prev_sample
-
-    # 4. 反归一化
-    disp = self.denormalize_disp(x)
-
-    return disp
-
-# 最终轮廓
-pred_poly = i_it_py + disp
-```
-
----
-
-### 5. 训练与推理
-
-#### 5.1 训练流程
-
-**入口文件**: `diffusion_train.py`
-
-```
-┌─────────────────────────────────────────────────────────────┐
-│                      训练流程                                │
-├─────────────────────────────────────────────────────────────┤
-│                                                             │
-│  for epoch in range(num_epochs):                            │
-│      for batch in data_loader:                              │
-│          │                                                  │
-│          ├──▶ 1. 数据移至 GPU                                │
-│          │                                                  │
-│          ├──▶ 2. 前向传播                                    │
-│          │       output, loss, loss_stats, _ = model(batch) │
-│          │                                                  │
-│          ├──▶ 3. 反向传播                                    │
-│          │       optimizer.zero_grad()                      │
-│          │       loss.backward()                            │
-│          │       clip_grad_value_(parameters, 40)           │
-│          │       optimizer.step()                           │
-│          │                                                  │
-│          ├──▶ 4. 学习率调度                                  │
-│          │       scheduler.step()  # 余弦退火               │
-│          │                                                  │
-│          └──▶ 5. 日志记录                                    │
-│                  json_logger.log(entry)                     │
-│                  wandb.log(entry)                           │
-│                                                             │
-│      if (epoch + 1) % save_ep == 0:                         │
-│          save_checkpoint(epoch)                             │
-│                                                             │
-└─────────────────────────────────────────────────────────────┘
-```
-
-**损失函数**:
-
-```python
-# 总损失 = YOLO 检测损失 + 扩散去噪损失
-loss = det_loss * det_weight + diff_loss * diff_weight
-
-# 扩散损失
-diff_loss = MSE(eps_pred, eps_gt)  # 噪声预测误差
-
-# 可选: 平滑损失 / 曲率损失 (默认权重为 0，需在配置中显式开启)
-# smooth_loss: Laplacian 平滑，惩罚相邻顶点间的剧烈变化
-# curv_loss: 二阶导数损失，惩罚轮廓曲率过大
-# 开启方式: 在配置文件的 loss_scales 中设置 smooth > 0 或 curv > 0
-```
-
-#### 5.3 GRPO 强化学习训练 (实验性)
-
-**入口文件**: `grpo_train.py`
-
-使用 Group Relative Policy Optimization 对扩散模型进行强化学习微调，以边界 Dice 作为奖励信号：
-
-```
-┌─────────────────────────────────────────────────────────────┐
-│                    GRPO 训练流程                              │
-├─────────────────────────────────────────────────────────────┤
-│                                                             │
-│  for epoch in range(num_epochs):                            │
-│      for batch in data_loader:                              │
-│          │                                                  │
-│          ├──▶ 1. 从当前策略采样多条轨迹                        │
-│          │     (多次 diffusion rollout, 记录 logprob)         │
-│          │                                                  │
-│          ├──▶ 2. 计算奖励: mBoundDice (多容忍度边界 Dice)     │
-│          │                                                  │
-│          ├──▶ 3. GAE 优势估计                                │
-│          │                                                  │
-│          ├──▶ 4. PPO-clip 策略梯度更新 (带 KL 正则)          │
-│          │                                                  │
-│          └──▶ 5. 记录奖励/散度/kl                            │
-│                                                             │
-└─────────────────────────────────────────────────────────────┘
-```
-
-**关键文件**:
-- `lib/networks/diffusion/grpo_evolution.py` — GRPO 演化 wrapper，含 `sample_with_logprob` 和 GAE 优势计算
-- `lib/networks/diffusion/ddpm_with_logprob.py` — DDPM 采样返回 log-probability
-- `lib/train/rewards/region_reward.py` — mBoundF 奖励函数（多容忍度边界 Dice）
-- `lib/train/trainers/diffusion_grpo_trainer.py` — GRPO 训练 wrapper
-
-**注意**: GRPO 训练仍在实验中，`grpo_train.py` 标注为"需调整"状态。
-
-#### 5.2 推理流程
-
-**入口文件**: `infer_v3_refinement.py`（兼容入口，实际实现位于 `scripts/infer_v3_final.py`）
-
-```python
-def run_inference(model, batch):
-    # 1. YOLO 检测 + 特征提取
-    yolo_out = model.yolo(batch['inp'])
-    p2 = yolo_out[1][0]
-    cnn_feature = model.cnn_proj(p2)
-
-    # 2. 准备初始轮廓 (V3: 八边形)
-    i_it_py, ind, valid_mask = prepare_v3_init(batch)
-
-    # 3. 扩散采样
-    c_it_py = img_poly_to_can_poly(i_it_py)
-    disp = model.gcn.sample_disp(cnn_feature, i_it_py, c_it_py, ind, steps=50)
-
-    # 4. 得到最终轮廓
-    pred_poly = i_it_py + disp
-
-    # 5. 可视化
-    # GT: 蓝色, 初始: 黄色, 预测: 红色
-    draw_results(orig_img, pred_poly, i_it_py, gt_poly)
-```
-
-#### 5.3 自适应曲率平滑后处理
-
-**入口文件**: `edge_smoothing.py`, `scripts/infer_v3_with_smoothing.py`
-
-扩散模型输出轮廓后，可通过 **曲率自适应平滑** 消除锯齿状边缘，同时保留尖角特征。
-
-**核心机制**: 根据每个顶点的局部曲率自动调节平滑强度。
-
-```python
-class EdgeAwareSmoothing:
-    def compute_curvature(self, contour):
-        # 环形二阶差分近似曲率 (使用 torch.roll)
-        d1 = contour - torch.roll(contour, 1, dims=1)
-        d2 = d1 - torch.roll(d1, 1, dims=1)
-        return torch.norm(d2, dim=-1, keepdim=True)
-
-    def smooth(self, contour):
-        curvature = self.compute_curvature(contour)
-        # 关键公式: 高曲率 → 低平滑权重; 平坦 → 高平滑权重
-        smooth_weight = torch.exp(-curvature / self.curvature_threshold)
-        # 局部平滑: (prev + 2*contour + next) / 4
-        smoothed = (torch.roll(contour, 1, dims=1)
-                    + 2 * contour
-                    + torch.roll(contour, -1, dims=1)) / 4
-        return smooth_weight * smoothed + (1 - smooth_weight) * contour
-```
-
-> 以上为简化示意，完整实现见 `edge_smoothing.py`。
-
-**行为示意**:
-
-```
-轮廓顶点曲率分布:
-   平坦区域  ───────  尖角 ^  ───────  平坦区域
-   smooth_weight≈0.9    smooth_weight≈0.01   smooth_weight≈0.9
-
-效果:
-   平坦处强力消除锯齿    尖角几乎不碰          平坦处强力消除锯齿
-```
-
-**使用**:
-
-```bash
-# 带自适应平滑的 V3 推理
-python scripts/infer_v3_with_smoothing.py --ckpt <path>
-
-# 单独测试平滑效果（可调 curvature_threshold，默认 5.0）
-python verify_edge_smoothing.py
-```
-
-**参数说明**:
-
-| 参数 | 默认值 | 说明 |
-|------|--------|------|
-| `curvature_threshold` | 5.0 | 越小越激进平滑（高曲区也受影响） |
-| `iterations` | 2 | 平滑迭代次数 |
-
-#### 5.4 单样本过拟合训练
-
-用于快速验证架构改动是否有效。选取单一样本进行过拟合训练，观察模型是否能拟合该样本的轮廓：
-
-```bash
-# 以 V3.5 单样本过拟合为例
-export CFG_FILE=configs/btcv_diffusion_dit_v3_5_single_overfit.yaml
-python diffusion_train.py
-
-# 批量推理对比所有版本
-python infer_all_single_overfit.py
-# 输出: 各版本可视化对比图
-```
-
-支持的版本：V2, V2.1, V2.2, V2.3, V3, V3.1, V3.2, V3.3a, V3.3b, V3.4, V3.5，均有对应的 `_single_overfit` 配置文件。
-
-#### 5.5 位移场归一化
-
-**入口文件**: `compute_disp_stats.py`
-
-计算训练集中位移场的统计信息（均值、标准差），用于归一化扩散模型的位移目标：
-
-```bash
-python compute_disp_stats.py
-# 输出: data/stats/btcv_disp_stats.json
-```
-
-配置中通过 `diffusion_disp_norm: true` 启用归一化，推理时自动反归一化。
-
----
-
-## 模型版本详解
-
-### 版本对比表
-
-| 版本 | 初始化 | 去噪器 | 视觉编码 | 位置编码 | 注意力模式 | 特殊功能 |
-|------|--------|--------|----------|----------|-----------|---------|
-| **V1** | 矩形 | `DiTDenoiser` | Perceiver | SnakePosEnc | Cross | 基础 Cross-Attention |
-| **V2** | 矩形 | `DiTDenoiserV2` | Perceiver + Local | CyclicRoPE | Cross (奇偶交替) | CyclicRoPE, 奇偶交替注意力 |
-| **V2.1** | 矩形 | `DiTDenoiserV2` | SpatialAnchor + Local | CyclicRoPE | Cross (奇偶交替) | 换 SpatialAnchor 编码器 |
-| **V2.2** | 矩形 | `DiTDenoiserV2_2` | Patchify | - | Joint (MM-DiT) | Patchify 全局上下文 |
-| **V2.3** | 矩形 | FlowMatching | MM-DiT Joint | - | **Flow Matching** | ODE 连续向量场演化 |
-| **V3** | **八边形** | `DiTDenoiserV3` | SpatialAnchor + Local | CyclicRoPE | Cross → Self | 八边形初始化 + Self-then-Cross |
-| **V3.1** | **八边形** | `DiTDenoiserV3_1` | Perceiver + Patchify | CyclicRoPE | Cross → Self | 双全局上下文对齐 V2 语义 |
-| **V3.2** | **八边形** | `DiTFlowMatchingV3_2` | Self+Cross+Patchify | CyclicRoPE | **Flow Matching** | ODE 演化 + 八边形 |
-| **V3.3** | **八边形** | `DiTDenoiserV3_3` | Perceiver + Local | CyclicRoPE | Cross → Self | Circular Conv1d 平滑约束 |
-| **V3.5** | **八边形** | `DiTDenoiserV3_5` | Perceiver + FourierBridge | CyclicRoPE | Fourier-Space | **傅里叶空间扩散 (K=16)** |
-
-### V3 关键改进
-
-```python
-# V3 配置
-use_dit_v3: True          # 启用 V3
-
-# V3 初始化: 八边形
-if cfg.use_dit_v3:
-    snake_config.init = 'octagon'
-
-# V3 注意力流: Cross → Self
-class DiTBlockV3:
-    def forward(self, x, context, t_emb):
-        # 1. 先做 Cross-Attention (聚合图像上下文)
-        x = x + self.cross_attn(x, context, t_emb)
-
-        # 2. 再做 Self-Attention (细化点间关系)
-        x = x + self.self_attn(x, t_emb)
-
-        # 3. FFN
-        x = x + self.ffn(x, t_emb)
-
-        return x
-```
-
-### V3.2: Flow Matching 演化
-
-**入口文件**: `lib/networks/diffusion/flow_matching_evolution.py`
-
-用 ODE 连续向量场替代离散 DDPM 采样，通过 Rectified Flow 训练直接预测速度场而非噪声：
-
-```python
-# Flow Matching 训练: 预测速度场 v = dx/dt
-class FlowMatchingEvolution:
-    def forward(self, output, cnn_feature, batch):
-        # 1. 计算 x0 (目标位移), x1 (纯噪声)
-        # 2. 线性插值: x_t = t * x1 + (1-t) * x0
-        # 3. 速度场: v = x1 - x0 (恒定)
-        # 4. 预测: v_pred = denoiser(x_t, t, context)
-        # 5. 损失: MSE(v_pred, v)
-        loss = F.mse_loss(v_pred, x1 - x0)
-        return loss
-```
-
-推理时通过 ODE 积分从噪声逐步演化到位移场，支持 V2.3/V3.2 去噪器。
-
-### V3.3: Circular Conv1d 平滑约束
-
-**入口文件**: `lib/networks/diffusion/dit_denoiser_v3_3.py`
-
-在最终输出层前加入 Circular Conv1d，利用局部邻域一致性约束防止异常顶点：
-
-```python
-# V3.3a/b 变体:
-# V3.3a: CircularConv1d 替换最后 FFN 的输出投影
-# V3.3b: CircularConv1d 作为额外分支与 FFN 输出相加
-class DiTDenoiserV3_3:
-    def forward(self, x, context, t_emb):
-        # ... standard DiT blocks ...
-        x = self.circular_conv1d(x)  # kernel 沿轮廓维度滑动，首尾相连
-        return self.output_head(x)
-```
-
-### V3.5: 傅里叶空间扩散 (最新)
-
-**入口文件**: `lib/networks/diffusion/dit_denoiser_v3_5.py`, `lib/networks/diffusion/pretrain_evolution.py`
-
-不再在 128 个顶点坐标上直接扩散，而是将轮廓变换到傅里叶空间（K=16 个复系数），扩散过程在频域进行：
-
-```python
-# Evolution wrapper 中的变换 (pretrain_evolution.py)
-def disp_to_fourier(self, disp):
-    # 空间坐标 [N, 128, 2] → 傅里叶系数 [N, K, 4]
-    coeffs = torch.fft.rfft(disp, n=K, dim=1)
-    coeffs = torch.cat([coeffs.real, coeffs.imag], dim=-1)
-    return coeffs
-
-def fourier_to_disp(self, coeffs):
-    # 傅里叶系数 → IFFT → 空间坐标
-    real = coeffs[..., :2]
-    imag = coeffs[..., 2:]
-    complex_coeffs = real + 1j * imag
-    return torch.fft.irfft(complex_coeffs, n=128, dim=1)
-
-# DiTDenoiserV3_5 在傅里叶空间操作 (接收已变换的系数)
-class DiTDenoiserV3_5:
-    def forward(self, x_t, context, t_emb):
-        # x_t 已经是傅里叶系数 [N, K, 4]
-        # 纯注意力网络，无任何 FFT 操作
-        return self.fourier_denoiser(x_t, context, t_emb)
-```
-
-优势：天然保证输出轮廓平滑（高频分量被截断），无需后处理。
-
----
-
-## 配置文件说明
-
-**V3 配置**: `configs/btcv_diffusion_dit_v3.yaml`
-
-```yaml
-# ===== 模型配置 =====
-model: 'sbd'
-network: 'ro_34'
-task: 'snake'
-
-# ===== DiT 版本选择 =====
-use_dit_v3: true          # V3 启用八边形初始化
-
-# ===== 扩散参数 =====
-diffusion_timesteps: 1000
-use_ddim_inference: true
-diffusion_loss_weight: 1.0
-diffusion_disp_stats: "data/stats/btcv_disp_stats.json"
-
-# ===== 训练参数 =====
-train:
-  lr: 5e-5
-  batch_size: 64
-  epoch: 1000
-  warmup_steps: 1000
-  save_ep: 100
-
-# ===== 检测参数 =====
-det_conf_thresh: 0.01
-det_iou_thresh: 0.45
-det_max_det: 100
-
-# ===== 损失权重 =====
-loss_scales:
-  det: 0      # 冻结 YOLO 时设为 0
-  py: 1.2
-```
-
----
-
-## 快速开始
-
-### 环境配置
-
-```bash
-conda create -n snake1 python=3.10
-conda activate snake1
-pip install torch torchvision diffusers opencv-python numpy pyyaml tqdm
-pip install ultralytics  # YOLOv8
-```
-
-### 训练
-
-```bash
-# V3 训练 (推荐)
-export CFG_FILE=configs/btcv_diffusion_dit_v3.yaml
-python diffusion_train.py
-
-# 多卡训练
-CUDA_VISIBLE_DEVICES=0,1,2,3 torchrun --standalone --nproc_per_node=4 diffusion_train.py
-```
-
-### 推理
-
-```bash
-# V3 推理
-export CFG_FILE=configs/btcv_diffusion_dit_v3.yaml
-python infer_v3_refinement.py --ckpt data/outputs/btcv_diffusion_dit_v3/checkpoints/latest.pt
-# 输出目录: visual/v3_clean_eval/
-```
-
-### 验证八边形初始化
-
-```bash
-python verify_octagon_v3.py
-# 输出: visual/octagon_comparison.png
-#       visual/octagon_multi_boxes.png
-```
+## 五任务分工（2026-08-04 起）
+
+| 任务 | 职责 |
+|------|------|
+| 轮廓演化 / Flow 主线 | FM 方法、训练目标、采样路径、8-NFE 冻结调度、inner/outer 归因 |
+| 推理加速 / 整卷并行 | 真实 pass / DiT calls / 吞吐 / 显存、Physical Volume Memory 代码 |
+| 检测器 / 初始化与覆盖 | LocateAnything、检测缓存、coverage/geometry/class 隔离归因 |
+| 强化学习 / Contour RL | 在冻结 Dense-6 + H1 主线上单独验证 GRPO 收益 |
+| 论文统筹 | 证据审计、数字机器可读落盘、中英文写作 |
+
+归因铁律：GT box 隔离轮廓演化能力，predicted box 评估部署链路，两者不混用；oracle class 不得冒充 predicted class；任何部署质量下降先做 detector/evolution isolation。
 
 ---
 
@@ -845,62 +109,33 @@ python verify_octagon_v3.py
 
 | 文件 | 说明 |
 |------|------|
-| `lib/networks/snake/ct_snake.py` | 主网络定义 (YOLO + Evolution) |
-| `lib/networks/diffusion/pretrain_evolution.py` | 扩散训练主模块，去噪器选择与调度 |
-| `lib/networks/diffusion/flow_matching_evolution.py` | Flow Matching (ODE) 演化 wrapper |
-| `lib/networks/diffusion/grpo_evolution.py` | GRPO 强化学习演化 wrapper |
-| `lib/networks/diffusion/dit_denoiser_v3.py` | V3 DiT 去噪器 |
-| `lib/networks/diffusion/dit_denoiser_v3_2.py` | V3.2 Flow Matching 去噪器 |
-| `lib/networks/diffusion/dit_denoiser_v3_3.py` | V3.3 Circular Conv1d 去噪器 |
-| `lib/networks/diffusion/dit_denoiser_v3_5.py` | V3.5 傅里叶空间去噪器 |
-| `lib/utils/snake/snake_decode.py` | 初始化轮廓生成 |
-| `lib/utils/snake/snake_gcn_utils.py` | 训练/测试数据准备 |
-| `lib/datasets/voc/snake.py` | 数据集加载 |
+| `lib/networks/diffusion/flow_matching_evolution.py` | FM 演化核心：训练目标、geom bridge 推理、外层迭代精修、位移归一化 |
+| `lib/networks/diffusion/dit_denoiser_v4.py` | Dense DiT + H1 Dense Residual 输出头（含 SharedDenseSparseResidualHead） |
+| `lib/networks/diffusion/prototype_phi_moe.py` | DiT FFN-MoE（E4K1 prototype 路由 + φ-balancing，研究候选） |
+| `lib/networks/snake/ct_snake.py` | 主网络接线（检测 → 初始化 → 演化） |
+| `lib/datasets/sagittal_2d_fixed/snake.py` | 矢状位数据契约（significant components、border 采样） |
 
-### 训练相关
+### 训练 / 评估 / 工具
 
 | 文件 | 说明 |
 |------|------|
-| `diffusion_train.py` | 主训练入口 (36KB) |
-| `grpo_train.py` | GRPO 强化学习训练 |
-| `lib/train/trainers/diffusion_trainer.py` | 标准训练 wrapper |
-| `lib/train/trainers/diffusion_grpo_trainer.py` | GRPO 训练 wrapper |
-| `lib/train/rewards/region_reward.py` | mBoundF 奖励函数 |
+| `tools/volmem/train_memflowdit.py` | MemFlowDiT 训练入口 |
+| `tools/volmem/eval_memflowdit_parallel.py` | 整卷并行评估、蒸馏轨迹缓存 |
+| `tools/volmem/distill_output_head.py` | H1/H2 输出头蒸馏、权重移植、参数统计 |
+| `tools/volmem/compute_stage_a_metrics.py` | Stage A 冻结指标（NSD@2 / HD95） |
+| `configs/volmem/verse_memflowdit_v0_5_minimal_gpu6.yaml` | v0.5 minimal 主线配置 |
+| `scripts/extract_sagittal_moonvit_features.py` | MoonViT 特征离线提取 |
 
-### 推理与分析脚本
-
-| 文件 | 说明 |
-|------|------|
-| `infer_v3_refinement.py` | V3 推理兼容入口 |
-| `scripts/infer_v3_final.py` | 当前 V3 推理实现 |
-| `scripts/infer_v3_with_smoothing.py` | V3 + 边缘平滑推理 |
-| `scripts/infer_v3_2_refinement.py` | V3.2 Flow Matching 推理 |
-| `scripts/infer_all_versions.py` | 多版本对比推理 |
-| `scripts/infer_single_sample.py` | 单样本推理 |
-| `scripts/infer_without_yolo.py` | 使用 GT 检测的推理 |
-| `infer_all_single_overfit.py` | 单样本过拟合批量推理 |
-
-### 工具与分析
-
-| 文件 | 说明 |
-|------|------|
-| `verify_octagon_v3.py` | 八边形初始化验证 |
-| `edge_smoothing.py` | 边缘感知平滑模块 |
-| `compute_disp_stats.py` | 位移场统计计算 |
-| `compute_octagon_stats.py` | 八边形初始化统计 |
-| `analyze_init_quality.py` | 初始化轮廓质量分析 |
-| `test/test_fourier_smooth.py` | V3.5 傅里叶平滑测试 |
-| `test/test_v3_5_inference.py` | V3.5 推理测试 |
-| `sync_logs_to_wandb.py` | JSON 日志同步至 WandB |
-| `lib/networks/vision_mamba2/` | Vision Mamba2 集成 |
-
-### 近期工作留档（docs/report/）
+### 工作留档（docs/report/）
 
 | 报告 | 内容 |
 |------|------|
 | `INNOVATION_SUMMARY.md` | 三大创新点总结（论文 Contributions 形式） |
 | `FLOW_MAIN_HANDOVER_STATUS_20260804.md` | Flow 主线职责、Dense-6 + H1 冻结、归因规则 |
-| `DETECTOR_STAGE_A_STATUS_20260804.md` | 检测器 Stage A：契约冻结与四条件隔离 |
+| `FLOW_GT_ORACLE_AND_INTERFACE_STATUS_20260804.md` | GT-oracle 隔离结果与接口冻结契约 |
+| `DETECTOR_STAGE_A_STATUS_20260804.md` | 检测器 Stage A：契约冻结与四条件定义 |
+| `DETECTOR_STAGE_A_AB_ATTRIBUTION_STATUS_20260805.md` | full-38 A→B 质量归因（coverage/geometry 损失分解） |
+| `DETECTOR_STAGE_A_D_ZERO_CONTROL_STATUS_20260805.md` | D 条件 zero-control 验证 |
 | `OUTPUT_HEAD_DISTILLATION_H0_H1_H2_20260803.md` | 输出头蒸馏实验（H1 胜出） |
 | `MEMFLOWDIT_RECENT_WORK_REPORT_20260731.md` | 数据根因修复、MoE 消融、Memory v0.7–v0.9 全程记录 |
 | `FLOW_MEMORY_3D_READONLY_REVIEW_20260804.md` | Memory / 3D 只读复核与淘汰结论 |
@@ -909,63 +144,62 @@ python verify_octagon_v3.py
 
 ---
 
-## 可视化
+## 遗留版本说明（2026-03 ~ 2026-04，BTCV 时代）
 
-训练/推理过程自动生成可视化结果 (目录名含时间戳):
+早期基于 DDPM/DDIM 的扩散轮廓演化原型（V1–V3.5）在 BTCV 腹部 CT 上开发，包括：
+V1 基础 Cross-Attention、V2 CyclicRoPE 奇偶交替、V2.2 MM-DiT Patchify、V2.3/V3.2 Flow Matching、V3 八边形初始化、V3.3 Circular Conv1d、V3.5 傅里叶空间扩散。
+其后 V4 系列引入 MoE 输出头与 geom bridge，GRPO v5 引入几何动作 RL。
 
-```
-visual/
-├── v3_clean_eval/                # 当前 V3 推理结果
-│   └── CLEAN_v3_*.png
-│       ├── GT: 蓝色
-│       ├── Init: 黄色
-│       └── Pred: 红色
-├── edge_aware_postprocess_*/     # 自适应曲率平滑结果
-├── fourier_smooth_test/          # V3.5 傅里叶平滑测试
-├── fourier_postprocess_*/        # V3.5 傅里叶后处理
-├── single_sample_all_models/     # 单样本多版本对比
-├── fourier_normal_single_sample_*/  # V3.5 单样本结果
-├── fourier_stronger_v3_*/        # V3.5 强化实验
-├── single_sample_normal_latest_*/   # 最新单样本结果
-└── training_sample_*_zoomed.png  # 训练样本局部放大
+这些版本已被当前 FM 主线取代，仅作历史参考：
+
+- V2 系列封存于 `archive/v2_legacy_2026-04-19/`；
+- 早期文档（八边形初始化、DDIM 采样、边缘平滑、单样本过拟合流程等）见 git 历史中的旧版 README；
+- 相关验证脚本：`verify_octagon_v3.py`、`edge_smoothing.py`、`compute_disp_stats.py`。
+
+---
+
+## 快速开始
+
+```bash
+conda create -n snake1 python=3.10
+conda activate snake1
+pip install torch torchvision diffusers opencv-python numpy pyyaml tqdm
+
+# 矢状位主线训练（v0.5 minimal 配置）
+export CFG_FILE=configs/volmem/verse_memflowdit_v0_5_minimal_gpu6.yaml
+python tools/volmem/train_memflowdit.py
+
+# MoonViT 特征离线提取（训练/评估前必需）
+python scripts/extract_sagittal_moonvit_features.py
 ```
 
 ---
 
 ## 更新日志
 
-- **2026-08-04**: Flow 主线接管记录与职责划分（演化/加速/检测/RL/论文统筹五任务）；Detector Stage A 目标契约统一（Flow interface manifest v1.1）与四条件损失因子隔离；Flow 接口与 H1 checkpoint 冻结
-- **2026-08-03**: 输出头 H0/H1/H2 蒸馏实验：H1 Dense Residual 质量保持且吞吐 +27.7%，H2 被严格支配，H1 成为主线输出头；DiT FFN D1 四组结构对照自动链启动；Memory 因果审计
-- **2026-08-02**: MoE 成本审计（参数 +12%、batch8 减速 15.68%）；3D Memory v0.8/v0.9 严格门控失败止损淘汰
-- **2026-07-31**: MemFlowDiT 综合报告：数据工程根因修复（largest-only 只保留 81.88% 前景 → 99.5%+，v0.5 step1600 Dice 0.792）；MoE 重要性消融（关闭 routed experts Dice -0.129）；DiT FFN-MoE E4K1 prototype 路由（1000 step 无死专家）；输出头 hard-φ 去退化（hard CV 0.91→0.57）；并行 3D Memory 实验（无净收益，整卷并行吞吐 4.5×）；LocateAnything 检测接入（external_detection [B,N,6] 契约）
-- **2026-07-29**: VolMem v0.2 切片记忆原型基线；v0.3 memory-conditioned Flow DiT 原型
-- **2026-07-21**: MoonViT 冻结特征伪 3D 矢状位正式训练（layer18 center-only，border 采样修复）
-- **2026-07-10**: RL 修复 sampled_feat 转置 bug，移除法向方向策略，新增 NSD 奖励
-- **2026-07-07**: per-point FM 尺度策略（tanh 有界）与训练配置
-- **2026-06-24**: Geom Bridge 几何位置桥范式（init→GT 直线桥，单桥单轮廓 0.98 IoU sanity）；RL 探索更新
-- **2026-06-13**: GRPO v5 几何动作（低频 Fourier 法向扰动）与信用分配诊断；Locate 集成与 E 系列评估报告
-- **2026-04-17**: V3.5 傅里叶空间扩散 pipeline 完成，推理测试 & 配置
-- **2026-04-16**: V3.3 Circular Conv1d 平滑约束 (V3.3a/b 变体)；边缘感知平滑后处理；单样本过拟合训练流程 (V2~V3.5)
-- **2026-04-15**: 单样本过拟合配置批量创建；批量推理对比脚本
-- **2026-04-13**: 训练可视化改进，初始化质量分析
-- **2026-04-04**: 修复 V3 八边形初始化，实现 canonical 12 点版本
-- **2026-04-03**: 完成 V3 DiT 去噪器实现
-- **2026-04-02**: V2 系列稳定版本
-- **2026-03-11**: V1 DiT 基础版本
+- **2026-08-05**: Detector Stage A full-38 A→B 归因完成（coverage Dice -0.1293、geometry -0.0894，38/38 一致，bootstrap CI 不跨 0）；D zero-control 通过；README 按当前主线重写
+- **2026-08-04**: Flow 主线接管与五任务分工；Flow interface manifest v1.1 与 H1 checkpoint 冻结；GT-oracle 三病例隔离上界 0.7940；Memory/3D 只读复核结论
+- **2026-08-03**: 输出头 H0/H1/H2 蒸馏：H1 质量保持且吞吐 +27.7%，成为主线输出头；DiT FFN 四组结构对照启动
+- **2026-08-02**: MoE 成本审计；3D Memory v0.8/v0.9 严格门控失败淘汰
+- **2026-07-31**: 数据工程根因修复（前景保留 81.88% → 99.5%+）；MoE 重要性消融（-0.129 Dice）；DiT FFN-MoE E4K1；输出头 hard-φ 去退化；LocateAnything 检测接入
+- **2026-07-29**: VolMem v0.2/v0.3 记忆条件 Flow DiT 原型
+- **2026-07-21**: MoonViT 冻结特征伪 3D 矢状位正式训练
+- **2026-07-10**: RL 修复 sampled_feat 转置，移除法向策略，新增 NSD 奖励
+- **2026-07-07**: per-point FM 尺度策略（tanh 有界）
+- **2026-06-24**: Geom Bridge 几何位置桥范式（单桥 0.98 IoU sanity）
+- **2026-06-13**: GRPO v5 几何动作与信用分配诊断；Locate 集成 E 系列评估
+- **2026-04 及更早**: BTCV 时代 V1–V3.5 扩散原型迭代（傅里叶空间扩散、Circular Conv1d、八边形初始化等）
 
 ---
 
 ## 参考文献
 
 - DeepSnake: [Peng et al., CVPR 2020]
-- DiT: [Peebles & Xie, ICCV 2023]
-- MM-DiT / SD3: [Esser et al., 2024]
-- YOLOv8: [Ultralytics, 2023]
-- DDPM: [Ho et al., NeurIPS 2020]
-- DDIM: [Song et al., ICLR 2021]
 - Flow Matching / Rectified Flow: [Lipman et al., ICLR 2023], [Liu et al., 2022]
+- DiT: [Peebles & Xie, ICCV 2023]
+- DDPM: [Ho et al., NeurIPS 2020] / DDIM: [Song et al., ICLR 2021]
 - GRPO: [Shao et al., 2024] (DeepSeekMath)
-- Vision Mamba: [Hatamizadeh et al., 2024]
+- MoonViT / LocateAnything / SAM 2 / XMem / RMem（Memory 对照依据）
 
 ---
 
