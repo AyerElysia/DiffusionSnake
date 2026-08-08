@@ -39,6 +39,21 @@
 | full-38 D 条件（完整 GT） | 38 例 / 6160 slices / 31,772 实例 | 0.7940（mean-volume）；NSD@2 0.8094 |
 | v0.5 step2300 / H1 历史锚点 | 3 例 / Batch-8 | 0.7967 |
 
+> ⚠️ **口径非标警告**：上表 Dice 为 volume-level 前景池化二值 Dice、NSD@2 为 voxel 单位，均**不符合** VerSe 论文与相关工作标准协议。在按标准协议重跑前，这些数字**不得**直接对标 VerSe 榜单；对外引用须加注"非标准口径"。完整规范见 `docs/report/eval_protocol_standard_20260809.md` 与下方「评估协议标准」章节。
+
+### 评估协议标准（必须与 VerSe 论文及相关工作对齐）
+
+**硬要求（Ayer 2026-08-09 定）**：本项目评估口径必须与 VerSe 官方协议（Sekuboyina et al. 2021；官方评测 `anjany/verse`）及相关工作惯例（Metrics Reloaded 2024、nnU-Net、SpineNet/VerTeBra）**完全一致**。当前主线评估在 5 个维度偏离，待按规范实现。
+
+标准协议要点（完整规范见 `docs/report/eval_protocol_standard_20260809.md`）：
+1. **单位**：从 manifest 读 spacing，重采样到 1mm 各向同性；所有表面/Hausdorff 指标用 **mm**，禁止 voxel。
+2. **Dice**：**逐椎体平均**（aggregate + single 两种），禁止 volume-level 前景池化二值 Dice。
+3. **NSD**：报告 **NSD@1mm / NSD@2mm（mm）**（Nikolov 2021，经 Metrics Reloaded 成为领域标准）。
+4. **Hausdorff**：报告 **HD95(mm)**，可选 full HD(mm)。
+5. **识别/分割分离**：报告 **ID rate** + **MLD 20mm 门控**；仅正确识别椎体计入分割指标，错标不冒充成功；另报 FP/FN。
+
+当前偏离：Dice 池化 ❌ / NSD voxel ❌ / HD95 voxel ❌ / 无识别分离 ❌ / 无 spacing(mm) ❌。**任何 AI 改评估代码须先对齐本规范**，实现结果写入 `docs/report/` 后再提交（AGENTS §7/§8）。
+
 ### Detector Stage A 端到端损失归因（full-38，2026-08-05）
 
 **结论：当前端到端损失主要来自检测器覆盖不足，其次是 matched box 定位几何，不能归因于 Flow。**
@@ -284,6 +299,7 @@ python scripts/extract_sagittal_moonvit_features.py
 ## 更新日志
 
 - **2026-08-09**: 训推初始化统一 A/B 判定完成——三臂 dev5 GT-box 对照（1248 slices、step 600、唯一差异是 init 开关）：baseline 0.760831 → route_A 0.788292 → route_B 0.790968 前景切片 mDice，两条统一路线均 5W/0L；**主线定为 Route B**（训推都用检测框四边中点构造 12 点八边形，训练不再用 GT 极值点）。量化外层状态采样缺陷（frac≈0 仅 1.25%、28.3% 样本 ≥0.95 进度、discrete/infer_target 单位混用）并给出连续化重设计（frac≈0 → 17.78%、中位数 0.823 → 0.449）。**v4_10 连续采样已实现**（commit `01f5304`，门控 `v4_10_use_continuous_sampling`，四臂配置 `init_unify_route_B_v410.yaml`）。**重采样链不一致已修**（commit `67158bb`，合同测试 max |delta|=0.000000）
+- **2026-08-09**：评估协议定为项目硬要求——必须与 VerSe 论文（Sekuboyina 2021）+ 相关工作（Metrics Reloaded / nnU-Net / SpineNet）对齐；当前主线 5 处偏离待修（Dice 池化 / NSD·HD95 voxel / 无识别分离 / 无 spacing-mm）。规范见 `docs/report/eval_protocol_standard_20260809.md`，README 新增「评估协议标准」章节，AGENTS §5 加评估红线、§10 加 backlog。
 - **2026-08-08**: 训推初始化统一实验启动——定位并量化 init 不一致（控制点 102.4 px），两条统一路线合同测试通过（逐点精确相同），发现重采样链为第三个不一致源；训练臂进行中。docs 整理——历史留档迁入 `docs/archive/`（镜像原路径），`docs/report/` 只保留活文档；删除 636 个无唯一内容的文件（浏览器 profile 缓存、渲染自检截图、可重生成的 pptx），其余一律归档不删
 - **2026-08-07**: Pure-2D DiT-4 10k baseline 未保持 H1 质量，slim-B 判 NO-GO；bbox→初始轮廓 Rectangle 消融（开发集）；逐实例 2D 指标探索性重算（不替代正式指标）
 - **2026-08-05**: Detector Stage A full-38 A→B 归因完成（coverage Dice -0.1293、geometry -0.0894，38/38 一致，bootstrap CI 不跨 0）；D zero-control 通过；README 按当前主线重写

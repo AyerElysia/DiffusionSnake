@@ -23,6 +23,8 @@ LocateAnything 检测器给出检测框，Flow Matching 网络从框初始化轮
 | 推理调度 | AB2，2 outer × 4 inner = 8 NFE，outer fractions `[0.6667, 1.0]` |
 | 全集指标 | full-38 mean-volume Dice **0.7940**，NSD@2 **0.8094**（GT box、Memory-off、seed 20260731） |
 
+> ⚠️ 上表数字为**非标准口径**（Dice = volume-level 前景池化；NSD@2 = voxel 单位），不可直接对标 VerSe 榜单。对标 VerSe 须按 §5 评估红线、以 `docs/report/eval_protocol_standard_20260809.md` 标准协议重跑。
+
 **冻结主线 checkpoint 永远不动。** 任何实验都开新 worktree + 新配置文件，禁止覆盖
 `h1_distilled_full.pt` 或修改 `verse_memflowdit_output_head_h1_distilled_dense_gpu0.yaml`。
 
@@ -122,6 +124,20 @@ dev5 = sub-verse022/024/071/150/264（val split 第 5/7/14/23/31 个 volume，�
 其中 3 个是 locked。这是已知陷阱，`eval_memflowdit_v03.py` 已加 `--volume-ids` 白名单，
 其他评估脚本请同步检查。
 
+### 评估协议必须与 VerSe 论文及相关工作对齐（红线）
+
+评估口径**必须**与 VerSe 官方协议（Sekuboyina et al. 2021；官方评测 `anjany/verse`）+
+相关工作惯例（Metrics Reloaded 2024、nnU-Net、SpineNet/VerTeBra）**一致**。
+完整规范见 `docs/report/eval_protocol_standard_20260809.md`（README 有摘要章节）。要点：
+- 单位：manifest spacing → 1mm 各向同性 → **mm**，禁止 voxel；
+- Dice：**逐椎体平均**（aggregate + single），禁止 volume-level 前景池化；
+- NSD：NSD@1mm / NSD@2mm（mm）；
+- Hausdorff：HD95(mm)（可选 full HD mm）；
+- **识别/分割分离**：ID rate + MLD 20mm 门控，仅正确识别椎体计入分割；
+
+当前主线在 5 个维度偏离（Dice 池化 / NSD voxel / HD95 voxel / 无识别分离 / 无 spacing-mm），
+**改评估代码前必须先对齐本规范**，不得用非标数字对标 VerSe 榜单。
+
 ---
 
 ## 6. SSH 与运行环境
@@ -199,6 +215,10 @@ Python:   /home/medteam/miniconda3/envs/qy_esnake/bin/python
 3. **[完成 67158bb] 重采样链**：`prepare_testing` 中 octagon 分支改为直接 128 点，
    合同测试 max |delta|=0.000000
 4. **[未整理] `volmem_acceleration/`（9 文件）和 `test/codex_brief_*.md`（5 文件）**
+5. **[待实现] 评估协议对齐 VerSe/相关工作**：按 `docs/report/eval_protocol_standard_20260809.md`
+   改造 `tools/volmem/eval_memflowdit_v03.py` / `refine_metrics3d.py`：spacing→1mm 各向同性、
+   逐椎体 Dice（aggregate+single）、NSD@1/2mm、HD95(mm)、ID rate + MLD 20mm 门控；
+   所有 eval 脚本默认 `--volume-ids` 白名单；补/删 `compute_stage_a_metrics.py` 引用
 
 ---
 
