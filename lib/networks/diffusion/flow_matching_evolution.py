@@ -2555,9 +2555,56 @@ class FlowMatchingEvolution(nn.Module):
                 iter_steps = int(getattr(global_cfg, 'iterative_num_steps', 3))
                 full_disp = x1_raw.clone()
                 B = x1_raw.size(0)
+                use_v4_10_cont = bool(getattr(global_cfg, 'v4_10_use_continuous_sampling', False))
                 use_rich_state_sampling = bool(getattr(global_cfg, 'v4_9_use_rich_state_sampling', False))
                 use_mixed_iter_interp = bool(getattr(global_cfg, 'v4_4_use_mixed_iter_interp', False))
-                if use_rich_state_sampling:
+                if use_v4_10_cont:
+                    # v4_10 continuous sampling: mixture-of-Gaussians centred at outer-loop
+                    # inference targets, blended with uniform background. Fully vectorised,
+                    # no host<->device syncs. Design details committed in AGENTS.md §v4_10.
+                    # centers = {0} ∪ v4_9_infer_target_fractions[:-1]
+                    # weights = work-proportional blended with uniform (λ=0.30)
+                    # noise   = folded Gaussian σ=0.05, background = 15% Uniform[0,0.999]
+                    _sigma = max(float(getattr(global_cfg, 'v4_10_sigma', 0.05)), 1e-6)
+                    _bg_p  = min(max(float(getattr(global_cfg, 'v4_10_uniform_bg_prob', 0.15)), 0.0), 1.0)
+
+                    # Build center list (host-side, tiny, no device sync)
+                    _raw_c = list(getattr(global_cfg, 'v4_10_centers', None) or [])
+                    if not _raw_c:
+                        _inf = list(getattr(global_cfg, 'v4_9_infer_target_fractions',
+                                            [0.3333, 0.5, 0.80, 0.97, 1.0]))
+                        _raw_c = [0.0] + [float(f) for f in _inf[:-1]]
+                    _centers = [min(max(float(_c), 0.0), 0.999) for _c in _raw_c]
+                    _K = max(len(_centers), 1)
+
+                    _raw_w = list(getattr(global_cfg, 'v4_10_center_weights', None) or [])
+                    if len(_raw_w) != _K:
+                        # Default work-proportional weights (for 5-center default config)
+                        # from tools/volmem/design_continuous_sampling.py, λ=0.30 blend.
+                        _wp_def = [0.2933, 0.1767, 0.27, 0.179, 0.081]
+                        _raw_w = _wp_def if len(_wp_def) == _K else [1.0 / _K] * _K
+                    _ws = sum(_raw_w)
+                    _weights = [w / _ws for w in _raw_w] if _ws > 0 else [1.0 / _K] * _K
+
+                    # Vectorised categorical draw via CDF + single uniform (sync-free)
+                    _ct  = torch.tensor(_centers, device=device, dtype=full_disp.dtype)  # (K,)
+                    _wt  = torch.tensor(_weights, device=device, dtype=full_disp.dtype)  # (K,)
+                    _cdf = _wt.cumsum(0)                                                  # (K,)
+                    _r   = torch.rand(B, device=device, dtype=full_disp.dtype)            # (B,)
+                    # index = number of CDF steps strictly below r (i.e. argmax of r < cdf)
+                    _cidx  = (_r.unsqueeze(1) >= _cdf.unsqueeze(0)).sum(1).clamp_(0, _K - 1)
+                    _sel_c = _ct[_cidx]                                                   # (B,)
+
+                    # Gaussian noise + fold to [0, 0.999]
+                    _noise  = torch.randn(B, device=device, dtype=full_disp.dtype).mul_(_sigma)
+                    _frac_g = (_sel_c + _noise).clamp_(0.0, 0.999)
+
+                    # Uniform background override
+                    _bg_mask = torch.rand(B, device=device) < _bg_p
+                    _frac_u  = torch.rand(B, device=device, dtype=full_disp.dtype).mul_(0.999)
+                    frac = torch.where(_bg_mask, _frac_u, _frac_g).view(B, 1, 1)
+                    used_mixed_iter_interp = True
+                elif use_rich_state_sampling:
                     cont_p = max(float(getattr(global_cfg, 'v4_9_continuous_state_prob', 0.60)), 0.0)
                     disc_p = max(float(getattr(global_cfg, 'v4_9_discrete_state_prob', 0.0)), 0.0)
                     small_p = max(float(getattr(global_cfg, 'v4_9_small_state_prob', 0.25)), 0.0)
