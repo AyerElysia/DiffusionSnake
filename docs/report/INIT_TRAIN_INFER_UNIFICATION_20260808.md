@@ -209,3 +209,110 @@ CUDA_VISIBLE_DEVICES=6 /usr/bin/python3.8 -u tools/volmem/train_memflowdit.py \
   其结论"若要成为长期训练合同，需要另做训练侧 rectangle 对齐实验"正是本实验。
 - `DETECTOR_STAGE_A_INSTANCE2D_RECALC_20260807.md` — 逐实例 2D 口径声明。
 - `DETECTOR_EVOLUTION_ISOLATION_20260803.md` — 归因铁律。本实验全程 GT box。
+
+
+---
+
+## 6. 训练结果：三臂 600 步微调，dev5 GT-box（2026-08-08）
+
+三臂均从冻结主线 `h1_distilled_full.pt`（SHA256 `5e28f12d…ecfc72`）起微调 600 步，
+配置只差两个 init 键（已 `diff` 验证）。评测：dev5 显式白名单、`--box-mode gt`、
+`--memory-mode off`、seed 20260731、5 outer × 20 inner。
+
+### 有效性闸门
+
+| arm | vols | slices | fg slices | fg w/ pred | GT boxes | dev5 | locked |
+|---|---:|---:|---:|---:|---:|---|---|
+| baseline | 5 | 1248 | 429 | 422 | 4340 | PASS | none |
+| route_A | 5 | 1248 | 429 | 422 | 4340 | PASS | none |
+| route_B | 5 | 1248 | 429 | 422 | 4340 | PASS | none |
+
+四项计数三臂完全一致；三臂 checkpoint step 均为 600。
+
+### 主口径：2D 逐前景切片 / 逐类
+
+| 指标 | baseline | route_A | route_B | A−base | B−base |
+|---|---:|---:|---:|---:|---:|
+| fg-slice mDice | 0.760831 | 0.788292 | 0.790968 | **+0.027461** | **+0.030137** |
+| fg-slice mIoU | 0.624421 | 0.661599 | 0.666274 | +0.037178 | +0.041853 |
+| class mDice | 0.737925 | 0.764256 | 0.766683 | +0.026331 | +0.028758 |
+| class mIoU | 0.602892 | 0.636955 | 0.641849 | +0.034063 | +0.038956 |
+
+### 次要结果检查：逐卷物理指标
+
+| 指标 | baseline | route_A | route_B |
+|---|---:|---:|---:|
+| volume mDice | 0.791974 | 0.830261 | 0.834922 |
+| volume mIoU | 0.655977 | 0.710507 | 0.717580 |
+
+### 逐病例一致性
+
+| volume | baseline | route_A | route_B |
+|---|---:|---:|---:|
+| sub-verse022 | 0.794875 | 0.827703 | 0.840433 |
+| sub-verse024 | 0.808805 | 0.851214 | 0.859278 |
+| sub-verse071 | 0.811765 | 0.861138 | 0.867405 |
+| sub-verse150 | 0.783093 | 0.817752 | 0.813229 |
+| sub-verse264 | 0.761334 | 0.793497 | 0.794266 |
+
+**route_A 5胜0负、route_B 5胜0负**（对 baseline）。两条统一路线对不统一的 baseline
+是一致压制，不是病例互有胜负。
+
+### 结论
+
+1. **统一训推 init 有实质收益：+0.027~0.030 fg-slice mDice，逐病例 5/5 一致。**
+   注意方向：baseline 是唯一留在其预训练原生 regime 里的臂，两条路线各只用 600 步
+   适应新 init 分布，却仍然反超。因此该增益对路线是**保守**估计。
+
+2. **这与 `DETECTOR_RECTANGLE_INIT_ABLATION_20260807` 的"打平"结论不矛盾。**
+   那次只换推理侧、不重训，它的两臂**都是训推不一致**的（octagon 臂训练用 GT 极值点
+   八边形、推理用 bbox 中点伪八边形；rectangle 臂训练同样是 GT 极值点八边形）。
+   两个不一致互比 → 打平（+0.0012，3胜2负）。本次是"不一致 vs 已统一" → +0.027，5胜0负。
+   **增益来自统一本身，不来自形状选择。**
+
+3. **Route A vs Route B 不具决定性。** B 领先 +0.002676 fg-slice mDice；逐病例 4胜1负
+   （150 由 A 胜）；逐类 17 类中 B 胜 10、A 胜 7，且 B 在 n 较大的 20–24 类上胜、
+   A 在 n 较小的中胸段 9/10/11/13/14/18/19 上胜。5 例规模下这个差距不足以定论。
+
+### 与外层状态采样的联动
+
+`tools/volmem/analyze_outer_state_sampling.py`（200 万样本镜像
+`flow_matching_evolution.py:2558-2640`）测得：推理每条轨迹必经的 `frac=0` 状态，
+训练质量仅 **0.499%**（±0.02）；`frac ≤ 0.05` 仅 1.2447%。而 `v4_9_discrete_fractions`
+里的 `1.0` 被 `.clamp_(0.0, 0.999)` 削成退化空转态，占全部样本 13.3%；连同 near_zero，
+**28.35% 的样本进度 ≥ 0.95**，中位数 frac = 0.823，分布严重后倾。
+
+单位混淆的铁证：代码自身的兜底式 `[1.0/(iter_steps-i) for i in range(iter_steps)]`
+在 `iter_steps=3` 时正好是 `[0.3333, 0.5, 1.0]`，与 `v4_9_discrete_fractions` 一字不差——
+一份**残差比例**表被塞进了按**绝对进度**消费的旋钮。三步迭代真正经过的进度应是
+`{0, 0.3333, 0.6667}`。旁证：`1232_final_v5_geom_action_*` 系列里
+`v4_9_discrete_fractions == v4_9_infer_target_fractions`，那才是正确纪律。
+
+这解释了为何 init 形状选择（A vs B）影响小、而统一性影响大：init 形状只在 `frac≈0`
+附近主导网络输入，而那里几乎没有训练质量。
+
+### 尚未修复
+
+**resample 链仍不一致**：训练 control→128 一步，推理 control→40→÷4→128 两步，
+40 点中间态截角。契约测试中 `p128_maxabs == resample_only_maxabs` 精确相等——
+两条路线的**全部**残差都来自这里（A 16.35 px，B 42.67 px），与 A/B 选择无关。
+若修掉此项，两路线残差均归零，A 的索引对齐优势随之消失。
+
+### 事故与坑（其他 AI 请注意）
+
+- **`--max-volumes 5` 不是 dev5。** val 按 `case_id` 排序后前五个是
+  010/011/013/016/018，其中 **010/011/013 是 locked**。dev5 实际在索引 5/7/14/23/31
+  （022/024/071/150/264，切片 204+73+350+204+417 = 1248）。已给
+  `tools/volmem/eval_memflowdit_v03.py` 增加 fail-closed `--volume-ids` 白名单。
+- **locked 集不再是零访问。** 本次冒烟测试用 `--max-volumes 1` 读到了
+  `sub-verse010` 一次（只读评测，其数值未进入任何结论）。
+  `DETECTOR_RECTANGLE_INIT_ABLATION_20260807` 记载的"locked 010/011/013：访问数 0"
+  自本次起不再成立。
+
+### 机器结果
+
+- `data/outputs/init_unify/eval_dev5_gtbox_step600/{baseline,route_A,route_B}/summary.json`
+- 汇总脚本：`tools/volmem/compare_init_unify_eval.py`
+- 采样分布：`data/outputs/init_unify/quantification/outer_state_sampling.json`
+- 三臂 checkpoint：`data/outputs/init_unify/init_unify_{arm}/checkpoints/step_000600.pt`
+- 全部位于 worktree `DiffusionSnake-12-30-init-unify-20260808`
