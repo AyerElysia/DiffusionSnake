@@ -43,7 +43,7 @@ seq_delta 训练已于 2026-07-08 跑满既定的 1000 步目标，正常收尾�
 ## 2. 逐点探索方案（per_point_fm_scale）设计演进
 
 目标：解决"探索空间不足"问题——现有 geom 低频谐波探索所有轮廓点共享同一方向，逐点探索让每个
-点独立学习修正幅度。完整方案演进记录见 `report/perpoint_fm_scale_design.md`（2026-07-07）。
+点独立学习修正幅度。完整方案演进记录见 `archive/report/perpoint_fm_scale_design.md`（2026-07-07）。
 
 ### 2.1 三版迭代
 

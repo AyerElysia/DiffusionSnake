@@ -216,20 +216,19 @@ test/*.nohup*.out
 test/*.nohup*.out.*
 
 # HTML render check temp
-docs/report/.html_render_check/
 
 # Eagle third-party
 Eagle/
 
 # Large evaluation result image directories (use scripts to regenerate)
-docs/report/perpoint_final_eval/
-docs/report/nsd_clear_full_20260708/
-docs/report/nsd_full_eval_20260708/
-docs/report/moonvit_pseudo3d_formal_training_assets/
-docs/report/perpoint_bottleneck_analysis/
-docs/report/perpoint_policy_bottlenecks/
-docs/report/perpoint_grouped_comparison/
-docs/report/sagittal_pseudo3d_assets/
+docs/archive/report/perpoint_final_eval/
+docs/archive/report/nsd_clear_full_20260708/
+docs/archive/report/nsd_full_eval_20260708/
+docs/archive/report/moonvit_pseudo3d_formal_training_assets/
+docs/archive/report/perpoint_bottleneck_analysis/
+docs/archive/report/perpoint_policy_bottlenecks/
+docs/archive/report/perpoint_grouped_comparison/
+docs/archive/report/sagittal_pseudo3d_assets/
 
 # Backup files (already tracked in original locations)
 grpo_train_v5_geom_action.py.bak_before_cleanup

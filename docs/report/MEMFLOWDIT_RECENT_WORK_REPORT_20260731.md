@@ -585,7 +585,7 @@ v0.6 联合候选同时使用：
 
 ### MoE 专项报告
 
-- `docs/report/MOE_2026_RESEARCH_20260731.md`
+- `docs/archive/report/MOE_2026_RESEARCH_20260731.md`
 
 ---
 
@@ -614,7 +614,7 @@ v0.6 联合候选同时使用：
 
 完整设计、实现、运行记录和逐项指标见：
 
-- `docs/report/MEMFLOWDIT_PARALLEL_3D_MEMORY_EXPERIMENT_20260731.md`
+- `docs/archive/report/MEMFLOWDIT_PARALLEL_3D_MEMORY_EXPERIMENT_20260731.md`
 
 严格同噪声、GT-box、固定 3 个 validation volumes 的配对结果显示：旧 v0.5 step2300 的 parallel-off Volume Dice 为 `0.796574`，feature-only、GT-oracle、predicted bidirectional Memory 分别为 `0.796354`、`0.796343`、`0.796363`，三种 Memory 均无收益，且 read delta 都约为 `1.089e-4`。旧自回归相对顺序 off 下降 `0.000276` Dice，吞吐下降 17.7%。因此当前问题不是 bank 太小，也不能主要归因于预测误差累积；更直接的原因是 26 通道稀疏 mask 在 1152 通道 MoonViT 特征中被数值淹没，随后 Memory residual 又被近零输出投影二次压低。
 
@@ -668,4 +668,4 @@ step100 已挂三路守护评估（PID `3404945`）：
 
 v0.9 step500 的 3-volume 门控已经完成：off / local K4 / K4+G16 的 Volume Dice 分别为 `0.789150 / 0.789112 / 0.789166`。compact 相对 off 仅 `+0.000016`，相对 local 仅 `+0.000054`；虽然前景 slice Dice 为 `+0.001310`，吞吐仍下降 18.09%，没有达到 Volume `+0.001` 与减速不超过 10% 的门槛。自动止损守护在结果落盘后核对 PID 与配置并发送 SIGTERM，训练于 step608 停止。当前 compact 在线均值方案正式淘汰，Memory 不能声称有效。
 
-另完成独立 MoE 成本审计。当前联合候选是输出头 8 专家 Top-2，加奇数 3 层 E4 Top-1，并非 6 层全 MoE。相对 output-MoE dense DiT，总参数增长 12.00%，训练峰值显存仅增长 0.61%，参数成本可接受；但 batch1 新增减速为 7.79%，batch8 新增减速为 15.68%。旧输出头还会先计算全部 8 个专家再 Top-2 gather，是并行扩展的主要冗余。完整表格、代码根因和准入决策见 `docs/report/MOE_COST_AUDIT_20260802.md`。
+另完成独立 MoE 成本审计。当前联合候选是输出头 8 专家 Top-2，加奇数 3 层 E4 Top-1，并非 6 层全 MoE。相对 output-MoE dense DiT，总参数增长 12.00%，训练峰值显存仅增长 0.61%，参数成本可接受；但 batch1 新增减速为 7.79%，batch8 新增减速为 15.68%。旧输出头还会先计算全部 8 个专家再 Top-2 gather，是并行扩展的主要冗余。完整表格、代码根因和准入决策见 `docs/archive/report/MOE_COST_AUDIT_20260802.md`。

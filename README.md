@@ -16,7 +16,7 @@
 | 第三层级 | 伪 3D / 顺序体数据能力扩展（跨切片传播、整卷并行推理） | 🕐 方向已定 |
 | 系统支撑 | 检测器（LocateAnything 接入）与推理加速 | 性能支撑，非核心创新 |
 
-贡献详述见 `docs/report/INNOVATION_SUMMARY.md`。
+贡献详述见 `docs/report/INNOVATION_SUMMARY.md`（写于 2026-07-05，**战场与超参描述已落后于当前主线，阅读时以本 README 为准**）。
 
 ---
 
@@ -141,6 +141,32 @@
 | `FLOW_MEMORY_3D_READONLY_REVIEW_20260804.md` | Memory / 3D 只读复核与淘汰结论 |
 | `LOCATEANYTHING_DIFFUSIONSNAKE_INTEGRATION_REPORT_2026-07-31.md` | LocateAnything 检测接入契约 |
 | `MEMFLOWDIT_NEXT_STAGE_EXECUTION_20260803.md` | DiT FFN 对照、Memory 因果审计执行链 |
+| `DETECTOR_STAGE_A_INSTANCE2D_RECALC_20260807.md` | 逐实例 2D 指标探索性重算（只读；**不替代**正式 3D mean-volume Dice） |
+| `DETECTOR_RECTANGLE_INIT_ABLATION_20260807.md` | bbox→初始轮廓几何消融（5 病例开发集，非 full-38 正式结果） |
+| `FLOW_PURE2D_DIT4_TOTAL10K_BASELINE_AND_SLIM_B_GATE_20260807.md` | Pure-2D DiT-4 10k baseline 未达 H1 参考，slim-B 判为 NO-GO |
+| `HISTORICAL_BEST_AUDIT_20260803.md` | 175 份 summary.json 审计，纠正“0.773345 是历史最佳”的误述 |
+| `DETECTOR_EVOLUTION_ISOLATION_20260803.md` | 检测器与演化的隔离规则（含 2026-08-04 活契约条款） |
+| `DISP_NORMALIZATION_REPORT.md` | disp 归一化统计规范——`flow_matching_evolution.py` 中 `_load_disp_stats/normalize_disp` 的唯一书面依据 |
+| `GEOM_BRIDGE_PARADIGM_DESIGN_AND_RESAMPLE_DEFERRAL_20260620.md` | Geom Bridge 几何位置桥范式设计与重采样延后决策 |
+| `LOCATE_FEATURE_REPLACEMENT_ARCHITECTURE_EXPLAINED_20260615.md` | `ct_snake.py` 中 `LocateFeatReplacer` 的架构说明（代码仍在用） |
+| `locate_integration_analysis_20260611.md` | Locate 接入分析 + 2026-06-12 结果更新与推荐配置 |
+| `RL_WORK_SUMMARY_20260708.md` | RL 阶段总结（§5 仍有未完成 TODO） |
+| `RL/POLICY_GRADIENT_GRPO_EXPLANATION.md`、`RL/V5_GEOM_POLICY_GRADIENT_DETAILED.md` | 现行 RL 入口 `grpo_train_v5_geom_action.py` / `grpo_train_v7_seedflow_grpo.py` 的原理说明 |
+| `CREDIT_DIAGNOSIS_FINDINGS_20260625.md` | RL 反馈信号离线诊断（reward 计算 vs 轨迹问责两条假说） |
+| `inference_acceleration/ODE_ACCELERATION_REPORT_20260706.md` | 推理加速：AB2 积分器与 KV cache 基准 |
+| `2D_FM_CURVE_FAILURE_THEORETICAL_ANALYSIS_20260626.html` | 2D FM 曲线失效的理论分析 |
+
+### 设计文档（docs/design/）
+
+| 文档 | 内容 |
+|------|------|
+| `VOLMEM_NAMING_AND_CODE_BOUNDARY.md` | VolMem 体数据主线的命名约定与代码边界（`volmem` 前缀、工作名 VolMemSnake） |
+
+### 历史留档（docs/archive/）
+
+已完成使命的文档与实验产物统一收于 `docs/archive/`，目录结构镜像整理前的原始路径。
+索引见 `docs/archive/README.md`。**该目录不指导当前工作**，仅供追溯 BTCV 时代原型、
+已淘汰路线（MoE / 3D Memory / per-point FM 尺度策略）的完整证据链，以及历史评测产物。
 
 ---
 
@@ -154,7 +180,8 @@ V1 基础 Cross-Attention、V2 CyclicRoPE 奇偶交替、V2.2 MM-DiT Patchify、
 
 - V2 系列封存于 `archive/v2_legacy_2026-04-19/`；
 - 早期文档（八边形初始化、DDIM 采样、边缘平滑、单样本过拟合流程等）见 git 历史中的旧版 README；
-- 相关验证脚本：`verify_octagon_v3.py`、`edge_smoothing.py`、`compute_disp_stats.py`。
+- 早期验证脚本（`verify_octagon_v3.py`、`edge_smoothing.py`、`compute_disp_stats.py` 等）已于 2026-08-08 清理，需要时从 git 历史找回；
+- BTCV 时代 RL 训练脚本（grpo_train v1/v2/v4 系列）同样已清理，当前 RL 入口为 `grpo_train_v5_geom_action.py` 与 `grpo_train_v7_seedflow_grpo.py`。
 
 ---
 
@@ -177,6 +204,8 @@ python scripts/extract_sagittal_moonvit_features.py
 
 ## 更新日志
 
+- **2026-08-08**: docs 整理——历史留档迁入 `docs/archive/`（镜像原路径），`docs/report/` 只保留活文档；删除 636 个无唯一内容的文件（浏览器 profile 缓存、渲染自检截图、可重生成的 pptx），其余一律归档不删
+- **2026-08-07**: Pure-2D DiT-4 10k baseline 未保持 H1 质量，slim-B 判 NO-GO；bbox→初始轮廓 Rectangle 消融（开发集）；逐实例 2D 指标探索性重算（不替代正式指标）
 - **2026-08-05**: Detector Stage A full-38 A→B 归因完成（coverage Dice -0.1293、geometry -0.0894，38/38 一致，bootstrap CI 不跨 0）；D zero-control 通过；README 按当前主线重写
 - **2026-08-04**: Flow 主线接管与五任务分工；Flow interface manifest v1.1 与 H1 checkpoint 冻结；GT-oracle 三病例隔离上界 0.7940；Memory/3D 只读复核结论
 - **2026-08-03**: 输出头 H0/H1/H2 蒸馏：H1 质量保持且吞吐 +27.7%，成为主线输出头；DiT FFN 四组结构对照启动

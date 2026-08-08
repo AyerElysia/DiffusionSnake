@@ -122,30 +122,6 @@ class DatasetCatalog(object):
             'data_root': '/home/medteam/Zhrch/detect_3D_lgz2/datasets/sagittal_2d_fixed',
             'ann_file': '/home/medteam/Zhrch/detect_3D_lgz2/datasets/sagittal_2d_fixed/manifests/slice_manifest.csv',
             'split': 'test'
-        },
-        'VocVal': {
-            'id': 'voc',
-            'data_root': 'data/voc/JPEGImages',
-            'ann_file': 'data/voc/annotations/voc_val_instance.json',
-            'split': 'val'
-        },
-        'CocoTrain': {
-            'id': 'coco',
-            'data_root': '/home/medteam/Zhrch/COCO/train2017',
-            'ann_file': '/home/medteam/Zhrch/COCO/annotations/instances_train2017.json',
-            'split': 'train'
-        },
-        'CocoVal': {
-            'id': 'coco',
-            'data_root': '/home/medteam/Zhrch/COCO/val2017',
-            'ann_file': '/home/medteam/Zhrch/COCO/annotations/instances_val2017.json',
-            'split': 'val'
-        },
-        'CocoMini': {
-            'id': 'coco',
-            'data_root': '/home/medteam/Zhrch/COCO/train2017',
-            'ann_file': '/home/medteam/Zhrch/COCO/annotations/instances_train2017.json',
-            'split': 'mini'
         }
     }
 
