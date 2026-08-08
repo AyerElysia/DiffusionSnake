@@ -51,25 +51,71 @@
 
 38/38 病例方向一致为下降，10,000 次 paired bootstrap 95% CI 均不跨 0。条件 C（predicted class）因无已登记分类器 blocked。详见 `docs/report/DETECTOR_STAGE_A_AB_ATTRIBUTION_STATUS_20260805.md`。
 
-### 训推初始化统一（2026-08-08，进行中）
+### 训推初始化统一（2026-08-09，A/B 已判定：主线走 Route B）
 
-**已发现的不一致**：训练用 GT 轮廓极值点构造八边形，推理只有检测框、构造不出同一个八边形
-（LocateAnything 不输出极值点）。同一个 `get_octagon()`，两侧输入分布不同。
+**问题**：训练用 GT 轮廓极值点构造八边形，推理只有检测框、构造不出同一个八边形
+（LocateAnything 不输出极值点）。同一个 `get_octagon()`，两侧输入分布不同，
 合同测试实测控制点逐点最大偏差 **102.4 px**。
 
-两条候选路线均已证明可做到训推**逐点精确相同**（`ctrl_maxabs = 0.0`）：
+**决定的主线（其他 AI 以此为准）**：训练与推理**都**从检测框四边中点构造 12 点八边形，
+即 `get_octagon(get_quadrangle(box))`。开关 `evolve_init: bbox_octagon`（训练侧）+
+`init: octagon`（推理侧），代码在 `lib/utils/snake/snake_voc_utils.py: get_evolution_init()`。
+**训练初始化不再使用 GT 极值点。**
 
-| 路线 | 统一形状 | 初始 Dice | 索引对齐残差 |
-|------|---------|---:|---:|
-| A | 8 点矩形 | 0.7650 | **16.35 px** |
-| B | bbox 12 点八边形 | **0.7866** | 42.67 px |
-| （现状 baseline） | 训练八边形 / 推理伪八边形 | 0.8373 / 0.7866 | 102.4 px |
+**证据**（dev5 = sub-verse022/024/071/150/264，1248 slices，GT box、Memory-off、step 600、
+seed 20260731，三臂唯一差异就是 init 开关）：
 
-同时发现**重采样链本身也不一致**（训练 control→128 一步；推理 control→40→÷4→128 两步），
-残差全部来自此处，是独立于 A/B 选择的第三个修复点。
+| 臂 | 训练 init | 推理 init | 前景切片 mDice | 逐卷胜负 |
+|----|----------|----------|---:|---|
+| baseline（现状，训推不一致） | GT 极值点八边形 | 框中点伪八边形 | 0.760831 | — |
+| route_A（统一 8 点矩形） | box 矩形 | box 矩形 | 0.788292 | 5W/0L vs baseline |
+| **route_B（统一 bbox 八边形）** | 框中点八边形 | 框中点八边形 | **0.790968** | **5W/0L vs baseline** |
 
-**状态：训练臂进行中，尚无质量结论，勿引用为定论。** baseline 控制臂因 GPU 占用未启动。
-详见 `docs/report/INIT_TRAIN_INFER_UNIFICATION_20260808.md`。
+结论：**形状本身几乎不重要，训推一致才重要**（+0.027~0.030）。这与 2026-08-07 的
+Rectangle 消融不矛盾——那次在冻结权重上只换推理侧形状（两臂都仍不一致），测的是
+"冻结 Flow 能否吸收形状变化"（能，+0.0012 打平）；本次测的是"消除不一致值多少"。
+选 B 不选 A：A 的索引对齐优势（16.35 vs 42.67 px）**全部来自重采样链**
+（`p128_maxabs == resample_only_maxabs` 精确相等），修掉重采样链后归零，
+而 B 的初始形状质量优势仍在；B 也拿下主口径（4/5 卷、10/17 类）且改动最小。
+
+详见 `docs/report/INIT_TRAIN_INFER_UNIFICATION_20260808.md` 与
+`data/outputs/init_unify/eval_dev5_gtbox_step600/COMPARISON.md`。
+
+### 外层状态采样连续化（2026-08-09，设计已定，待实现）
+
+`frac` 语义（源码确证，勿反着读）：`i_init_train += full_disp * frac`、
+`x1_raw = full_disp * (1 - frac)`，所以 `frac` = **已走完的 GT 位移比例** = 外层进度。
+`frac=0` 就是推理第 1 步永远面对的原始初始轮廓。
+
+**现状实测缺陷**（2M 采样，`tools/volmem/analyze_outer_state_sampling.py`）：
+
+- `frac≈0`（±0.05）只占 **1.25%**，但 100% 的推理轨迹从这里出发，且这一步位移最多；
+- `v4_9_discrete_fractions: [0.3333, 0.5, 1.0]` 被当**绝对进度**消费，`1.0` 又被
+  `clamp_(0, 0.999)`，13.3% 样本浪费在近退化状态；根因是单位混用
+  （`iterative_fractions` 是**残差**比例，`v4_9_infer_target_fractions` 是**绝对进度**）；
+- 28.3% 样本落在 ≥0.95 进度，中位数 0.823——分布严重偏向"快到终点"。
+
+**新设计**（`tools/volmem/design_continuous_sampling.py`，连续 + 按工作量加权）：
+中心取 `{0} ∪ infer_target_fractions[:-1]` = `[0, 0.3333, 0.5, 0.80, 0.97]`，
+权重 ∝ 该外层步要走的**绝对进度份额** `[33.3, 16.7, 30.0, 17.0, 3.0]%`，
+再与均匀分布按 λ=0.30 混合防过窄；每个中心是折叠/反射高斯 σ=0.05，
+另加 15% 均匀底噪覆盖 [0, 0.999]。
+
+| 状态 | 现状 | 新设计 |
+|------|---:|---:|
+| 0.0 | 1.25% | **17.78%** |
+| 0.3333 | 15.24% | 11.99% |
+| 0.50 | 15.21% | 17.33% |
+| 0.80 | 10.22% | 11.93% |
+| 0.97 | 33.31% | 7.01% |
+| ≥0.95 | 28.31% | 4.87% |
+| 中位数 | 0.823 | 0.449 |
+
+概率可视化：`data/outputs/init_unify/quantification/outer_state_sampling_design.html`。
+
+**第三个不一致源（仍未修）**：重采样链本身不一致——训练 control→128 一步，
+推理 control→40→÷4→128 两步，40 点中间态截角。合同测试的剩余残差**全部**来自此处，
+独立于 A/B 选择。
 
 ### 已淘汰路线（有严格证据，不再回退）
 
@@ -89,9 +135,9 @@
    ├─▶ 检测：LocateAnything 离线预测 ──▶ external_detection [B,N,6]
    │        (x1,y1,x2,y2,score,class_id)；隔离实验用 GT box
    │
-   ├─▶ 框初始化：box → 4 边中点 → 12 点八边形 → 40 点 → 1/4 分辨率 Flow 网格
-   │        → 128 点上采样轮廓（v3 家族默认 octagon；训练侧用 GT 极值点构造，
-   │        推理侧只能用框四边中点 —— 训推不一致，见 §训推初始化统一）
+   ├─▶ 框初始化：检测框 → 4 边中点 → 12 点八边形 → 40 点 → 1/4 分辨率 Flow 网格
+   │        → 128 点上采样轮廓（训练/推理统一从检测框四边中点构造，即
+   │        get_octagon(get_quadrangle(box))；不再用 GT 极值点，见 §训推初始化统一）
    │
    └─▶ Flow Matching 演化（两层 ODE）
         ├─ 内层：FM 速度场 v(x_t, t)，AB2 积分 4 NFE（≈推理 8 步内）
@@ -227,6 +273,7 @@ python scripts/extract_sagittal_moonvit_features.py
 
 ## 更新日志
 
+- **2026-08-09**: 训推初始化统一 A/B 判定完成——三臂 dev5 GT-box 对照（1248 slices、step 600、唯一差异是 init 开关）：baseline 0.760831 → route_A 0.788292 → route_B 0.790968 前景切片 mDice，两条统一路线均 5W/0L；**主线定为 Route B**（训推都用检测框四边中点构造 12 点八边形，训练不再用 GT 极值点）。量化外层状态采样缺陷（frac≈0 仅 1.25%、28.3% 样本 ≥0.95 进度、discrete/infer_target 单位混用）并给出连续化重设计（frac≈0 → 17.78%、中位数 0.823 → 0.449）；重采样链不一致仍未修
 - **2026-08-08**: 训推初始化统一实验启动——定位并量化 init 不一致（控制点 102.4 px），两条统一路线合同测试通过（逐点精确相同），发现重采样链为第三个不一致源；训练臂进行中。docs 整理——历史留档迁入 `docs/archive/`（镜像原路径），`docs/report/` 只保留活文档；删除 636 个无唯一内容的文件（浏览器 profile 缓存、渲染自检截图、可重生成的 pptx），其余一律归档不删
 - **2026-08-07**: Pure-2D DiT-4 10k baseline 未保持 H1 质量，slim-B 判 NO-GO；bbox→初始轮廓 Rectangle 消融（开发集）；逐实例 2D 指标探索性重算（不替代正式指标）
 - **2026-08-05**: Detector Stage A full-38 A→B 归因完成（coverage Dice -0.1293、geometry -0.0894，38/38 一致，bootstrap CI 不跨 0）；D zero-control 通过；README 按当前主线重写
