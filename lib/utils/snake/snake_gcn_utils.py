@@ -55,7 +55,16 @@ def prepare_testing(output):
         i_it_py = torch.zeros([0, snake_config.poly_num, 2], device=i_it_4py.device, dtype=i_it_4py.dtype)
         c_it_py = torch.zeros_like(i_it_py)
     else:
-        i_it_py = uniform_upsample(i_it_4py.unsqueeze(0), snake_config.poly_num)[0]
+        if snake_config.init == 'octagon':
+            # Build i_it_py directly at full image scale to match the training chain:
+            #   box -> quadrangle -> octagon(12pts) -> uniform_upsample(poly_num)
+            # Avoids the /4 stride-scaling and double-upsample that i_it_4py carries.
+            # i_it_4py stays at feature-map (/4) coords for GCN feature extraction.
+            _valid = score > 1e-4
+            _valid_boxes = box[_valid]          # [M, 4] full-scale image coords
+            i_it_py = _box_to_octagon_init(_valid_boxes, snake_config.poly_num)
+        else:
+            i_it_py = uniform_upsample(i_it_4py.unsqueeze(0), snake_config.poly_num)[0]
         c_it_py = img_poly_to_can_poly(i_it_py)
     init.update({'i_it_py': i_it_py, 'c_it_py': c_it_py, 'py_ind': ind})
     return init
