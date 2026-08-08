@@ -76,15 +76,22 @@ x1_raw = full_disp * (1 - frac)      # 剩余残差
 均匀混合 λ=0.30，折叠高斯 σ=0.05，15% 均匀底噪。
 效果：frac≈0 从 1.25% → **17.78%**，中位数 0.823 → **0.449**。
 
-**实现要求**：新的 gated 分支（`v4_10_*` 配置键），现有 `v4_9_*` 路径一行不动。
+**实现状态（2026-08-09 已完成）**：gated 分支已插入，commit `01f5304`。
+门控 `v4_10_use_continuous_sampling: true`，`v4_9_*` 路径一行不动。
+四臂配置：`configs/volmem/init_unify_route_B_v410.yaml`（Route B + v4_10）。
 
-### 3.4 重采样链不一致 — 已知缺陷，未修
+### 3.4 重采样链不一致 — 已修（2026-08-09，commit `67158bb`）
 
 训练：control → 128 点（一步）
 推理：control → 40 点 → ÷4 → 128 点（两步，40 点中间态截角）
 
-合同测试剩余残差**全部来自此处**（`p128_maxabs == resample_only_maxabs` 精确相等），
-独立于 A/B 选择，是独立的第三个修复点。
+合同测试剩余残差全部来自此处，独立于 A/B 选择。
+
+**修复**：`prepare_testing`（`lib/utils/snake/snake_gcn_utils.py`）中
+`init=='octagon'` 分支改为 `_box_to_octagon_init(valid_boxes, poly_num)` —— 在完整图像
+坐标下直接构造 128 点八边形，与训练链 `build_box_octagon_from_poly` 完全等价。
+GCN 特征提取（`i_it_4py` at /4 coords）保持不变。
+合同测试（4 实例合成批次）：max |train−infer| = **0.000000**。commit: `67158bb`。
 
 ---
 
@@ -186,10 +193,11 @@ Python:   /home/medteam/miniconda3/envs/qy_esnake/bin/python
 
 按优先级排序，接手前先确认哪些已完成：
 
-1. **[待实现] 连续采样 gated 分支**：`flow_matching_evolution.py` 加 `v4_10_*` 分支，
-   `v4_9_*` 路径一行不动；对应新配置 `configs/volmem/init_unify_route_B_v410.yaml`
-2. **[待启动] 第 4 训练臂**：Route B + 新采样，验证连续化设计的实际效果；需确认 GPU
-3. **[待修复] 重采样链**：统一 control→128 一步（推理去掉 40 点中间态），独立 PR
+1. **[完成 01f5304] 连续采样 gated 分支**：`flow_matching_evolution.py` 加 `v4_10_*` 分支，
+   `v4_9_*` 路径一行不动；配置 `configs/volmem/init_unify_route_B_v410.yaml`
+2. **[待启动] 第 4 训练臂**：Route B + v4_10，验证连续化设计的实际收益；需确认 GPU
+3. **[完成 67158bb] 重采样链**：`prepare_testing` 中 octagon 分支改为直接 128 点，
+   合同测试 max |delta|=0.000000
 4. **[未整理] `volmem_acceleration/`（9 文件）和 `test/codex_brief_*.md`（5 文件）**
 
 ---
