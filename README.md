@@ -81,7 +81,7 @@ Rectangle 消融不矛盾——那次在冻结权重上只换推理侧形状（�
 详见 `docs/report/INIT_TRAIN_INFER_UNIFICATION_20260808.md` 与
 `data/outputs/init_unify/eval_dev5_gtbox_step600/COMPARISON.md`。
 
-### 外层状态采样连续化（2026-08-09，设计已定，待实现）
+### 外层状态采样连续化（2026-08-09，已实现，合同测试通过）
 
 `frac` 语义（源码确证，勿反着读）：`i_init_train += full_disp * frac`、
 `x1_raw = full_disp * (1 - frac)`，所以 `frac` = **已走完的 GT 位移比例** = 外层进度。
@@ -113,9 +113,19 @@ Rectangle 消融不矛盾——那次在冻结权重上只换推理侧形状（�
 
 概率可视化：`data/outputs/init_unify/quantification/outer_state_sampling_design.html`。
 
-**第三个不一致源（仍未修）**：重采样链本身不一致——训练 control→128 一步，
-推理 control→40→÷4→128 两步，40 点中间态截角。合同测试的剩余残差**全部**来自此处，
-独立于 A/B 选择。
+**实现状态（2026-08-09 已完成）**：
+- v4_10 branch 已插入 `lib/networks/diffusion/flow_matching_evolution.py`，
+  门控开关 `v4_10_use_continuous_sampling: true`（优先级高于 v4_9 block，v4_9 推理调度不变）。
+  四臂实验配置：`configs/volmem/init_unify_route_B_v410.yaml`（Route B + v4_10）。
+  commit: `01f5304`。
+
+**重采样链不一致（2026-08-09 已修）**：训练 control→128 一步，
+推理原来 control→40→÷4→128 两步（40 点中间态截角 + /4 坐标缩放）。
+修复：`prepare_testing`（`lib/utils/snake/snake_gcn_utils.py`）中 `init=='octagon'` 时
+改为直接调用 `_box_to_octagon_init(valid_boxes, poly_num)` 在**完整图像坐标**下构造128点
+八边形，与训练链 `build_box_octagon_from_poly` 完全等价。
+合同测试：4 实例合成批次 max |train−infer| = **0.000000**。commit: `67158bb`。
+GCN 特征提取（`i_it_4py` at /4 coords）保持不变。
 
 ### 已淘汰路线（有严格证据，不再回退）
 
@@ -273,7 +283,7 @@ python scripts/extract_sagittal_moonvit_features.py
 
 ## 更新日志
 
-- **2026-08-09**: 训推初始化统一 A/B 判定完成——三臂 dev5 GT-box 对照（1248 slices、step 600、唯一差异是 init 开关）：baseline 0.760831 → route_A 0.788292 → route_B 0.790968 前景切片 mDice，两条统一路线均 5W/0L；**主线定为 Route B**（训推都用检测框四边中点构造 12 点八边形，训练不再用 GT 极值点）。量化外层状态采样缺陷（frac≈0 仅 1.25%、28.3% 样本 ≥0.95 进度、discrete/infer_target 单位混用）并给出连续化重设计（frac≈0 → 17.78%、中位数 0.823 → 0.449）；重采样链不一致仍未修
+- **2026-08-09**: 训推初始化统一 A/B 判定完成——三臂 dev5 GT-box 对照（1248 slices、step 600、唯一差异是 init 开关）：baseline 0.760831 → route_A 0.788292 → route_B 0.790968 前景切片 mDice，两条统一路线均 5W/0L；**主线定为 Route B**（训推都用检测框四边中点构造 12 点八边形，训练不再用 GT 极值点）。量化外层状态采样缺陷（frac≈0 仅 1.25%、28.3% 样本 ≥0.95 进度、discrete/infer_target 单位混用）并给出连续化重设计（frac≈0 → 17.78%、中位数 0.823 → 0.449）。**v4_10 连续采样已实现**（commit `01f5304`，门控 `v4_10_use_continuous_sampling`，四臂配置 `init_unify_route_B_v410.yaml`）。**重采样链不一致已修**（commit `67158bb`，合同测试 max |delta|=0.000000）
 - **2026-08-08**: 训推初始化统一实验启动——定位并量化 init 不一致（控制点 102.4 px），两条统一路线合同测试通过（逐点精确相同），发现重采样链为第三个不一致源；训练臂进行中。docs 整理——历史留档迁入 `docs/archive/`（镜像原路径），`docs/report/` 只保留活文档；删除 636 个无唯一内容的文件（浏览器 profile 缓存、渲染自检截图、可重生成的 pptx），其余一律归档不删
 - **2026-08-07**: Pure-2D DiT-4 10k baseline 未保持 H1 质量，slim-B 判 NO-GO；bbox→初始轮廓 Rectangle 消融（开发集）；逐实例 2D 指标探索性重算（不替代正式指标）
 - **2026-08-05**: Detector Stage A full-38 A→B 归因完成（coverage Dice -0.1293、geometry -0.0894，38/38 一致，bootstrap CI 不跨 0）；D zero-control 通过；README 按当前主线重写
