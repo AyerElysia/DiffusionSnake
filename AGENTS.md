@@ -18,7 +18,7 @@ LocateAnything 检测器给出检测框，Flow Matching 网络从框初始化轮
 | 项目 | 值 |
 |------|-----|
 | 结构 | Dense-6 DiT + H1 Dense-Residual 输出头 |
-| Checkpoint | `data/outputs/volmem/output_head_h0_h1_h2_20260803/distilled/h1_distilled_full.pt` |
+| Checkpoint | `data/model/volmem_frozen/h1_distilled_full.pt`（注意：原 `data/outputs/volmem/output_head_h0_h1_h2_20260803/distilled/` 路径已废弃/不存在，真实位置在 `data/model/volmem_frozen/`） |
 | SHA256 | `5e28f12df357ec4d18fc9f0baf67b5a57655932a585b4ae1a0254d8449ecfc72` |
 | 推理调度 | AB2，2 outer × 4 inner = 8 NFE，outer fractions `[0.6667, 1.0]` |
 | 全集指标 | full-38 mean-volume Dice **0.7940**，NSD@2 **0.8094**（GT box、Memory-off、seed 20260731） |
