@@ -20,7 +20,7 @@
 
 ---
 
-## 当前主线状态（2026-08-05）
+## 当前主线状态（2026-08-09）
 
 ### 冻结主线
 
@@ -30,6 +30,8 @@
 - **特征**：冻结 MoonViT layer-18（center-only），离线缓存读取。
 - **接口契约**：Flow interface manifest v1.1（`label_id 1..25 → flow_class_id 0..24`）。
 - 冻结细节见 `docs/report/FLOW_MAIN_HANDOVER_STATUS_20260804.md` 与 `docs/report/FLOW_GT_ORACLE_AND_INTERFACE_STATUS_20260804.md`。
+- **初始化形状**：**Route B**，训推统一用 `get_octagon(get_quadrangle(box))` 从检测框中点构造 12 点八边形（`evolve_init: bbox_octagon` / `init: octagon`）；训练不再使用 GT 极值点。主线确认 2026-08-09，详见下方§训推初始化统一。
+- **外层 frac 采样**：**v4_10 MoG 连续采样**，centers `[0, 0.3333, 0.5, 0.80, 0.97]`，σ=0.05，15% 均匀底噪，开关 `v4_10_use_continuous_sampling: true`。主线确认 2026-08-09，详见下方§外层状态采样连续化。
 
 ### 关键数字（均 GT box、Memory-off、seed 20260731）
 
@@ -96,7 +98,7 @@ Rectangle 消融不矛盾——那次在冻结权重上只换推理侧形状（�
 详见 `docs/report/INIT_TRAIN_INFER_UNIFICATION_20260808.md` 与
 `data/outputs/init_unify/eval_dev5_gtbox_step600/COMPARISON.md`。
 
-### 外层状态采样连续化（2026-08-09，已实现，合同测试通过）
+### 外层状态采样连续化（2026-08-09，**v4_10 已确认为主线训练采样配置**）
 
 `frac` 语义（源码确证，勿反着读）：`i_init_train += full_disp * frac`、
 `x1_raw = full_disp * (1 - frac)`，所以 `frac` = **已走完的 GT 位移比例** = 外层进度。
@@ -131,7 +133,7 @@ Rectangle 消融不矛盾——那次在冻结权重上只换推理侧形状（�
 **实现状态（2026-08-09 已完成）**：
 - v4_10 branch 已插入 `lib/networks/diffusion/flow_matching_evolution.py`，
   门控开关 `v4_10_use_continuous_sampling: true`（优先级高于 v4_9 block，v4_9 推理调度不变）。
-  四臂实验配置：`configs/volmem/init_unify_route_B_v410.yaml`（Route B + v4_10）。
+  **主线配置**：`configs/volmem/init_unify_route_B_v410.yaml`（Route B + v4_10，2026-08-09 确认为主线训练配置）。
   commit: `01f5304`。
 
 **重采样链不一致（2026-08-09 已修）**：训练 control→128 一步，
@@ -298,7 +300,8 @@ python scripts/extract_sagittal_moonvit_features.py
 
 ## 更新日志
 
-- **2026-08-09**: 训推初始化统一 A/B 判定完成——三臂 dev5 GT-box 对照（1248 slices、step 600、唯一差异是 init 开关）：baseline 0.760831 → route_A 0.788292 → route_B 0.790968 前景切片 mDice，两条统一路线均 5W/0L；**主线定为 Route B**（训推都用检测框四边中点构造 12 点八边形，训练不再用 GT 极值点）。量化外层状态采样缺陷（frac≈0 仅 1.25%、28.3% 样本 ≥0.95 进度、discrete/infer_target 单位混用）并给出连续化重设计（frac≈0 → 17.78%、中位数 0.823 → 0.449）。**v4_10 连续采样已实现**（commit `01f5304`，门控 `v4_10_use_continuous_sampling`，四臂配置 `init_unify_route_B_v410.yaml`）。**重采样链不一致已修**（commit `67158bb`，合同测试 max |delta|=0.000000）
+- **2026-08-09**: 训推初始化统一 A/B 判定完成——三臂 dev5 GT-box 对照（1248 slices、step 600、唯一差异是 init 开关）：baseline 0.760831 → route_A 0.788292 → route_B 0.790968 前景切片 mDice，两条统一路线均 5W/0L；**主线定为 Route B**（训推都用检测框四边中点构造 12 点八边形，训练不再用 GT 极值点）。量化外层状态采样缺陷（frac≈0 仅 1.25%、28.3% 样本 ≥0.95 进度、discrete/infer_target 单位混用）并给出连续化重设计（frac≈0 → 17.78%、中位数 0.823 → 0.449）。**v4_10 连续采样已实现**（commit `01f5304`，门控 `v4_10_use_continuous_sampling`，四臂配置 `init_unify_route_B_v410.yaml`）。**重采样链不一致已修**（commit `67158bb`，合同测试 max |delta|=0.000000）。
+  **Route B（bbox_octagon 初始化）与 v4_10 MoG 连续采样均已确认为主线默认训练配置**（2026-08-09 用户批准）；第 4 臂训练结果收录后更新。
 - **2026-08-09**：评估协议定为项目硬要求——必须与 VerSe 论文（Sekuboyina 2021）+ 相关工作（Metrics Reloaded / nnU-Net / SpineNet）对齐；当前主线 5 处偏离待修（Dice 池化 / NSD·HD95 voxel / 无识别分离 / 无 spacing-mm）。规范见 `docs/report/eval_protocol_standard_20260809.md`，README 新增「评估协议标准」章节，AGENTS §5 加评估红线、§10 加 backlog。
 - **2026-08-08**: 训推初始化统一实验启动——定位并量化 init 不一致（控制点 102.4 px），两条统一路线合同测试通过（逐点精确相同），发现重采样链为第三个不一致源；训练臂进行中。docs 整理——历史留档迁入 `docs/archive/`（镜像原路径），`docs/report/` 只保留活文档；删除 636 个无唯一内容的文件（浏览器 profile 缓存、渲染自检截图、可重生成的 pptx），其余一律归档不删
 - **2026-08-07**: Pure-2D DiT-4 10k baseline 未保持 H1 质量，slim-B 判 NO-GO；bbox→初始轮廓 Rectangle 消融（开发集）；逐实例 2D 指标探索性重算（不替代正式指标）
