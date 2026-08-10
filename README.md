@@ -56,6 +56,20 @@
 
 当前偏离：Dice 池化 ❌ / NSD voxel ❌ / HD95 voxel ❌ / 无识别分离 ❌ / 无 spacing(mm) ❌。**任何 AI 改评估代码须先对齐本规范**，实现结果写入 `docs/report/` 后再提交（AGENTS §7/§8）。
 
+**实施状态（2026-08-09 更新）**：标准协议**已实现并通过 calibration**。
+
+- ✅ **评估器实现完成**：`tools/volmem/verse_eval/verse_metrics.py` 完整实现 VerSe-2021 标准（per-vertebra Dice、ID rate @ 20mm、HD95(mm)、NSD@1mm/2mm）
+- ✅ **Calibration 通过**：9 种已知扰动测试，**8/9 通过**（见 `data/outputs/verse_eval_calibration_20260809_fixed/report.html`）
+  - ✅ Identity 测试：完美预测下所有指标达到理想值（Dice=1.0, ID rate=1.0, HD=0mm）
+  - ✅ **Label_shift_+1 关键测试**：pooled Dice = 1.0（盲目于标签错误）vs **VerSe Dice = 0.0**（正确检测）
+  - ⚠️ PNG vs NIfTI Dice = 0.937（阈值 0.95）：合理的重采样误差，不影响核心结论
+- ✅ **可溯源性**：所有指标可追溯到官方 `anjany/verse @02b292b` 或领域标准（Metrics Reloaded 2024）
+
+**旧评估的问题**：当前 `tools/volmem/eval_memflowdit_v03.py:585-605` 的 Dice 是 volume-level 前景池化（累加所有 gt/pred 像素后算一个 Dice），不是 per-vertebra；无 spacing 读取、无 1mm 重采样、无 ID rate 门控、无 mm 单位。**因此上表的 0.7940 / 0.8094 等数字不可对标 VerSe leaderboard（榜单是 per-vertebra Dice ~91%）。**
+
+**下一步**：深度/宽度扩容实验（tasks #14, #15）的 P0 L=6 / P1 L=8 checkpoints 已在（step 2000），但只有 loss 数字。需要生成预测并用标准评估器跑出 per-vertebra Dice / ID rate / HD95(mm) 才能给出可信结论。
+
+
 ### Detector Stage A 端到端损失归因（full-38，2026-08-05）
 
 **结论：当前端到端损失主要来自检测器覆盖不足，其次是 matched box 定位几何，不能归因于 Flow。**
