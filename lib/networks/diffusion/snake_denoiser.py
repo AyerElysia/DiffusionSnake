@@ -3,6 +3,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from typing import Optional, Tuple
+from .dit_blocks import SinusoidalTimeEmbedding
 
 class TimeFiLM(nn.Module):
     """
@@ -30,31 +31,6 @@ class TimeFiLM(nn.Module):
         emb = self.time_mlp(t_emb)  # [B, 2*C]
         gamma, beta = torch.chunk(emb, 2, dim=1)  # [B, C], [B, C]
         return gamma, beta
-
-class SinusoidalTimeEmbedding(nn.Module):
-    """
-    Sinusoidal position embedding for time steps.
-    """
-    def __init__(self, dim: int):
-        super().__init__()
-        self.dim = dim
-        
-    def forward(self, t: torch.Tensor) -> torch.Tensor:
-        """
-        Args:
-            t: Time steps of shape [B]
-            
-        Returns:
-            Time embeddings of shape [B, dim]
-        """
-        half_dim = self.dim // 2
-        emb = math.log(10000) / (half_dim - 1)
-        emb = torch.exp(torch.arange(half_dim, device=t.device) * -emb)
-        emb = t.unsqueeze(1) * emb.unsqueeze(0)  # [B, dim//2]
-        emb = torch.cat([torch.sin(emb), torch.cos(emb)], dim=-1)  # [B, dim]
-        if self.dim % 2 == 1:  # if dim is odd, pad with zeros
-            emb = F.pad(emb, (0, 1), "constant", 0)
-        return emb
 
 class SnakeDenoiser(nn.Module):
     """

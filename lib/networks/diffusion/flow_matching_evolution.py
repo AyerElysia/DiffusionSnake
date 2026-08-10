@@ -69,62 +69,7 @@ class FlowMatchingEvolution(nn.Module):
         self.use_fourier_smooth = int(getattr(global_cfg, 'fourier_smooth_k', 0))
 
         # V3.7: Per-Point Output Head (per-point embedding + per-point linear)
-        if getattr(global_cfg, 'use_dit_v3_7', False):
-            from .dit_denoiser_v3_7 import DiTFlowMatchingV3_7
-            _pt_scale = float(getattr(global_cfg, 'v3_7_point_embed_scale', 0.1))
-            _lap_w = float(getattr(global_cfg, 'v3_7_laplacian_weight', 0.0))
-            _inject_in = bool(getattr(global_cfg, 'v3_7_inject_at_input', False))
-            _inject_out = bool(getattr(global_cfg, 'v3_7_inject_at_output', False))
-            _per_pt = bool(getattr(global_cfg, 'v3_7_use_per_point_head', True))
-            _f64_head = bool(getattr(global_cfg, 'v3_7_use_float64_head', False))
-            _reg_pt = bool(getattr(global_cfg, 'v3_7_use_regularized_per_point', False))
-            _delta_scale = float(getattr(global_cfg, 'v3_7_delta_scale', 0.1))
-            _delta_reg = float(getattr(global_cfg, 'v3_7_delta_reg_weight', 0.001))
-            _scale_cond = bool(getattr(global_cfg, 'v3_7_use_scale_conditioning', False))
-            _detail_ctx = bool(getattr(global_cfg, 'v3_7_use_detail_context', False))
-            _detail_curve_ctx = bool(getattr(global_cfg, 'v3_7_use_detail_curve_context', False))
-            _detail_curve_inject_mode = str(
-                getattr(global_cfg, 'v3_7_detail_curve_inject_mode', 'both')
-            ).strip().lower()
-            _detail_mode = str(getattr(global_cfg, 'v3_7_detail_context_mode', 'normal')).strip().lower()
-            _detail_mult = self._detail_feature_multiplier(_detail_mode) if _detail_ctx else 0
-            _global_ctx_mode = str(getattr(global_cfg, 'v3_7_global_context_mode', 'patch')).strip().lower()
-            _global_queries = int(getattr(global_cfg, 'v3_7_global_num_queries', 256))
-            print(f"[FlowMatchingEvolution] Using DiT Flow Network V3.7 "
-                  f"(per_point_head={_per_pt}, regularized={_reg_pt}, "
-                  f"float64_head={_f64_head}, "
-                  f"inject_in={_inject_in}, inject_out={_inject_out}, "
-                  f"scale_cond={_scale_cond}, detail_ctx={_detail_ctx}, "
-                  f"detail_curve_ctx={_detail_curve_ctx}, "
-                  f"detail_mode={_detail_mode}, "
-                  f"curve_inject={_detail_curve_inject_mode}, "
-                  f"global_ctx={_global_ctx_mode}, global_queries={_global_queries}, "
-                  f"ODE steps={ode_steps})")
-            self.denoiser = DiTFlowMatchingV3_7(
-                state_dim=dit_state_dim,
-                feature_dim=feature_dim,
-                num_layers=dit_num_layers,
-                num_heads=dit_num_heads,
-                num_points=num_points,
-                use_per_point_head=_per_pt,
-                use_float64_head=_f64_head,
-                use_regularized_per_point=_reg_pt,
-                delta_scale=_delta_scale,
-                delta_reg_weight=_delta_reg,
-                point_embed_scale=_pt_scale,
-                laplacian_weight=_lap_w,
-                inject_at_input=_inject_in,
-                inject_at_output=_inject_out,
-                use_scale_conditioning=_scale_cond,
-                use_detail_context=_detail_ctx,
-                use_detail_curve_context=_detail_curve_ctx,
-                detail_curve_inject_mode=_detail_curve_inject_mode,
-                detail_feature_dim=feature_dim * _detail_mult,
-                use_self_conditioning=bool(getattr(global_cfg, 'v3_7_use_self_conditioning', False)),
-                global_context_mode=_global_ctx_mode,
-                global_num_queries=_global_queries,
-            )
-        elif getattr(global_cfg, 'use_dit_v3_1', False):
+        if getattr(global_cfg, 'use_dit_v3_1', False):
             from .dit_denoiser_v3_1 import DiTDenoiserV3_1
             print(f"[FlowMatchingEvolution] Using DiT Flow Network V3.1 "
                   f"(Patchify + Self->Cross, ODE steps={ode_steps})")
@@ -134,43 +79,6 @@ class FlowMatchingEvolution(nn.Module):
                 num_layers=dit_num_layers,
                 num_heads=dit_num_heads,
                 num_points=num_points,
-            )
-        elif getattr(global_cfg, 'use_dit_v4_2', False):
-            from .dit_denoiser_v4_2 import DiTFlowMatchingV4_2
-            _detail_ctx = bool(
-                getattr(global_cfg, 'v4_2_use_detail_context', False)
-                or getattr(global_cfg, 'v4_1_use_detail_context', False)
-                or getattr(global_cfg, 'v3_4_use_detail_context', False)
-            )
-            _detail_mode = self._resolve_detail_context_mode(global_cfg)
-            _detail_mult = self._detail_feature_multiplier(_detail_mode) if _detail_ctx else 1
-            _use_pp_delta = bool(getattr(global_cfg, 'v4_2_use_per_point_delta', True))
-            _pp_delta_scale = float(getattr(global_cfg, 'v4_2_per_point_delta_scale', 0.10))
-            _pp_delta_reg = float(getattr(global_cfg, 'v4_2_per_point_delta_reg_weight', 0.0))
-            _use_curv_cond = bool(getattr(global_cfg, 'v4_2_use_curvature_conditioning', True))
-            _curv_scale = float(getattr(global_cfg, 'v4_2_curvature_embed_scale', 0.10))
-            _use_delta_gate = bool(getattr(global_cfg, 'v4_2_use_delta_gate', True))
-            _delta_gate_bias = float(getattr(global_cfg, 'v4_2_delta_gate_bias', -2.0))
-            print(f"[FlowMatchingEvolution] Using DiT Flow Network V4.2 "
-                  f"(detail_ctx={_detail_ctx}, detail_mode={_detail_mode}, "
-                  f"per_point_delta={_use_pp_delta}, delta_scale={_pp_delta_scale}, "
-                  f"delta_reg={_pp_delta_reg}, curvature_cond={_use_curv_cond}, "
-                  f"delta_gate={_use_delta_gate}, ODE steps={ode_steps})")
-            self.denoiser = DiTFlowMatchingV4_2(
-                state_dim=dit_state_dim,
-                feature_dim=feature_dim,
-                num_layers=dit_num_layers,
-                num_heads=dit_num_heads,
-                num_points=num_points,
-                use_detail_context=_detail_ctx,
-                detail_feature_dim=feature_dim * _detail_mult,
-                use_per_point_delta=_use_pp_delta,
-                per_point_delta_scale=_pp_delta_scale,
-                per_point_delta_reg_weight=_pp_delta_reg,
-                use_curvature_conditioning=_use_curv_cond,
-                curvature_embed_scale=_curv_scale,
-                use_delta_gate=_use_delta_gate,
-                delta_gate_bias=_delta_gate_bias,
             )
         elif getattr(global_cfg, 'use_dit_v4_1', False):
             from .dit_denoiser_v4_1 import DiTFlowMatchingV4_1
@@ -451,18 +359,6 @@ class FlowMatchingEvolution(nn.Module):
                 detail_feature_dim=feature_dim * _detail_mult,
             )
         # V3.6: V3 global query + iterative refinement + Flow Matching
-        elif getattr(global_cfg, 'use_dit_v3_6', False):
-            from .dit_denoiser_v3_6 import DiTFlowMatchingV3_6
-            print(f"[FlowMatchingEvolution] Using DiT Flow Network V3.6 "
-                  f"(V3 global query + iterative refinement, ODE steps={ode_steps})")
-            self.denoiser = DiTFlowMatchingV3_6(
-                state_dim=dit_state_dim,
-                feature_dim=feature_dim,
-                num_layers=dit_num_layers,
-                num_heads=dit_num_heads,
-                num_points=num_points,
-            )
-        # V3.2: Efficient Self+Cross Attention with Flow Matching
         elif getattr(global_cfg, 'use_dit_v3_2', False):
             from .dit_denoiser_v3_2 import DiTFlowMatchingV3_2
             print(f"[FlowMatchingEvolution] Using DiT Flow Network V3.2 "
