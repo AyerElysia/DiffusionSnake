@@ -487,7 +487,14 @@ def main(argv=None):
     dump_json(result_dir / "verse2021_per_scan.json", [item["scan"] for item in scan_results])
     dump_json(result_dir / "verse2021_per_vertebra.json", all_per_label)
 
-    visualization_path = result_dir / "routeb_step8000_visualization.png"
+    checkpoint_tag = (
+        "step{}".format(checkpoint_step)
+        if checkpoint_step >= 0
+        else checkpoint_path.stem
+    )
+    visualization_path = result_dir / "routeb_{}_visualization.png".format(
+        checkpoint_tag
+    )
     visualization_rows = make_visualization(
         visualization_path,
         evaluator,
@@ -552,7 +559,9 @@ def main(argv=None):
             "selected_slices": visualization_rows,
         },
     }
-    result_path = result_dir / "PURE2D_DETECTOR_FREE_STEP8000_RESULTS.json"
+    result_path = result_dir / "PURE2D_DETECTOR_FREE_{}_RESULTS.json".format(
+        checkpoint_tag.upper()
+    )
     dump_json(result_path, result)
     print(json.dumps({
         "status": "PASS",

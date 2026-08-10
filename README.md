@@ -98,15 +98,18 @@ missing/unexpected=0；构造后 Memory 参数=0、内置 detector 参数=0、�
 4 inner = 8 NFE。部署时把 GT 框替换为外部检测器输出的 `[B,N,6]`，其 512 输入坐标在进入
 128 Flow 网格前除以 `down_ratio=4`，初始化几何不变。
 
-已验证 checkpoint 为续训 `step_8000.pt`（SHA256
-`340e4a4734c003ac948e65a012cc11c8829b7589c7db68987c2be4e26fe2a7f7`）。在非锁定 Dev8
-（8 cases / 1123 slices，seed 20260731）上：VerSe-2021 scan-equal per-vertebra Dice
-**0.841594**，识别率 **1.000000**，maximum HD 均值 **7.0007 mm**，命中椎体 dmean
-**12.2042 mm**；前景切片 Dice **0.795535**、IoU **0.673552**，缺失椎体率 0。
-机器结果与可视化位于
-`data/outputs/depth_sweep/pure2d_mainline_l6_f256_routeb_v410_48h/inference/pure2d_detector_free_step8000_dev8_v1/`。
-历史同 Dev8/GT-box/8-NFE 的 A0 step2000 scan-equal Dice 为 0.767668；继续训练到 step8000
-后提高 0.073927。该对比支持“生成式演化不能因 loss 平台提前停止”的长训原则。
+已验证续训 `step_8000.pt`（SHA256 `340e4a4734c003ac948e65a012cc11c8829b7589c7db68987c2be4e26fe2a7f7`）
+和更新的 `step_10000.pt`（SHA256 `0f1a856b68bcacc9d85d52e91bab1a2efbbf7d7e3e06f781ef80543f88d98ad6`）。
+在同一非锁定 Dev8（8 cases / 1123 slices，seed 20260731）上，step10000 的 VerSe-2021
+scan-equal per-vertebra Dice 为 **0.851624**，识别率 **1.000000**，maximum HD 均值
+**6.7738 mm**，dmean hits-only **12.6295 mm**；前景切片 Dice **0.806135**、IoU
+**0.687948**，缺失椎体率 0。相对 step8000，8/8 扫描的 Dice 和 18/18 类别聚合 Dice
+均提高，scan-equal Dice +0.010029，maximum HD 均值改善 0.2269 mm；但 dmean hits-only
+反而增加 0.4253 mm，因此 step10000 是明确的 Dice 进步，尚非所有距离指标上的全面支配。
+最新机器结果与可视化位于
+`data/outputs/depth_sweep/pure2d_mainline_l6_f256_routeb_v410_48h/inference/pure2d_detector_free_step10000_dev8_v2/`。
+历史同 Dev8/GT-box/8-NFE 的 A0 step2000 scan-equal Dice 为 0.767668；step10000 相对提高
+0.083956。该轨迹继续支持“生成式演化不能因 loss 平台提前停止”的长训原则。
 
 ### Detector Stage A 端到端损失归因（full-38，2026-08-05）
 
@@ -365,7 +368,7 @@ python scripts/extract_sagittal_moonvit_features.py
 
 ## 更新日志
 
-- **2026-08-10**：新增并验证纯 2D 直接推理入口：物理网络 14,373,444 参数、Memory=0、内置 detector=0，GT 矩形框按 Route B 构造 12 点八边形，AB2 8 NFE。续训 step8000 在非锁定 Dev8 的 VerSe-2021 scan-equal Dice=0.841594、识别率=1.0、maximum HD=7.0007mm；可视化与完整机器结果已落盘。
+- **2026-08-10**：新增并验证纯 2D 直接推理入口：物理网络 14,373,444 参数、Memory=0、内置 detector=0，GT 矩形框按 Route B 构造 12 点八边形，AB2 8 NFE。续训 step10000 在非锁定 Dev8 的 VerSe-2021 scan-equal Dice=0.851624、识别率=1.0、maximum HD=6.7738mm；相对 step8000 为 8/8 scan Dice 胜出，但 dmean hits-only 增加 0.4253mm。可视化与完整机器结果已落盘。
 - **2026-08-09**：主线物理删除 Memory 参数：不再使用“完整模型 + Memory-off”的形式；当前 Flow 模型为 L6/F256、14,373,444 参数，Memory=0、内置 detector=0。外部检测器作为独立系统组件计数。新增纯 2D 长训配置和构造期硬门，P0 step2000 只提取纯 2D 基网权重作为初始化。
 - **2026-08-09**: 训推初始化统一 A/B 判定完成——三臂 dev5 GT-box 对照（1248 slices、step 600、唯一差异是 init 开关）：baseline 0.760831 → route_A 0.788292 → route_B 0.790968 前景切片 mDice，两条统一路线均 5W/0L；**主线定为 Route B**（训练取 GT 轮廓外接矩形框、推理取检测器矩形框，再以同一框中点规则构造12点八边形；训练不再用 GT 极值点）。量化外层状态采样缺陷（frac≈0 仅 1.25%、28.3% 样本 ≥0.95 进度、discrete/infer_target 单位混用）并给出连续化重设计（frac≈0 → 17.78%、中位数 0.823 → 0.449）。**v4_10 连续采样已实现**（commit `01f5304`，门控 `v4_10_use_continuous_sampling`，四臂配置 `init_unify_route_B_v410.yaml`）。**重采样链不一致已修**（commit `67158bb`，合同测试 max |delta|=0.000000）。
   **Route B（bbox_octagon 初始化）与 v4_10 MoG 连续采样均已确认为主线默认训练配置**（2026-08-09 用户批准）。
