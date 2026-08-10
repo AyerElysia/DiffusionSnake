@@ -14,6 +14,7 @@ from lib.utils.snake import snake_config, snake_voc_utils
 _MANIFEST_SPLITS = {
     'train': 'training',
     'val': 'validation',
+    'dev': 'training',
     'mini': 'training',
     'test': 'test',
 }
@@ -121,6 +122,120 @@ class Dataset(VocDataset):
         if text is None:
             return None
         return os.path.realpath(os.path.abspath(os.path.expanduser(text)))
+
+    @staticmethod
+    def _canonical_case_ids(value, description):
+        if value is None:
+            return ()
+        if isinstance(value, str):
+            raw_values = value.split(',')
+        else:
+            try:
+                raw_values = list(value)
+            except TypeError as exc:
+                raise ValueError('{} must be a string or sequence'.format(
+                    description
+                )) from exc
+        parsed = []
+        for raw in raw_values:
+            case_id = str(raw).strip()
+            if not case_id:
+                continue
+            if (
+                case_id in ('.', '..')
+                or os.path.basename(case_id) != case_id
+                or '/' in case_id
+                or '\\' in case_id
+            ):
+                raise ValueError('{} contains unsafe case_id={!r}'.format(
+                    description, case_id
+                ))
+            parsed.append(case_id)
+        if len(parsed) != len(set(parsed)):
+            raise ValueError('{} contains duplicate case IDs'.format(description))
+        return tuple(parsed)
+
+    def _apply_case_partition(self, rows):
+        available = {row['case_id'] for row in rows}
+        train_exclude = self._canonical_case_ids(
+            getattr(cfg, 'sagittal_train_exclude_case_ids', ()),
+            'cfg.sagittal_train_exclude_case_ids',
+        )
+        eval_include = self._canonical_case_ids(
+            getattr(cfg, 'sagittal_eval_include_case_ids', ()),
+            'cfg.sagittal_eval_include_case_ids',
+        )
+        forbidden = set(self._canonical_case_ids(
+            getattr(cfg, 'sagittal_forbidden_case_ids', ()),
+            'cfg.sagittal_forbidden_case_ids',
+        ))
+
+        if self.split == 'train':
+            missing = set(train_exclude).difference(available)
+            if missing:
+                raise ValueError('Training exclusion cases are absent from the '
+                                 'manifest split: {}'.format(sorted(missing)))
+            selected = [
+                row for row in rows if row['case_id'] not in set(train_exclude)
+            ]
+            expected_cases = int(getattr(
+                cfg, 'sagittal_expected_train_case_count', 0
+            ))
+            expected_rows = int(getattr(
+                cfg, 'sagittal_expected_train_row_count', 0
+            ))
+            policy = 'training-minus-exact-dev-cases'
+        elif self.split == 'dev':
+            if not eval_include:
+                raise ValueError(
+                    'The dev split requires cfg.sagittal_eval_include_case_ids'
+                )
+            missing = set(eval_include).difference(available)
+            if missing:
+                raise ValueError('Development cases are absent from the '
+                                 'training manifest split: {}'.format(sorted(missing)))
+            selected = [
+                row for row in rows if row['case_id'] in set(eval_include)
+            ]
+            expected_cases = int(getattr(
+                cfg, 'sagittal_expected_eval_case_count', 0
+            ))
+            expected_rows = int(getattr(
+                cfg, 'sagittal_expected_eval_row_count', 0
+            ))
+            policy = 'exact-development-case-allowlist'
+        else:
+            selected = rows
+            expected_cases = 0
+            expected_rows = 0
+            policy = 'manifest-split-unfiltered'
+
+        selected_cases = sorted({row['case_id'] for row in selected})
+        forbidden_selected = forbidden.intersection(selected_cases)
+        if forbidden_selected:
+            raise ValueError('Forbidden locked cases selected: {}'.format(
+                sorted(forbidden_selected)
+            ))
+        if expected_cases and len(selected_cases) != expected_cases:
+            raise ValueError('Expected {} cases for {}, got {}'.format(
+                expected_cases, policy, len(selected_cases)
+            ))
+        if expected_rows and len(selected) != expected_rows:
+            raise ValueError('Expected {} rows for {}, got {}'.format(
+                expected_rows, policy, len(selected)
+            ))
+        self.case_partition_audit = {
+            'policy': policy,
+            'manifest_split': self.manifest_split,
+            'selected_case_ids': selected_cases,
+            'selected_case_count': len(selected_cases),
+            'selected_row_count': len(selected),
+            'train_exclude_case_ids': list(train_exclude),
+            'eval_include_case_ids': list(eval_include),
+            'forbidden_case_ids': sorted(forbidden),
+            'forbidden_selected': [],
+        }
+        return selected
 
     def __init__(self, ann_file, data_root, split):
         data.Dataset.__init__(self)
@@ -285,7 +400,7 @@ class Dataset(VocDataset):
                 )
             )
 
-        rows = self._read_manifest()
+        rows = self._apply_case_partition(self._read_manifest())
         self._case_rows = self._group_case_rows(rows)
         self.records = [row for case_rows in self._case_rows.values() for row in case_rows]
         if split == 'mini' and self.records:

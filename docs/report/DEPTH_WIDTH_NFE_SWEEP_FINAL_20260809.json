@@ -1,0 +1,93 @@
+{
+  "schema": "diffusionsnake.depth_width_nfe_sweep_final.v1",
+  "status": "PASS_DECISION_COMPLETE",
+  "date": "2026-08-09",
+  "decision": {
+    "architecture": "L6/F256",
+    "inference_schedule": "AB2, 2 outer x 4 inner",
+    "nfe_per_prediction": 8,
+    "reason": "L8/F256 adds cost without improving the primary metrics; 4 NFE clearly degrades quality; 12 NFE does not improve native volume Dice over 8 NFE."
+  },
+  "fixed_protocol": {
+    "arm": "P0",
+    "checkpoint_step": 2000,
+    "case_ids": [
+      "sub-verse022",
+      "sub-verse024",
+      "sub-verse071",
+      "sub-verse150",
+      "sub-verse264"
+    ],
+    "slice_count": 1248,
+    "box_mode": "gt",
+    "memory_mode": "parallel-off",
+    "parallel_batch_size": 16,
+    "seed": 20260731,
+    "ode_solver": "ab2",
+    "outer_steps": 2,
+    "outer_fractions": [0.6667, 1.0],
+    "locked_case_opens": 0
+  },
+  "nfe_results": {
+    "4": {
+      "inner_steps_per_outer": 2,
+      "volume_mean_dice": 0.7892260566268499,
+      "foreground_slice_mean_dice": 0.7516378182942627,
+      "class_mean_dice": 0.725665094076756,
+      "peak_cuda_memory_gb": 4.9565958976745605,
+      "denoiser_calls_for_4340_boxes": 17360,
+      "delta_vs_8": {
+        "volume_mean_dice": -0.0118226820497828,
+        "foreground_slice_mean_dice": -0.0175645047998494,
+        "class_mean_dice": -0.0200722640037115
+      },
+      "result_sha256": "3a4e255fb57b5a51df2c97c26ece50c02aee3859c2a0aecb88f6b4663357f4a2"
+    },
+    "8": {
+      "inner_steps_per_outer": 4,
+      "volume_mean_dice": 0.8010487386766327,
+      "foreground_slice_mean_dice": 0.7692023230941121,
+      "class_mean_dice": 0.7457373580804675,
+      "peak_cuda_memory_gb": 4.9565958976745605,
+      "denoiser_calls_for_4340_boxes": 34720,
+      "verse2021_scan_equal_dice": 0.7869666341450544,
+      "verse2021_identification_rate": 1.0,
+      "project_nsd_at_2mm": 0.7935148649345155,
+      "project_hd95_mm": 4.186769670185586,
+      "result_sha256": "c876879a55325c72b69ff74c98a7b056741833a263620e4c9bca60b2ccccd5e8"
+    },
+    "12": {
+      "inner_steps_per_outer": 6,
+      "volume_mean_dice": 0.8004873475614611,
+      "foreground_slice_mean_dice": 0.7701838350318821,
+      "class_mean_dice": 0.7464683356435988,
+      "peak_cuda_memory_gb": 4.9565958976745605,
+      "denoiser_calls_for_4340_boxes": 52080,
+      "delta_vs_8": {
+        "volume_mean_dice": -0.0005613911151716,
+        "foreground_slice_mean_dice": 0.00098151193777,
+        "class_mean_dice": 0.0007309775631313
+      },
+      "per_volume_volume_dice_delta_vs_8": {
+        "sub-verse022": -0.0010577786455125,
+        "sub-verse024": -0.0000739559213987,
+        "sub-verse071": -0.0010995122907976,
+        "sub-verse150": -0.0020200785679829,
+        "sub-verse264": 0.0014443698498339
+      },
+      "result_sha256": "91f844b87d32e476bf81496f1f94a6189c927e52cd2cf1d967dbb82b7ff7cea0"
+    }
+  },
+  "interpretation": {
+    "nfe4": "Rejected: quality drops materially on all three native aggregate metrics.",
+    "nfe12": "Rejected as default: 50% more denoiser evaluations than 8 NFE, no volume-Dice gain, and 4 of 5 volumes have lower volume Dice.",
+    "timing": "Wall-clock evaluation times are not used for ranking because shared-storage I/O dominated and even made 4 NFE slower than 8 NFE.",
+    "boundary": "Dev5 is a fixed non-locked development cohort, not the final independent test set. NFE4 and NFE12 are native-metric screens; the full VerSe-2021 physical evaluation is retained for NFE8."
+  },
+  "coordinate_contract": {
+    "issue": "GT boxes were in 512-input coordinates while the sampled feature map was 128x128.",
+    "fix": "Divide boxes by snake_config.down_ratio before direct octagon initialization.",
+    "source_sha256": "03c07e07cbd7f9f1eee4333e2900ee4b845d5ef7c88415376ec87603ac83e477",
+    "test_sha256": "d124a7b9183be9c9ede39c0ca58198632fb10b70728f5c40cc20cd06b7976589"
+  }
+}

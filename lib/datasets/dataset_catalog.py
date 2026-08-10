@@ -93,6 +93,12 @@ class DatasetCatalog(object):
             'ann_file': '/home/medteam/Zhrch/detect_3D_lgz2/datasets/sagittal_2d_fixed/manifests/slice_manifest.csv',
             'split': 'val'
         },
+        'VolMemDev8': {
+            'id': 'sagittal_2d_fixed',
+            'data_root': '/home/medteam/Zhrch/detect_3D_lgz2/datasets/sagittal_2d_fixed',
+            'ann_file': '/home/medteam/Zhrch/detect_3D_lgz2/datasets/sagittal_2d_fixed/manifests/slice_manifest.csv',
+            'split': 'dev'
+        },
         'VolMemTest': {
             'id': 'sagittal_2d_fixed',
             'data_root': '/home/medteam/Zhrch/detect_3D_lgz2/datasets/sagittal_2d_fixed',

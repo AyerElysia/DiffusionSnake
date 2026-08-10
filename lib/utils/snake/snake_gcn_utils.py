@@ -56,12 +56,12 @@ def prepare_testing(output):
         c_it_py = torch.zeros_like(i_it_py)
     else:
         if snake_config.init == 'octagon':
-            # Build i_it_py directly at full image scale to match the training chain:
-            #   box -> quadrangle -> octagon(12pts) -> uniform_upsample(poly_num)
-            # Avoids the /4 stride-scaling and double-upsample that i_it_4py carries.
-            # i_it_4py stays at feature-map (/4) coords for GCN feature extraction.
+            # Detector boxes are expressed in 512-input coordinates, whereas
+            # Flow and the training ``i_gt_py`` polygons use stride-4 feature
+            # coordinates.  Build the direct 128-point octagon used by the
+            # bbox-octagon training route, but only after converting scales.
             _valid = score > 1e-4
-            _valid_boxes = box[_valid]          # [M, 4] full-scale image coords
+            _valid_boxes = box[_valid] / float(snake_config.down_ratio)
             i_it_py = _box_to_octagon_init(_valid_boxes, snake_config.poly_num)
         else:
             i_it_py = uniform_upsample(i_it_4py.unsqueeze(0), snake_config.poly_num)[0]
