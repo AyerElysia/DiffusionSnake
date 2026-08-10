@@ -67,6 +67,30 @@ class FlowMatchingEvolution(nn.Module):
             or getattr(global_cfg, 'use_dit_v4_2', False)
         )
         self.use_fourier_smooth = int(getattr(global_cfg, 'fourier_smooth_k', 0))
+        self.routeb_box_jitter_config = (
+            snake_gcn_utils.resolve_routeb_box_jitter_config(global_cfg)
+        )
+        if self.routeb_box_jitter_config['enabled']:
+            init_source = str(
+                getattr(global_cfg, 'diffusion_init_source', 'extreme')
+            ).strip().lower()
+            if init_source not in (
+                'gt_box_octagon',
+                'gt_bbox_octagon',
+                'box_octagon',
+                'bbox_octagon',
+            ):
+                raise ValueError(
+                    'routeb_box_jitter_enabled requires bbox-octagon training init'
+                )
+            print(
+                '[RouteBBoxJitter] enabled '
+                f"probabilities={self.routeb_box_jitter_config['probabilities']} "
+                f"shift={self.routeb_box_jitter_config['shift_fractions']} "
+                f"log_scale={self.routeb_box_jitter_config['log_scale_fractions']} "
+                f"edge={self.routeb_box_jitter_config['edge_fractions']} "
+                f"min_iou={self.routeb_box_jitter_config['min_iou']}"
+            )
 
         # V3.7: Per-Point Output Head (per-point embedding + per-point linear)
         if getattr(global_cfg, 'use_dit_v3_1', False):
@@ -2343,7 +2367,23 @@ class FlowMatchingEvolution(nn.Module):
                     )
             init_source = str(getattr(global_cfg, 'diffusion_init_source', 'extreme')).strip().lower()
             if init_source in ('gt_box_octagon', 'gt_bbox_octagon', 'box_octagon', 'bbox_octagon'):
-                train_dict = snake_gcn_utils.replace_training_init_with_gt_box_octagon(train_dict)
+                train_dict, box_jitter_stats = (
+                    snake_gcn_utils.replace_training_init_with_gt_box_octagon(
+                        train_dict,
+                        jitter_config=self.routeb_box_jitter_config,
+                        image_hw=(cnn_feature.size(2), cnn_feature.size(3)),
+                        return_jitter_stats=True,
+                    )
+                )
+                severity_counts = box_jitter_stats.get(
+                    'routeb_box_jitter_severity_counts'
+                )
+                if isinstance(severity_counts, torch.Tensor):
+                    for severity_index, severity_count in enumerate(severity_counts):
+                        box_jitter_stats[
+                            f'routeb_box_jitter_severity_{severity_index}_count'
+                        ] = severity_count
+                ret.update(box_jitter_stats)
                 ret['diffusion_init_source'] = init_source
             elif (
                 bool(getattr(global_cfg, 'use_pred_extreme_init_for_diffusion', False))

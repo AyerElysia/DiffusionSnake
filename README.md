@@ -35,6 +35,16 @@
 - **模型边界**：Flow 模型组件为 **14,373,444 参数**，Memory 参数 **0**，内置 heatmap detector 参数 **0**；`flow_box_only` 后端在训练时接收 GT 框、部署时接收经校验的外部检测框。检测器是单独系统组件，不计入 Flow 模型参数。历史 39,865,760 参数模型只作证据来源，不再作为训练/推理主线。
 - **训练入口**：`diffusion_train.py` + `configs/volmem/depth_sweep/pure2d_mainline_l6_f256_routeb_v410_48h.yaml`。训练配置中不再存在 `memory_capacity`、`memory_dim`、Memory reader/controller 或 memory learning-rate 参数。
 
+### 抗检测框扰动候选训练（2026-08-10）
+
+- 该训练**不改变已验证主线结构**：仍为 L6/F256、Route B、v4.10、8 NFE、14,373,444 参数、Memory=0、内置 detector=0；它只在训练侧 GT 外接框进入 `bbox -> octagon -> 128点` 之前加入框扰动，GT 轮廓、类别与监督目标保持精确。
+- 配置：`configs/volmem/depth_sweep/pure2d_mainline_l6_f256_routeb_v410_robustbox_resume15500.yaml`；失败关闭启动器：`tools/volmem/depth_sweep_tools/run_pure2d_robustbox_training.py`。严格从干净主线 `step_15500.pt` 续训到绝对 `step_180000`，剩余 164,500 updates，按隔离卡约 1 s/update 估计约 45.7 小时，仍按“两天训练”管理；不得按 loss 平台或 Dev 波动早停。
+- 因输入框课程从 clean Route-B 切换为 jitter mix，launcher 只对白名单源 cfg hash `d0d0075c0b703e5c363ef26ca5661e538264eea285a2341a38fbab6821f879d0` 放行一次显式配置迁移；模型权重仍 `strict=True`，optimizer、scheduler、epoch/step 与 RNG 全量恢复。source/target hash 和 transition id 同时写入 launch manifest 与后续 checkpoint，禁止悄悄退化为 weights-only。
+- 检查点每 500 step 保存；滚动保留最近 12 个，同时永久保留 `20k/40k/.../180k` 阶段锚点，其余 step 检查点在保存后立即清理。`latest.pt` 始终原子更新，源 `step_15500.pt` 位于既有训练输出中且不参与本次清理。
+- 扰动混合固定为 clean/mild/medium/severe=`0.35/0.40/0.20/0.05`；依次使用中心偏移上限 `0/5%/10%/15%`、各向异性 log-scale 上限 `0/10%/20%/30%`、单边误差上限 `0/3%/8%/15%`，并投影到 `IoU>=0.20`。clean 分支与原 Route-B 完全相同。
+- 这是**抗框几何误差候选**，在同一 Dev8 上完成 clean GT-box、固定扰动分层和真实 detector matched-box 配对评估前，不替代已验证主线。它不能修复 detector 漏检；完整部署仍须单独报告 coverage/missing。
+- 只允许在本原仓库和既有 `data/outputs/depth_sweep/` 内运行一份；实际启动/失败/完成状态以该输出下 `PURE2D_TRAINING_LAUNCH.json` 为准，不创建新顶层仓库或 worktree。
+
 ### 关键数字（历史筛选均为 GT box、Memory-off 隔离评估、seed 20260731；新主线为物理无 Memory 网络）
 
 | 实验 | 协议 | Volume Dice |
@@ -273,9 +283,11 @@ Rectangle 消融不矛盾——那次在冻结权重上只换推理侧形状（�
 | `diffusion_train.py` | 当前纯 2D Flow 训练入口；构造时硬断言 Memory=0、内置 detector=0、参数量=14,373,444 |
 | `tools/volmem/eval_memflowdit_parallel.py` | 整卷并行评估、蒸馏轨迹缓存 |
 | `tools/volmem/depth_sweep_tools/run_pure2d_detector_free_inference.py` | 当前主线无 Memory、无内置检测器的直接推理、Dev8 3D 指标与 Route-B 可视化 |
+| `tools/volmem/depth_sweep_tools/test_routeb_box_jitter.py` | Route-B 框扰动的 clean 等价、边界、IoU 与共享 40/128 点初始化合同测试 |
 | `tools/volmem/distill_output_head.py` | H1/H2 输出头蒸馏、权重移植、参数统计 |
 | `tools/volmem/compute_stage_a_metrics.py` | Stage A 冻结指标（NSD@2 / HD95） |
 | `configs/volmem/depth_sweep/pure2d_mainline_l6_f256_routeb_v410_48h.yaml` | 当前 L6/F256、Route B、v4.10、8-NFE、无 Memory 长训配置 |
+| `configs/volmem/depth_sweep/pure2d_mainline_l6_f256_routeb_v410_robustbox_resume15500.yaml` | 同结构、从 step15500 严格续训的约两天抗检测框扰动候选配置 |
 | `scripts/extract_sagittal_moonvit_features.py` | MoonViT 特征离线提取 |
 
 ### 工作留档（docs/report/）

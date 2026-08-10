@@ -142,6 +142,71 @@ def _config_hash(config):
     return hashlib.sha256(normalized.dump().encode('utf-8')).hexdigest()
 
 
+def _validate_formal_resume_cfg_hash(checkpoint_cfg_hash, current_cfg_hash):
+    """Validate strict-resume identity, including an explicit audited transition.
+
+    A scientific configuration change normally invalidates a formal strict
+    resume. The only exception is a launcher-authorized transition tied to the
+    exact source checkpoint hash. Model, optimizer, scheduler, progress and RNG
+    restoration remain strict; this merely records that the input curriculum
+    intentionally changed at the resume boundary.
+    """
+    checkpoint_cfg_hash = str(checkpoint_cfg_hash)
+    current_cfg_hash = str(current_cfg_hash)
+    if checkpoint_cfg_hash == current_cfg_hash:
+        return None
+
+    expected_source = os.environ.get(
+        'FORMAL_RESUME_EXPECTED_SOURCE_CFG_HASH', ''
+    ).strip()
+    transition_id = os.environ.get(
+        'FORMAL_RESUME_CONFIG_TRANSITION_ID', ''
+    ).strip()
+    if not expected_source or not transition_id:
+        raise RuntimeError(
+            'formal resume cfg hash mismatch: '
+            f'checkpoint={checkpoint_cfg_hash} current={current_cfg_hash}'
+        )
+    if checkpoint_cfg_hash != expected_source:
+        raise RuntimeError(
+            'formal resume source cfg hash does not match the authorized '
+            f'transition: checkpoint={checkpoint_cfg_hash} '
+            f'expected_source={expected_source} current={current_cfg_hash}'
+        )
+    if len(transition_id) > 128 or any(
+        character not in 'abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789._-'
+        for character in transition_id
+    ):
+        raise RuntimeError(
+            'FORMAL_RESUME_CONFIG_TRANSITION_ID must be a non-empty safe token '
+            'of at most 128 characters'
+        )
+    return {
+        'transition_id': transition_id,
+        'source_cfg_hash': checkpoint_cfg_hash,
+        'target_cfg_hash': current_cfg_hash,
+    }
+
+
+def _step_checkpoint_paths_to_remove(step_paths, keep_recent, milestone_steps):
+    """Return non-recent, non-milestone step checkpoints for pruning."""
+    keep_recent = int(keep_recent)
+    if keep_recent <= 0:
+        raise ValueError('keep_recent must be positive')
+    milestones = {int(step) for step in milestone_steps}
+    ordered = sorted(
+        step_paths,
+        key=lambda item: int(item.stem.split('_', 1)[1]),
+    )
+    recent = set(ordered[-keep_recent:])
+    return [
+        path
+        for path in ordered
+        if path not in recent
+        and int(path.stem.split('_', 1)[1]) not in milestones
+    ]
+
+
 def _capture_rng_state():
     state = {
         'python': random.getstate(),
@@ -686,12 +751,22 @@ def main():
     )
     if step_checkpoint_every < 0 or step_checkpoint_keep <= 0:
         raise ValueError('step checkpoint interval must be >= 0 and retention must be > 0')
+    try:
+        step_checkpoint_milestones = {
+            int(step)
+            for step in getattr(cfg.train, 'step_checkpoint_milestones', ())
+        }
+    except (TypeError, ValueError) as error:
+        raise ValueError('step checkpoint milestones must be integer steps') from error
+    if any(step <= 0 for step in step_checkpoint_milestones):
+        raise ValueError('step checkpoint milestones must be positive')
     resume_step = 0
     resume_epoch = 0
     resume_step_in_epoch = 0
     resume_json_pos = None
     resume_checkpoint = None
     strict_resume = False
+    resume_cfg_transition = None
     resume_path = os.environ.get('ONE_SAMPLE_RESUME_PATH', '').strip()
     if not resume_path:
         resume_path = str(getattr(cfg, 'resume_path', '') or '').strip()
@@ -885,10 +960,19 @@ def main():
                         raise RuntimeError(
                             f"formal resume checkpoint is missing required fields: {missing_fields}"
                         )
-                    if str(resume_checkpoint['cfg_hash']) != str(cfg_hash):
-                        raise RuntimeError(
-                            'formal resume cfg hash mismatch: '
-                            f"checkpoint={resume_checkpoint['cfg_hash']} current={cfg_hash}"
+                    inherited_transition = resume_checkpoint.get('resume_cfg_transition')
+                    if isinstance(inherited_transition, dict):
+                        resume_cfg_transition = dict(inherited_transition)
+                    approved_transition = _validate_formal_resume_cfg_hash(
+                        resume_checkpoint['cfg_hash'], cfg_hash
+                    )
+                    if approved_transition is not None:
+                        resume_cfg_transition = approved_transition
+                        logger.warning(
+                            'Authorized strict-resume config transition: '
+                            f"id={approved_transition['transition_id']} "
+                            f"source={approved_transition['source_cfg_hash']} "
+                            f"target={approved_transition['target_cfg_hash']}"
                         )
                     checkpoint_run_id = str(resume_checkpoint['run_id'])
                     configured_run_id = os.environ.get('TRAIN_RUN_ID', '').strip()
@@ -1369,6 +1453,8 @@ def main():
             'step_in_epoch': int(step_in_epoch),
             'rng': _capture_rng_state(),
         }
+        if resume_cfg_transition is not None:
+            ckpt['resume_cfg_transition'] = dict(resume_cfg_transition)
         if epoch is not None:
             ckpt['epoch'] = int(epoch)
         if total_steps is not None:
@@ -1377,11 +1463,12 @@ def main():
         if step_file:
             ckpt_path = os.path.join(ckpt_dir, f'step_{int(step)}.pt')
             _atomic_torch_save(ckpt, ckpt_path)
-            step_paths = sorted(
-                Path(ckpt_dir).glob('step_*.pt'),
-                key=lambda item: int(item.stem.split('_', 1)[1]),
-            )
-            for old_path in step_paths[:-step_checkpoint_keep]:
+            step_paths = list(Path(ckpt_dir).glob('step_*.pt'))
+            for old_path in _step_checkpoint_paths_to_remove(
+                step_paths,
+                step_checkpoint_keep,
+                step_checkpoint_milestones,
+            ):
                 old_path.unlink()
         elif epoch is not None:
             ckpt_path = os.path.join(
