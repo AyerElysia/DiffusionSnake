@@ -1,0 +1,109 @@
+{
+  "schema": "diffusionsnake-depth-width-dev5-final-v1",
+  "status": "PASS_RETAIN_L6_F256",
+  "date": "2026-08-09",
+  "cohort": {
+    "case_ids": [
+      "sub-verse022",
+      "sub-verse024",
+      "sub-verse071",
+      "sub-verse150",
+      "sub-verse264"
+    ],
+    "slices": 1248,
+    "locked_cases_opened": 0,
+    "box_mode": "gt",
+    "memory_mode": "parallel-off",
+    "seed": 20260731,
+    "schedule": "2 outer x 4 AB2 = 8 NFE",
+    "batch_size": 16
+  },
+  "inference_coordinate_fix": {
+    "root_cause": "detector boxes in 512-input coordinates were used directly to sample a 128x128 stride-4 feature grid",
+    "down_ratio": 4.0,
+    "broken_to_fixed_coordinate_ratio": 4.0,
+    "training_direct_octagon_exact_after_fix": true,
+    "source_sha256": "03c07e07cbd7f9f1eee4333e2900ee4b845d5ef7c88415376ec87603ac83e477",
+    "test_sha256": "d124a7b9183be9c9ede39c0ca58198632fb10b70728f5c40cc20cd06b7976589"
+  },
+  "h1_anchor": {
+    "checkpoint_step": 2300,
+    "parameter_count": 39865760,
+    "native_volume_mean_dice": 0.7969925991481455,
+    "verse2021_scan_equal_dice_mean": 0.7825121483976657,
+    "nsd_at_2mm_mean": 0.7873776366355374,
+    "missing_label_count": 0,
+    "result_sha256": "dd5d76e2e0d2ee03e5ceeefe0895036c12cb661b5f43eeafe5bf927d95862d96"
+  },
+  "arms": {
+    "P0_L6_F256": {
+      "parameter_count": 39865760,
+      "trainable_parameter_count": 16557636,
+      "peak_cuda_memory_gb": 4.9565958976745605,
+      "native_volume_mean_dice": 0.8010487386766327,
+      "foreground_slice_mean_dice": 0.7692023230941121,
+      "class_mean_dice": 0.7457373580804675,
+      "verse2021_scan_equal_dice_mean": 0.7869666341450544,
+      "verse2021_scan_equal_dmean_mm": 11.878716563570508,
+      "verse2021_scan_equal_maximum_hd_mm": 12.327692415790233,
+      "identification_rate": 1.0,
+      "nsd_at_2mm_mean": 0.7935148649345155,
+      "hd95_mm_mean": 4.186769670185586,
+      "foreground_ratio_mean": 1.0429270166244533,
+      "missing_label_count": 0,
+      "result_sha256": "c876879a55325c72b69ff74c98a7b056741833a263620e4c9bca60b2ccccd5e8"
+    },
+    "P1_L8_F256": {
+      "parameter_count": 43708384,
+      "trainable_parameter_count": 20400260,
+      "peak_cuda_memory_gb": 5.157589435577393,
+      "native_volume_mean_dice": 0.8003980693072521,
+      "foreground_slice_mean_dice": 0.7692530970362692,
+      "class_mean_dice": 0.7459473674604961,
+      "verse2021_scan_equal_dice_mean": 0.7865629888067995,
+      "verse2021_scan_equal_dmean_mm": 11.9829675643979,
+      "verse2021_scan_equal_maximum_hd_mm": 12.226271690017208,
+      "identification_rate": 1.0,
+      "nsd_at_2mm_mean": 0.7925348130324326,
+      "hd95_mm_mean": 4.176719148499458,
+      "foreground_ratio_mean": 1.038357014291403,
+      "missing_label_count": 0,
+      "result_sha256": "c8c4de3dead9de51c1341cb0a4969ba94c623d92d9c574c4882e234f3746ecd7"
+    }
+  },
+  "delta_P1_minus_P0": {
+    "parameter_count": 3842624,
+    "parameter_relative": 0.0963909875015053,
+    "trainable_parameter_relative": 0.2320720229521873,
+    "peak_cuda_memory_gb": 0.20099353790283203,
+    "native_volume_mean_dice": -0.0006506693693806298,
+    "foreground_slice_mean_dice": 0.000050773942157134044,
+    "class_mean_dice": 0.00021000938002857517,
+    "verse2021_scan_equal_dice_mean": -0.0004036453382548766,
+    "verse2021_scan_equal_dmean_mm": 0.10425100082739114,
+    "verse2021_scan_equal_maximum_hd_mm": -0.10142072577302308,
+    "nsd_at_2mm_mean": -0.0009800519020829457,
+    "hd95_mm_mean": -0.010050521686127745,
+    "foreground_ratio_mean": -0.0045700023330503825,
+    "per_case_native_volume_dice": {
+      "sub-verse022": -0.00039869604675857317,
+      "sub-verse024": -0.0009991306563698066,
+      "sub-verse071": -0.0007208540225757121,
+      "sub-verse150": -0.0004707605418052818,
+      "sub-verse264": -0.0006639055793938864
+    }
+  },
+  "paired_training_runtime_steps_101_2000": {
+    "P0_mean_ms": 9251.210579872131,
+    "P1_mean_ms": 9776.51376536018,
+    "P1_minus_P0_mean_ms": 525.3031854880484,
+    "P1_relative_slowdown": 0.05678210229382863,
+    "P1_slower_step_fraction": 0.8042105263157895
+  },
+  "decision": {
+    "retain": "P0 L6/F256",
+    "reject": "P1 L8/F256 as a mainline replacement",
+    "reason": "L8 increases capacity and memory while all five case-level native volume Dice values, scan-equal VerSe Dice, NSD@2mm, and dmean are no better overall",
+    "timing_note": "single evaluation wall-clock values are not used for ranking because the P0 window overlapped CPU-only H1 surface computation; paired training step timing is reported separately"
+  }
+}

@@ -8,6 +8,7 @@ import math
 import os
 import pathlib
 import random
+import re
 import subprocess
 import sys
 import time
@@ -328,10 +329,15 @@ def load_memflow_weights(model, checkpoint_path):
             ].clone()
             adapted.append(evidence_value_target + "<-" + source_key)
     info = model.load_state_dict(compatible, strict=False)
-    if len(compatible) < int(len(target) * 0.80):
+    # Depth-sweep: the guard exists to catch a mis-specified checkpoint. A
+    # deliberate depth increase legitimately lowers the pretrained fraction
+    # (each new DiT layer adds 18 block keys + 9 memflow-adapter keys), so the
+    # threshold is config-driven. Default 0.80 == previous hardcoded behaviour.
+    min_ratio = float(getattr(cfg.train, "memflow_min_compat_ratio", 0.80))
+    if len(compatible) < int(len(target) * min_ratio):
         raise RuntimeError(
-            "MemFlow checkpoint compatibility below 80%: {}/{}".format(
-                len(compatible), len(target)
+            "MemFlow checkpoint compatibility below {:.1f}%: {}/{}".format(
+                min_ratio * 100.0, len(compatible), len(target)
             )
         )
     print(
@@ -354,8 +360,24 @@ def build_optimizer(model):
     locate_mult = float(getattr(cfg.train, "locate_lr_multiplier", 1.0))
     memory_mult = float(getattr(cfg.train, "memory_lr_multiplier", 1.0))
     detail_mult = float(getattr(cfg.train, "detail_lr_multiplier", 1.0))
+    # Depth-sweep: freshly-added DiT layers (index >= new_layer_base_depth) are
+    # identity at init (adaLN_modulation[-1] is zero-init, gating all 3 residual
+    # branches). They therefore need their own, larger LR to lift off zero within
+    # a short screen budget. Defaults keep mainline behaviour bit-identical.
+    new_layer_mult = float(getattr(cfg.train, "new_layer_lr_multiplier", 1.0))
+    new_layer_base_depth = int(getattr(cfg.train, "new_layer_base_depth", 0))
+    _dit_layer_re = re.compile(r"\.dit_layers\.(\d+)\.")
+
+    def _is_new_dit_layer(param_name):
+        if new_layer_base_depth <= 0 or new_layer_mult == 1.0:
+            return False
+        match = _dit_layer_re.search(param_name)
+        if match is None:
+            return False
+        return int(match.group(1)) >= new_layer_base_depth
+
     groups = []
-    counts = {"base": 0, "locate": 0, "memory": 0, "detail": 0}
+    counts = {"base": 0, "locate": 0, "memory": 0, "detail": 0, "new_layer": 0}
     for name, parameter in model.named_parameters():
         if not parameter.requires_grad:
             continue
@@ -367,6 +389,8 @@ def build_optimizer(model):
             group_name, multiplier = "locate", locate_mult
         elif "detail_local_proj." in name or "detail_point_proj." in name:
             group_name, multiplier = "detail", detail_mult
+        elif _is_new_dit_layer(name):
+            group_name, multiplier = "new_layer", new_layer_mult
         counts[group_name] += parameter.numel()
         groups.append({
             "params": [parameter],
@@ -375,11 +399,13 @@ def build_optimizer(model):
             "weight_decay": weight_decay,
         })
     print(
-        "[optim] base_lr={} multipliers=locate:{} memory:{} detail:{} params={}".format(
+        "[optim] base_lr={} multipliers=locate:{} memory:{} detail:{} new_layer:{}(>=L{}) params={}".format(
             base_lr,
             locate_mult,
             memory_mult,
             detail_mult,
+            new_layer_mult,
+            new_layer_base_depth,
             counts,
         ),
         flush=True,

@@ -13,7 +13,7 @@
 |------|------|------|
 | 第一贡献 | **Flow Matching 轮廓演化**：FM 速度场建模 `init → GT` 位移，推理约 8 NFE；外层按 fractions 多轮推进并在当前轮廓位置重新采样图像特征 | ✅ 已成立 |
 | 第二贡献 | **Contour RL**：GRPO 后训练，以不可微几何质量（IoU / 曲率 / 毛刺 / NSD）为奖励 | 🔶 有实现，瓶颈已诊断 |
-| 第三层级 | 伪 3D / 顺序体数据能力扩展（跨切片传播、整卷并行推理） | 🕐 方向已定 |
+| 当前边界 | **纯 2D**；Memory / 2.5D / 3D 不再进入网络与论文贡献 | ✅ 已收敛 |
 | 系统支撑 | 检测器（LocateAnything 接入）与推理加速 | 性能支撑，非核心创新 |
 
 贡献详述见 `docs/report/INNOVATION_SUMMARY.md`（写于 2026-07-05，**战场与超参描述已落后于当前主线，阅读时以本 README 为准**）。
@@ -24,16 +24,18 @@
 
 ### 冻结主线
 
-- **结构**：Dense-6 DiT + H1 Dense Residual 输出头（由 E8 Top-2 输出 MoE 蒸馏而来，函数相对误差 0.48%）。
+- **结构**：纯 2D Dense-6 DiT + H1 Dense Residual 输出头（由 E8 Top-2 输出 MoE 蒸馏而来，函数相对误差 0.48%）。当前网络**不再实例化 Memory 模块，也不携带任何 Memory 参数**。
 - **Checkpoint**：`data/outputs/volmem/output_head_h0_h1_h2_20260803/distilled/h1_distilled_full.pt`（SHA256 `5e28f12d…`）。
 - **推理调度**：AB2，2 outer × 4 inner = **8 NFE**，outer fractions `[0.6667, 1.0]`，每个 outer 在更新后的轮廓位置重采特征。
 - **特征**：冻结 MoonViT layer-18（center-only），离线缓存读取。
 - **接口契约**：Flow interface manifest v1.1（`label_id 1..25 → flow_class_id 0..24`）。
 - 冻结细节见 `docs/report/FLOW_MAIN_HANDOVER_STATUS_20260804.md` 与 `docs/report/FLOW_GT_ORACLE_AND_INTERFACE_STATUS_20260804.md`。
-- **初始化形状**：**Route B**，训推统一用 `get_octagon(get_quadrangle(box))` 从检测框中点构造 12 点八边形（`evolve_init: bbox_octagon` / `init: octagon`）；训练不再使用 GT 极值点。主线确认 2026-08-09，详见下方§训推初始化统一。
+- **初始化形状**：**Route B（矩形框构造八边形）**。训练侧取 GT 轮廓的轴对齐外接矩形框，推理侧取检测器矩形框；两侧统一调用 `get_octagon(get_quadrangle(box))`，由框四边中点构造12点八边形，再直接均匀采样为128点（`evolve_init: bbox_octagon` / `init: octagon`）。训练不再使用 GT 极值点。主线确认 2026-08-09，详见下方§训推初始化统一。
 - **外层 frac 采样**：**v4_10 MoG 连续采样**，centers `[0, 0.3333, 0.5, 0.80, 0.97]`，σ=0.05，15% 均匀底噪，开关 `v4_10_use_continuous_sampling: true`。主线确认 2026-08-09，详见下方§外层状态采样连续化。
+- **模型边界**：Flow 模型组件为 **14,373,444 参数**，Memory 参数 **0**，内置 heatmap detector 参数 **0**；`flow_box_only` 后端在训练时接收 GT 框、部署时接收经校验的外部检测框。检测器是单独系统组件，不计入 Flow 模型参数。历史 39,865,760 参数模型只作证据来源，不再作为训练/推理主线。
+- **训练入口**：`diffusion_train.py` + `configs/volmem/depth_sweep/pure2d_mainline_l6_f256_routeb_v410_48h.yaml`。训练配置中不再存在 `memory_capacity`、`memory_dim`、Memory reader/controller 或 memory learning-rate 参数。
 
-### 关键数字（均 GT box、Memory-off、seed 20260731）
+### 关键数字（历史筛选均为 GT box、Memory-off 隔离评估、seed 20260731；新主线为物理无 Memory 网络）
 
 | 实验 | 协议 | Volume Dice |
 |------|------|---:|
@@ -56,6 +58,54 @@
 
 当前偏离：Dice 池化 ❌ / NSD voxel ❌ / HD95 voxel ❌ / 无识别分离 ❌ / 无 spacing(mm) ❌。**任何 AI 改评估代码须先对齐本规范**，实现结果写入 `docs/report/` 后再提交（AGENTS §7/§8）。
 
+**实施状态（2026-08-09 更新）**：旧 `eval_memflowdit_v03.py` 的 volume-level 前景 Dice 仍不能直接对标 VerSe leaderboard；它没有 per-vertebra ID matching 和毫米物理距离口径。深度试验现已通过独立的原空间 3D exporter/evaluator 补齐 scan-equal per-vertebra Dice、identification rate、dmean/maximum-HD（mm），并把 NSD@2mm/HD95 明确保留为项目诊断指标。实现与边界见 `docs/report/EVAL_PROTOCOL_IMPLEMENTATION_20260809.md`。
+
+**深度扩容结论（P0 已关闭）**：相同 Train72/2000 steps/随机流/GT-box/Memory-off/Dev5/8-NFE 下，P1 L8/F256 相对 P0 L6/F256 多 3.843M 参数和 0.201 GiB 峰值推理显存，但 5/5 病例 native volume Dice 均下降；均值 −0.000651，VerSe scan-equal Dice −0.000404，NSD@2mm −0.000980。主线保留 **L6/F256**，不采用 L8/F256。完整机器结果、坐标修复说明与 SHA 见 **`docs/report/DEPTH_WIDTH_DEV5_FINAL_20260809.md`** / `.json`。最初三模型全零的结果来自检测框 512 坐标误采样 128 特征图，已作废。
+
+**NFE 筛选结论（2026-08-09）**：固定 P0 L6/F256 step2000、同一 Dev5/GT-box/Memory-off/B16/seed 后，4/8/12 NFE 的 native volume Dice 分别为 0.789226 / **0.801049** / 0.800487。4 NFE 明显退化；12 NFE 比 8 NFE 多 50% denoiser 调用，却没有 volume Dice 增益，且 4/5 病例下降。因此主线固定为 **AB2 2 outer × 4 inner = 8 NFE**。共享存储使本次墙钟不稳定，速度不按 E2E 秒数排序，而按确定的 NFE/denoiser 调用预算解释。详见 `docs/report/DEPTH_WIDTH_NFE_SWEEP_FINAL_20260809.md` / `.json`。
+
+### Pure-2D 物理精简（2026-08-09，当前执行主线）
+
+这里的“去掉 Memory”不是把开关设为 off，而是从模型结构和 checkpoint 中删除相应参数：
+
+| 组成 | 参数量 | 当前主线 |
+|------|------:|----------|
+| 历史完整 H1（内置 detector + Memory + Flow） | 39,865,760 | 仅历史证据 |
+| 内置 heatmap detector | 23,308,124 | 删除；由外部检测器负责 |
+| Memory encoder/controller | 2,184,192 | **删除** |
+| 纯 2D L6/F256 Flow + MoonViT replacer + H1 | **14,373,444** | **当前模型** |
+
+P0 step2000 的纯 2D 基网已机械导出为 156 个 state keys；与已签纯 2D L6/F256 参考网络的 key 集合和 tensor shape 全部一致。主训练 checkpoint 为
+`data/outputs/depth_sweep/pure2d_mainline_l6_f256_routeb_v410_48h/source/p0_step2000_memory_free.pt`
+（SHA256 `737409fad5e60f8e72447a8f1079f4f4cfef5ac819647c30db57a5171c34ae32`）。GPU 严格加载结果为
+missing/unexpected=0；构造后 Memory 参数=0、内置 detector 参数=0、总参数=14,373,444。
+
+删除前后同输入、同噪声的 GT-box 训练协议逐阶段对照已经通过：`stage_init`、`outer1`、最终返回
+`ret.py` 与 `py_ind` 均 `torch.equal=true`、`max_abs=0`。机器证据位于
+`data/outputs/depth_sweep/pure2d_mainline_l6_f256_routeb_v410_48h/validation/p0_memory_free_exact_v5/`
+（JSON SHA256 `f61a8bbcd4a513534383e35146782f789bd5102d04b307f9b2113b19078c9920`）。
+外部检测器的参数与耗时必须单独报告，不能把 14.37M 写成完整部署系统总参数。
+
+
+### 纯 2D 无内置检测器推理（2026-08-10 已验证）
+
+标准入口为 `tools/volmem/depth_sweep_tools/run_pure2d_detector_free_inference.py`。它只构造
+14,373,444 参数的 L6/F256 Flow 网络，逐键严格加载纯 2D checkpoint；不会构造 Memory wrapper，
+也不会构造 heatmap/YOLO 检测器。科研评估固定使用 GT 矩形框与 GT 类别 oracle，矩形框按 Route B
+执行 `get_octagon(get_quadrangle(box))`，再直接均匀采样到 128 点；推理轨迹固定 AB2、2 outer ×
+4 inner = 8 NFE。部署时把 GT 框替换为外部检测器输出的 `[B,N,6]`，其 512 输入坐标在进入
+128 Flow 网格前除以 `down_ratio=4`，初始化几何不变。
+
+已验证 checkpoint 为续训 `step_8000.pt`（SHA256
+`340e4a4734c003ac948e65a012cc11c8829b7589c7db68987c2be4e26fe2a7f7`）。在非锁定 Dev8
+（8 cases / 1123 slices，seed 20260731）上：VerSe-2021 scan-equal per-vertebra Dice
+**0.841594**，识别率 **1.000000**，maximum HD 均值 **7.0007 mm**，命中椎体 dmean
+**12.2042 mm**；前景切片 Dice **0.795535**、IoU **0.673552**，缺失椎体率 0。
+机器结果与可视化位于
+`data/outputs/depth_sweep/pure2d_mainline_l6_f256_routeb_v410_48h/inference/pure2d_detector_free_step8000_dev8_v1/`。
+历史同 Dev8/GT-box/8-NFE 的 A0 step2000 scan-equal Dice 为 0.767668；继续训练到 step8000
+后提高 0.073927。该对比支持“生成式演化不能因 loss 平台提前停止”的长训原则。
+
 ### Detector Stage A 端到端损失归因（full-38，2026-08-05）
 
 **结论：当前端到端损失主要来自检测器覆盖不足，其次是 matched box 定位几何，不能归因于 Flow。**
@@ -74,8 +124,9 @@
 （LocateAnything 不输出极值点）。同一个 `get_octagon()`，两侧输入分布不同，
 合同测试实测控制点逐点最大偏差 **102.4 px**。
 
-**决定的主线（其他 AI 以此为准）**：训练与推理**都**从检测框四边中点构造 12 点八边形，
-即 `get_octagon(get_quadrangle(box))`。开关 `evolve_init: bbox_octagon`（训练侧）+
+**决定的主线（其他 AI 以此为准）**：训练侧使用 GT 轮廓的轴对齐外接矩形框，推理侧使用
+检测器矩形框；两侧都从矩形框四边中点构造12点八边形，即
+`get_octagon(get_quadrangle(box))`。开关 `evolve_init: bbox_octagon`（训练侧）+
 `init: octagon`（推理侧），代码在 `lib/utils/snake/snake_voc_utils.py: get_evolution_init()`。
 **训练初始化不再使用 GT 极值点。**
 
@@ -136,18 +187,18 @@ Rectangle 消融不矛盾——那次在冻结权重上只换推理侧形状（�
   **主线配置**：`configs/volmem/init_unify_route_B_v410.yaml`（Route B + v4_10，2026-08-09 确认为主线训练配置）。
   commit: `01f5304`。
 
-**重采样链不一致（2026-08-09 已修）**：训练 control→128 一步，
-推理原来 control→40→÷4→128 两步（40 点中间态截角 + /4 坐标缩放）。
-修复：`prepare_testing`（`lib/utils/snake/snake_gcn_utils.py`）中 `init=='octagon'` 时
-改为直接调用 `_box_to_octagon_init(valid_boxes, poly_num)` 在**完整图像坐标**下构造128点
-八边形，与训练链 `build_box_octagon_from_poly` 完全等价。
-合同测试：4 实例合成批次 max |train−infer| = **0.000000**。commit: `67158bb`。
-GCN 特征提取（`i_it_4py` at /4 coords）保持不变。
+**坐标与重采样链统一（2026-08-09 已修）**：训练侧的 `i_gt_py` 与 Flow 特征都位于
+128×128 stride-4 网格；检测器框则位于 512×512 输入坐标。推理侧先将有效框除以
+`snake_config.down_ratio=4`，再调用 `_box_to_octagon_init(box, poly_num)`，由框四边中点
+构造12点八边形并直接均匀上采样为128点。训练侧
+`build_box_octagon_from_poly(i_gt_py)` 使用 GT 轮廓的矩形外接框调用同一函数，因此训推的
+**坐标尺度、八边形控制点和128点重采样完全一致**；训练不读取 GT 极值点作为初始化。
+合同测试确认 train/infer 逐点 `max_abs=0`，并明确检测框到 Flow 网格的缩放比为4。
 
 ### 已淘汰路线（有严格证据，不再回退）
 
 - **输出 MoE**：H1 蒸馏严格支配（质量保持、头参数 -63.6%、Batch-8 吞吐 +27.7%）。
-- **3D Memory v0.7 / v0.8 / v0.9**：严格门控（Volume +0.001、前景同向、减速 ≤10%）下均无净收益；整卷并行吞吐 4.5× 保留为加速支撑。
+- **3D Memory v0.7 / v0.8 / v0.9 及后续 Memory reader**：严格门控下均无稳定净收益，已从当前网络结构、checkpoint 与论文贡献中删除。历史实验只保留作审计证据。
 - **数据管线 largest-only**：旧管线只保留 81.88% 前景，是早期演化失败的根因；修复后（每类 top-4 significant components、面积 ≥2、cap 32）前景保留 99.5%+。
 
 ---
@@ -162,9 +213,9 @@ GCN 特征提取（`i_it_4py` at /4 coords）保持不变。
    ├─▶ 检测：LocateAnything 离线预测 ──▶ external_detection [B,N,6]
    │        (x1,y1,x2,y2,score,class_id)；隔离实验用 GT box
    │
-   ├─▶ 框初始化：检测框 → 4 边中点 → 12 点八边形 → 40 点 → 1/4 分辨率 Flow 网格
-   │        → 128 点上采样轮廓（训练/推理统一从检测框四边中点构造，即
-   │        get_octagon(get_quadrangle(box))；不再用 GT 极值点，见 §训推初始化统一）
+   ├─▶ 框初始化：512输入坐标检测框 → ÷down_ratio → 128×128 Flow网格框
+   │        → 4边中点 → 12点八边形 → 直接均匀上采样为128点轮廓
+   │        （训练/推理调用同一 _box_to_octagon_init；训练不再用GT极值点）
    │
    └─▶ Flow Matching 演化（两层 ODE）
         ├─ 内层：FM 速度场 v(x_t, t)，AB2 积分 4 NFE（≈推理 8 步内）
@@ -189,7 +240,7 @@ GCN 特征提取（`i_it_4py` at /4 coords）保持不变。
 | 任务 | 职责 |
 |------|------|
 | 轮廓演化 / Flow 主线 | FM 方法、训练目标、采样路径、8-NFE 冻结调度、inner/outer 归因 |
-| 推理加速 / 整卷并行 | 真实 pass / DiT calls / 吞吐 / 显存、Physical Volume Memory 代码 |
+| 推理加速 / 批量并行 | 真实 pass / DiT calls / 吞吐 / 显存；不再包含 Memory 路线 |
 | 检测器 / 初始化与覆盖 | LocateAnything、检测缓存、coverage/geometry/class 隔离归因 |
 | 强化学习 / Contour RL | 在冻结 Dense-6 + H1 主线上单独验证 GRPO 收益 |
 | 论文统筹 | 证据审计、数字机器可读落盘、中英文写作 |
@@ -214,11 +265,12 @@ GCN 特征提取（`i_it_4py` at /4 coords）保持不变。
 
 | 文件 | 说明 |
 |------|------|
-| `tools/volmem/train_memflowdit.py` | MemFlowDiT 训练入口 |
+| `diffusion_train.py` | 当前纯 2D Flow 训练入口；构造时硬断言 Memory=0、内置 detector=0、参数量=14,373,444 |
 | `tools/volmem/eval_memflowdit_parallel.py` | 整卷并行评估、蒸馏轨迹缓存 |
+| `tools/volmem/depth_sweep_tools/run_pure2d_detector_free_inference.py` | 当前主线无 Memory、无内置检测器的直接推理、Dev8 3D 指标与 Route-B 可视化 |
 | `tools/volmem/distill_output_head.py` | H1/H2 输出头蒸馏、权重移植、参数统计 |
 | `tools/volmem/compute_stage_a_metrics.py` | Stage A 冻结指标（NSD@2 / HD95） |
-| `configs/volmem/verse_memflowdit_v0_5_minimal_gpu6.yaml` | v0.5 minimal 主线配置 |
+| `configs/volmem/depth_sweep/pure2d_mainline_l6_f256_routeb_v410_48h.yaml` | 当前 L6/F256、Route B、v4.10、8-NFE、无 Memory 长训配置 |
 | `scripts/extract_sagittal_moonvit_features.py` | MoonViT 特征离线提取 |
 
 ### 工作留档（docs/report/）
@@ -238,7 +290,7 @@ GCN 特征提取（`i_it_4py` at /4 coords）保持不变。
 | `MEMFLOWDIT_NEXT_STAGE_EXECUTION_20260803.md` | DiT FFN 对照、Memory 因果审计执行链 |
 | `DETECTOR_STAGE_A_INSTANCE2D_RECALC_20260807.md` | 逐实例 2D 指标探索性重算（只读；**不替代**正式 3D mean-volume Dice） |
 | `DETECTOR_RECTANGLE_INIT_ABLATION_20260807.md` | bbox→初始轮廓几何消融（5 病例开发集，非 full-38 正式结果） |
-| `INIT_TRAIN_INFER_UNIFICATION_20260808.md` | 训推初始化统一：两条路线合同测试（ctrl_maxabs=0）+ 训练臂（**进行中**，baseline 控制臂未跑） |
+| `INIT_TRAIN_INFER_UNIFICATION_20260808.md` | 训推初始化统一：A/B与baseline已完成，Route B bbox-octagon成为主线；坐标与128点重采样合同 `max_abs=0` |
 | `FLOW_PURE2D_DIT4_TOTAL10K_BASELINE_AND_SLIM_B_GATE_20260807.md` | Pure-2D DiT-4 10k baseline 未达 H1 参考，slim-B 判为 NO-GO |
 | `HISTORICAL_BEST_AUDIT_20260803.md` | 175 份 summary.json 审计，纠正“0.773345 是历史最佳”的误述 |
 | `DETECTOR_EVOLUTION_ISOLATION_20260803.md` | 检测器与演化的隔离规则（含 2026-08-04 活契约条款） |
@@ -288,9 +340,20 @@ conda create -n snake1 python=3.10
 conda activate snake1
 pip install torch torchvision diffusers opencv-python numpy pyyaml tqdm
 
-# 矢状位主线训练（v0.5 minimal 配置）
-export CFG_FILE=configs/volmem/verse_memflowdit_v0_5_minimal_gpu6.yaml
-python tools/volmem/train_memflowdit.py
+# 纯 2D 主线训练（无 Memory 参数、无内置 detector 参数）
+python diffusion_train.py \
+  --cfg_file configs/volmem/depth_sweep/pure2d_mainline_l6_f256_routeb_v410_48h.yaml
+
+# 纯 2D 直接推理（科研评估：GT box + GT class；无 Memory / 无内置 detector）
+CUDA_VISIBLE_DEVICES=5 python tools/volmem/depth_sweep_tools/run_pure2d_detector_free_inference.py \
+  --project-root "$PWD" \
+  --config "$PWD/configs/volmem/depth_sweep/pure2d_mainline_l6_f256_routeb_v410_resume6000.yaml" \
+  --checkpoint "$PWD/data/outputs/depth_sweep/pure2d_mainline_l6_f256_routeb_v410_48h/training/pure2d_l6_f256_48h_v1_resume6000/checkpoints/step_8000.pt" \
+  --result-dir "$PWD/data/outputs/depth_sweep/pure2d_mainline_l6_f256_routeb_v410_48h/inference/pure2d_detector_free_step8000_dev8_v2" \
+  --metric-module /home/medteam/Zhrch/DiffusionSnake-12-30-pure2d-verse3d-eval-20260808/tools/verse2021_3d/verse2021_3d.py \
+  --slice-manifest /home/medteam/Zhrch/detect_3D_lgz2/datasets/sagittal_2d_fixed/manifests/slice_manifest.csv \
+  --case-metadata /home/medteam/Zhrch/detect_3D_lgz2/datasets/sagittal_2d_fixed/manifests/case_metadata.csv \
+  --locate-feat-cache-root /home/medteam/Zhrch/DiffusionSnake-12-30/data/sagittal_moonvit_cache
 
 # MoonViT 特征离线提取（训练/评估前必需）
 python scripts/extract_sagittal_moonvit_features.py
@@ -300,8 +363,10 @@ python scripts/extract_sagittal_moonvit_features.py
 
 ## 更新日志
 
-- **2026-08-09**: 训推初始化统一 A/B 判定完成——三臂 dev5 GT-box 对照（1248 slices、step 600、唯一差异是 init 开关）：baseline 0.760831 → route_A 0.788292 → route_B 0.790968 前景切片 mDice，两条统一路线均 5W/0L；**主线定为 Route B**（训推都用检测框四边中点构造 12 点八边形，训练不再用 GT 极值点）。量化外层状态采样缺陷（frac≈0 仅 1.25%、28.3% 样本 ≥0.95 进度、discrete/infer_target 单位混用）并给出连续化重设计（frac≈0 → 17.78%、中位数 0.823 → 0.449）。**v4_10 连续采样已实现**（commit `01f5304`，门控 `v4_10_use_continuous_sampling`，四臂配置 `init_unify_route_B_v410.yaml`）。**重采样链不一致已修**（commit `67158bb`，合同测试 max |delta|=0.000000）。
-  **Route B（bbox_octagon 初始化）与 v4_10 MoG 连续采样均已确认为主线默认训练配置**（2026-08-09 用户批准）；第 4 臂训练结果收录后更新。
+- **2026-08-10**：新增并验证纯 2D 直接推理入口：物理网络 14,373,444 参数、Memory=0、内置 detector=0，GT 矩形框按 Route B 构造 12 点八边形，AB2 8 NFE。续训 step8000 在非锁定 Dev8 的 VerSe-2021 scan-equal Dice=0.841594、识别率=1.0、maximum HD=7.0007mm；可视化与完整机器结果已落盘。
+- **2026-08-09**：主线物理删除 Memory 参数：不再使用“完整模型 + Memory-off”的形式；当前 Flow 模型为 L6/F256、14,373,444 参数，Memory=0、内置 detector=0。外部检测器作为独立系统组件计数。新增纯 2D 长训配置和构造期硬门，P0 step2000 只提取纯 2D 基网权重作为初始化。
+- **2026-08-09**: 训推初始化统一 A/B 判定完成——三臂 dev5 GT-box 对照（1248 slices、step 600、唯一差异是 init 开关）：baseline 0.760831 → route_A 0.788292 → route_B 0.790968 前景切片 mDice，两条统一路线均 5W/0L；**主线定为 Route B**（训练取 GT 轮廓外接矩形框、推理取检测器矩形框，再以同一框中点规则构造12点八边形；训练不再用 GT 极值点）。量化外层状态采样缺陷（frac≈0 仅 1.25%、28.3% 样本 ≥0.95 进度、discrete/infer_target 单位混用）并给出连续化重设计（frac≈0 → 17.78%、中位数 0.823 → 0.449）。**v4_10 连续采样已实现**（commit `01f5304`，门控 `v4_10_use_continuous_sampling`，四臂配置 `init_unify_route_B_v410.yaml`）。**重采样链不一致已修**（commit `67158bb`，合同测试 max |delta|=0.000000）。
+  **Route B（bbox_octagon 初始化）与 v4_10 MoG 连续采样均已确认为主线默认训练配置**（2026-08-09 用户批准）。
 - **2026-08-09**：评估协议定为项目硬要求——必须与 VerSe 论文（Sekuboyina 2021）+ 相关工作（Metrics Reloaded / nnU-Net / SpineNet）对齐；当前主线 5 处偏离待修（Dice 池化 / NSD·HD95 voxel / 无识别分离 / 无 spacing-mm）。规范见 `docs/report/eval_protocol_standard_20260809.md`，README 新增「评估协议标准」章节，AGENTS §5 加评估红线、§10 加 backlog。
 - **2026-08-08**: 训推初始化统一实验启动——定位并量化 init 不一致（控制点 102.4 px），两条统一路线合同测试通过（逐点精确相同），发现重采样链为第三个不一致源；训练臂进行中。docs 整理——历史留档迁入 `docs/archive/`（镜像原路径），`docs/report/` 只保留活文档；删除 636 个无唯一内容的文件（浏览器 profile 缓存、渲染自检截图、可重生成的 pptx），其余一律归档不删
 - **2026-08-07**: Pure-2D DiT-4 10k baseline 未保持 H1 质量，slim-B 判 NO-GO；bbox→初始轮廓 Rectangle 消融（开发集）；逐实例 2D 指标探索性重算（不替代正式指标）

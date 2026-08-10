@@ -439,6 +439,55 @@ def main():
     network = make_network(cfg)
     logger.info("Building trainer")
     trainer = make_trainer(cfg, network)
+
+    # The pure-2D mainline is a physically slim model, not a MemFlow model run
+    # with memory disabled.  Keep this as a hard construction-time contract so
+    # a future config change cannot silently reintroduce Memory or the internal
+    # detector before a long training run.
+    if bool(getattr(cfg, 'pure2d_memory_free_required', False)):
+        named_parameters = list(trainer.network.named_parameters())
+        parameter_names = [name for name, _ in named_parameters]
+        forbidden_memory_tokens = (
+            'memory_encoder',
+            'memflow_controller',
+            'memory_reader',
+            'memory_writer',
+            'memory_bank',
+        )
+        forbidden_memory_names = [
+            name for name in parameter_names
+            if any(token in name.lower() for token in forbidden_memory_tokens)
+        ]
+        if forbidden_memory_names:
+            raise RuntimeError(
+                'pure2d Memory-free contract failed; forbidden parameters: '
+                + ', '.join(forbidden_memory_names[:20])
+            )
+
+        if bool(getattr(cfg, 'pure2d_internal_detector_free_required', False)):
+            detector_names = [
+                name for name in parameter_names if 'heatmap_detector' in name.lower()
+            ]
+            if detector_names:
+                raise RuntimeError(
+                    'pure2d detector-free contract failed; internal detector parameters: '
+                    + ', '.join(detector_names[:20])
+                )
+
+        observed_parameters = sum(parameter.numel() for _, parameter in named_parameters)
+        expected_parameters = int(
+            getattr(cfg, 'pure2d_expected_parameter_count', observed_parameters)
+        )
+        if observed_parameters != expected_parameters:
+            raise RuntimeError(
+                'pure2d parameter-count contract failed: '
+                f'observed={observed_parameters} expected={expected_parameters}'
+            )
+        logger.info(
+            'Pure2D physical-slim contract PASS: '
+            f'parameters={observed_parameters}, memory_parameters=0, '
+            'internal_detector_parameters=0'
+        )
     if torch.cuda.is_available():
         trainer.network.cuda()
 
@@ -591,8 +640,19 @@ def main():
             return
         batch = viz_batch
         trainer.network.eval()
-        with torch.no_grad():
-            output, _, _, _ = trainer.network(batch)
+        restore_train_only = bool(getattr(cfg, 'use_gt_det_train_only', False))
+        use_visualization_gt = (
+            str(getattr(cfg, 'detector_backend', '')).strip() == 'flow_box_only'
+            and restore_train_only
+        )
+        if use_visualization_gt:
+            cfg.use_gt_det_train_only = False
+        try:
+            with torch.no_grad():
+                output, _, _, _ = trainer.network(batch)
+        finally:
+            if use_visualization_gt:
+                cfg.use_gt_det_train_only = restore_train_only
         save_dir = os.path.join(out_dir, 'visual', 'diffusion_one_sample')
         save_affine_visualization(output=output, batch=batch, tag=str(tag), save_dir=save_dir)
 
