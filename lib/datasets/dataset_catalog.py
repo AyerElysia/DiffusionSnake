@@ -63,6 +63,42 @@ class DatasetCatalog(object):
             'ann_file': 'dummy_annotations.json',
             'split': 'mini'
         },
+        'PanNukeTrain': {
+            'id': 'sbd',
+            'data_root': '/home/medteam/Zhrch/Datasets/PanNuke/pannuke_snake',
+            'ann_file': 'dummy_annotations.json',
+            'split': 'train'
+        },
+        'PanNukeVal': {
+            'id': 'sbd',
+            'data_root': '/home/medteam/Zhrch/Datasets/PanNuke/pannuke_snake',
+            'ann_file': 'dummy_annotations.json',
+            'split': 'val'
+        },
+        'PanNukeMini': {
+            'id': 'sbd',
+            'data_root': '/home/medteam/Zhrch/Datasets/PanNuke/pannuke_snake',
+            'ann_file': 'dummy_annotations.json',
+            'split': 'mini'
+        },
+        'AvbceTrain': {
+            'id': 'sbd',
+            'data_root': '/home/medteam/Zhrch/Datasets/MR_AVBCE/1232processed',
+            'ann_file': 'dummy_annotations.json',
+            'split': 'train'
+        },
+        'AvbceVal': {
+            'id': 'sbd',
+            'data_root': '/home/medteam/Zhrch/Datasets/MR_AVBCE/230processed',
+            'ann_file': 'dummy_annotations.json',
+            'split': 'val'
+        },
+        'AvbceMini': {
+            'id': 'sbd',
+            'data_root': '/home/medteam/Zhrch/Datasets/MR_AVBCE/1232processed',
+            'ann_file': 'dummy_annotations.json',
+            'split': 'mini'
+        },
         'Proc1232Train': {
             'id': 'sbd',
             'data_root': '/home/medteam/Zhrch/Data_processed/1232processed',
@@ -92,6 +128,12 @@ class DatasetCatalog(object):
             'data_root': '/home/medteam/Zhrch/detect_3D_lgz2/datasets/sagittal_2d_fixed',
             'ann_file': '/home/medteam/Zhrch/detect_3D_lgz2/datasets/sagittal_2d_fixed/manifests/slice_manifest.csv',
             'split': 'val'
+        },
+        'VolMemDev8': {
+            'id': 'sagittal_2d_fixed',
+            'data_root': '/home/medteam/Zhrch/detect_3D_lgz2/datasets/sagittal_2d_fixed',
+            'ann_file': '/home/medteam/Zhrch/detect_3D_lgz2/datasets/sagittal_2d_fixed/manifests/slice_manifest.csv',
+            'split': 'dev'
         },
         'VolMemTest': {
             'id': 'sagittal_2d_fixed',

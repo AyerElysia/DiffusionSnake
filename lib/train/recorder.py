@@ -3,7 +3,15 @@ import torch
 try:
     from tensorboardX import SummaryWriter
 except ImportError:
-    from torch.utils.tensorboard import SummaryWriter
+    try:
+        from torch.utils.tensorboard import SummaryWriter
+    except ImportError:
+        class SummaryWriter:
+            def __init__(self, *a, **kw): pass
+            def add_scalar(self, *a, **kw): pass
+            def add_histogram(self, *a, **kw): pass
+            def flush(self): pass
+            def close(self): pass
 import os
 
 # 这个文件没啥看的

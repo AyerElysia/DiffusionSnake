@@ -1,1 +1,0 @@
-"""VolMemSnake prototype training engine."""

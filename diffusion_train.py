@@ -142,6 +142,71 @@ def _config_hash(config):
     return hashlib.sha256(normalized.dump().encode('utf-8')).hexdigest()
 
 
+def _validate_formal_resume_cfg_hash(checkpoint_cfg_hash, current_cfg_hash):
+    """Validate strict-resume identity, including an explicit audited transition.
+
+    A scientific configuration change normally invalidates a formal strict
+    resume. The only exception is a launcher-authorized transition tied to the
+    exact source checkpoint hash. Model, optimizer, scheduler, progress and RNG
+    restoration remain strict; this merely records that the input curriculum
+    intentionally changed at the resume boundary.
+    """
+    checkpoint_cfg_hash = str(checkpoint_cfg_hash)
+    current_cfg_hash = str(current_cfg_hash)
+    if checkpoint_cfg_hash == current_cfg_hash:
+        return None
+
+    expected_source = os.environ.get(
+        'FORMAL_RESUME_EXPECTED_SOURCE_CFG_HASH', ''
+    ).strip()
+    transition_id = os.environ.get(
+        'FORMAL_RESUME_CONFIG_TRANSITION_ID', ''
+    ).strip()
+    if not expected_source or not transition_id:
+        raise RuntimeError(
+            'formal resume cfg hash mismatch: '
+            f'checkpoint={checkpoint_cfg_hash} current={current_cfg_hash}'
+        )
+    if checkpoint_cfg_hash != expected_source:
+        raise RuntimeError(
+            'formal resume source cfg hash does not match the authorized '
+            f'transition: checkpoint={checkpoint_cfg_hash} '
+            f'expected_source={expected_source} current={current_cfg_hash}'
+        )
+    if len(transition_id) > 128 or any(
+        character not in 'abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789._-'
+        for character in transition_id
+    ):
+        raise RuntimeError(
+            'FORMAL_RESUME_CONFIG_TRANSITION_ID must be a non-empty safe token '
+            'of at most 128 characters'
+        )
+    return {
+        'transition_id': transition_id,
+        'source_cfg_hash': checkpoint_cfg_hash,
+        'target_cfg_hash': current_cfg_hash,
+    }
+
+
+def _step_checkpoint_paths_to_remove(step_paths, keep_recent, milestone_steps):
+    """Return non-recent, non-milestone step checkpoints for pruning."""
+    keep_recent = int(keep_recent)
+    if keep_recent <= 0:
+        raise ValueError('keep_recent must be positive')
+    milestones = {int(step) for step in milestone_steps}
+    ordered = sorted(
+        step_paths,
+        key=lambda item: int(item.stem.split('_', 1)[1]),
+    )
+    recent = set(ordered[-keep_recent:])
+    return [
+        path
+        for path in ordered
+        if path not in recent
+        and int(path.stem.split('_', 1)[1]) not in milestones
+    ]
+
+
 def _capture_rng_state():
     state = {
         'python': random.getstate(),
@@ -439,6 +504,55 @@ def main():
     network = make_network(cfg)
     logger.info("Building trainer")
     trainer = make_trainer(cfg, network)
+
+    # The pure-2D mainline is a physically slim model, not a MemFlow model run
+    # with memory disabled.  Keep this as a hard construction-time contract so
+    # a future config change cannot silently reintroduce Memory or the internal
+    # detector before a long training run.
+    if bool(getattr(cfg, 'pure2d_memory_free_required', False)):
+        named_parameters = list(trainer.network.named_parameters())
+        parameter_names = [name for name, _ in named_parameters]
+        forbidden_memory_tokens = (
+            'memory_encoder',
+            'memflow_controller',
+            'memory_reader',
+            'memory_writer',
+            'memory_bank',
+        )
+        forbidden_memory_names = [
+            name for name in parameter_names
+            if any(token in name.lower() for token in forbidden_memory_tokens)
+        ]
+        if forbidden_memory_names:
+            raise RuntimeError(
+                'pure2d Memory-free contract failed; forbidden parameters: '
+                + ', '.join(forbidden_memory_names[:20])
+            )
+
+        if bool(getattr(cfg, 'pure2d_internal_detector_free_required', False)):
+            detector_names = [
+                name for name in parameter_names if 'heatmap_detector' in name.lower()
+            ]
+            if detector_names:
+                raise RuntimeError(
+                    'pure2d detector-free contract failed; internal detector parameters: '
+                    + ', '.join(detector_names[:20])
+                )
+
+        observed_parameters = sum(parameter.numel() for _, parameter in named_parameters)
+        expected_parameters = int(
+            getattr(cfg, 'pure2d_expected_parameter_count', observed_parameters)
+        )
+        if observed_parameters != expected_parameters:
+            raise RuntimeError(
+                'pure2d parameter-count contract failed: '
+                f'observed={observed_parameters} expected={expected_parameters}'
+            )
+        logger.info(
+            'Pure2D physical-slim contract PASS: '
+            f'parameters={observed_parameters}, memory_parameters=0, '
+            'internal_detector_parameters=0'
+        )
     if torch.cuda.is_available():
         trainer.network.cuda()
 
@@ -591,8 +705,20 @@ def main():
             return
         batch = viz_batch
         trainer.network.eval()
-        with torch.no_grad():
-            output, _, _, _ = trainer.network(batch)
+        restore_train_only = bool(getattr(cfg, 'use_gt_det_train_only', False))
+        use_visualization_gt = (
+            str(getattr(cfg, 'detector_backend', '')).strip()
+            in ('flow_box_only', 'flow_box_cnn')
+            and restore_train_only
+        )
+        if use_visualization_gt:
+            cfg.use_gt_det_train_only = False
+        try:
+            with torch.no_grad():
+                output, _, _, _ = trainer.network(batch)
+        finally:
+            if use_visualization_gt:
+                cfg.use_gt_det_train_only = restore_train_only
         save_dir = os.path.join(out_dir, 'visual', 'diffusion_one_sample')
         save_affine_visualization(output=output, batch=batch, tag=str(tag), save_dir=save_dir)
 
@@ -626,12 +752,22 @@ def main():
     )
     if step_checkpoint_every < 0 or step_checkpoint_keep <= 0:
         raise ValueError('step checkpoint interval must be >= 0 and retention must be > 0')
+    try:
+        step_checkpoint_milestones = {
+            int(step)
+            for step in getattr(cfg.train, 'step_checkpoint_milestones', ())
+        }
+    except (TypeError, ValueError) as error:
+        raise ValueError('step checkpoint milestones must be integer steps') from error
+    if any(step <= 0 for step in step_checkpoint_milestones):
+        raise ValueError('step checkpoint milestones must be positive')
     resume_step = 0
     resume_epoch = 0
     resume_step_in_epoch = 0
     resume_json_pos = None
     resume_checkpoint = None
     strict_resume = False
+    resume_cfg_transition = None
     resume_path = os.environ.get('ONE_SAMPLE_RESUME_PATH', '').strip()
     if not resume_path:
         resume_path = str(getattr(cfg, 'resume_path', '') or '').strip()
@@ -825,10 +961,19 @@ def main():
                         raise RuntimeError(
                             f"formal resume checkpoint is missing required fields: {missing_fields}"
                         )
-                    if str(resume_checkpoint['cfg_hash']) != str(cfg_hash):
-                        raise RuntimeError(
-                            'formal resume cfg hash mismatch: '
-                            f"checkpoint={resume_checkpoint['cfg_hash']} current={cfg_hash}"
+                    inherited_transition = resume_checkpoint.get('resume_cfg_transition')
+                    if isinstance(inherited_transition, dict):
+                        resume_cfg_transition = dict(inherited_transition)
+                    approved_transition = _validate_formal_resume_cfg_hash(
+                        resume_checkpoint['cfg_hash'], cfg_hash
+                    )
+                    if approved_transition is not None:
+                        resume_cfg_transition = approved_transition
+                        logger.warning(
+                            'Authorized strict-resume config transition: '
+                            f"id={approved_transition['transition_id']} "
+                            f"source={approved_transition['source_cfg_hash']} "
+                            f"target={approved_transition['target_cfg_hash']}"
                         )
                     checkpoint_run_id = str(resume_checkpoint['run_id'])
                     configured_run_id = os.environ.get('TRAIN_RUN_ID', '').strip()
@@ -880,6 +1025,74 @@ def main():
                             f"missing_after_load={len(load_report['missing_keys'])} "
                             f"unexpected_ckpt_keys={len(load_report['unexpected_ckpt_keys'])}"
                         )
+
+                        # Architecture migrations may intentionally add a new
+                        # module, but an explicitly fail-closed weights-only
+                        # resume must never silently copy overlapping tensor
+                        # slices or leave unrelated model keys uninitialized.
+                        if (
+                            resume_weights_only
+                            and not bool(getattr(cfg, 'resume_allow_partial_copy', True))
+                        ):
+                            raw_allowed_missing = getattr(
+                                cfg, 'resume_allowed_missing_prefixes', []
+                            )
+                            if isinstance(raw_allowed_missing, str):
+                                allowed_missing_prefixes = [
+                                    item.strip()
+                                    for item in raw_allowed_missing.split(',')
+                                    if item.strip()
+                                ]
+                            elif isinstance(raw_allowed_missing, (list, tuple)):
+                                allowed_missing_prefixes = [
+                                    str(item).strip()
+                                    for item in raw_allowed_missing
+                                    if str(item).strip()
+                                ]
+                            else:
+                                raise TypeError(
+                                    'resume_allowed_missing_prefixes must be a string, list, or tuple'
+                                )
+                            disallowed_missing = [
+                                key for key in load_report['missing_keys']
+                                if not any(
+                                    str(key).startswith(prefix)
+                                    for prefix in allowed_missing_prefixes
+                                )
+                            ]
+                            migration_errors = []
+                            if load_report['partial_copy_keys']:
+                                migration_errors.append(
+                                    f"partial_copy_keys={load_report['partial_copy_keys']}"
+                                )
+                            if load_report['skipped_shape_keys']:
+                                migration_errors.append(
+                                    f"skipped_shape_keys={load_report['skipped_shape_keys']}"
+                                )
+                            if load_report['unexpected_ckpt_keys']:
+                                migration_errors.append(
+                                    f"unexpected_ckpt_keys={len(load_report['unexpected_ckpt_keys'])}"
+                                )
+                            if load_report['unexpected_keys']:
+                                migration_errors.append(
+                                    f"unexpected_loaded_keys={len(load_report['unexpected_keys'])}"
+                                )
+                            if disallowed_missing:
+                                migration_errors.append(
+                                    f"disallowed_missing_keys={len(disallowed_missing)} "
+                                    f"examples={disallowed_missing[:8]}"
+                                )
+                            if migration_errors:
+                                raise RuntimeError(
+                                    'Fail-closed weights-only migration rejected: '
+                                    + '; '.join(migration_errors)
+                                )
+                            logger.info(
+                                'Fail-closed weights-only migration PASS: '
+                                f"allowed_missing={len(load_report['missing_keys'])} "
+                                f"excluded_source={len(load_report['excluded_keys'])} "
+                                'partial_copy=0 skipped_shape=0 unexpected=0'
+                            )
 
                         critical_missing = [
                             k for k in load_report['missing_keys']
@@ -1309,6 +1522,8 @@ def main():
             'step_in_epoch': int(step_in_epoch),
             'rng': _capture_rng_state(),
         }
+        if resume_cfg_transition is not None:
+            ckpt['resume_cfg_transition'] = dict(resume_cfg_transition)
         if epoch is not None:
             ckpt['epoch'] = int(epoch)
         if total_steps is not None:
@@ -1317,11 +1532,12 @@ def main():
         if step_file:
             ckpt_path = os.path.join(ckpt_dir, f'step_{int(step)}.pt')
             _atomic_torch_save(ckpt, ckpt_path)
-            step_paths = sorted(
-                Path(ckpt_dir).glob('step_*.pt'),
-                key=lambda item: int(item.stem.split('_', 1)[1]),
-            )
-            for old_path in step_paths[:-step_checkpoint_keep]:
+            step_paths = list(Path(ckpt_dir).glob('step_*.pt'))
+            for old_path in _step_checkpoint_paths_to_remove(
+                step_paths,
+                step_checkpoint_keep,
+                step_checkpoint_milestones,
+            ):
                 old_path.unlink()
         elif epoch is not None:
             ckpt_path = os.path.join(

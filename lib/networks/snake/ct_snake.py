@@ -674,6 +674,7 @@ class Network(nn.Module):
         self.use_swin_snake_feature = False
         self.swin_snake_feature = None
         self.yolo = None
+        self.heatmap_detector = None
         self.samsnake_dla = None
         self.samsnake_refine = None
         self.use_extreme_refine = bool(getattr(cfg, 'use_extreme_refine', False))
@@ -684,10 +685,56 @@ class Network(nn.Module):
         self.locate_feat_adapter = None
         self.locate_feat_replacer = None
         self.locate_feat_replace_upscale = int(getattr(cfg, 'locate_feat_replace_upscale', 2))
+        self.pure2d_cnn_context = None
         if self.locate_feat_inject and self.locate_feat_replace:
             raise ValueError("locate_feat_inject and locate_feat_replace are mutually exclusive.")
 
-        if self.detector_backend == 'yolo':
+        if self.detector_backend in ('flow_gt_cnn', 'flow_box_cnn'):
+            if not bool(getattr(cfg, 'use_gt_det', False)):
+                raise ValueError(f'{self.detector_backend} requires cfg.use_gt_det=True')
+            if self.locate_feat_inject or self.locate_feat_replace:
+                raise ValueError(
+                    f'{self.detector_backend} is a MoonViT-free backend; '
+                    'locate feature injection/replacement must be disabled'
+                )
+            cnn_out = int(getattr(cfg, 'snake_feature_dim', 256))
+            backbone_name = str(getattr(cfg, 'pure2d_cnn_backbone', 'resnet18'))
+            context_kwargs = dict(
+                backbone_name=backbone_name,
+                out_channels=cnn_out,
+                pyramid_channels=int(getattr(cfg, 'pure2d_cnn_pyramid_channels', 64)),
+                pretrained_path=str(getattr(cfg, 'pure2d_cnn_pretrained_path', '') or ''),
+                freeze_backbone=bool(getattr(cfg, 'pure2d_cnn_freeze_backbone', False)),
+            )
+            if backbone_name.startswith('sam2_hiera_'):
+                from .pure2d_hiera_context import Pure2DSAM2HieraFPN
+                context_kwargs.update(
+                    source_mean=float(getattr(cfg, 'pseudo3d_mean', 0.5)),
+                    source_std=float(getattr(cfg, 'pseudo3d_std', 0.5)),
+                )
+                self.pure2d_cnn_context = Pure2DSAM2HieraFPN(**context_kwargs)
+            else:
+                from .pure2d_cnn_context import Pure2DResNetFPN
+                self.pure2d_cnn_context = Pure2DResNetFPN(**context_kwargs)
+            param_count = sum(p.numel() for p in self.pure2d_cnn_context.parameters())
+            print(
+                f'[Flow2D-CNN] detector-free {self.detector_backend} enabled; '
+                f'backbone={getattr(cfg, "pure2d_cnn_backbone", "resnet18")} '
+                f'out={cnn_out} params={param_count / 1e6:.3f}M '
+                'MoonViT=False hand_features=False',
+                flush=True,
+            )
+        elif self.detector_backend in ('flow_gt_only', 'flow_box_only'):
+            if not bool(getattr(cfg, 'use_gt_det', False)):
+                raise ValueError(f'{self.detector_backend} requires cfg.use_gt_det=True')
+            if not self.locate_feat_replace:
+                raise ValueError(f'{self.detector_backend} requires locate_feat_replace=True')
+            print(
+                f'[Flow2D] detector-free {self.detector_backend} backend enabled; '
+                'only the MoonViT feature replacer and Flow evolution are constructed.',
+                flush=True,
+            )
+        elif self.detector_backend == 'yolo':
             # 使用本地 YOLOv8 检测模型替换 DLA，输出检测与特征
             # 选择包含 P2 的结构以获得 stride=4 的特征图，空间大小与原来 DLA 的 136x136 对齐（当输入是 544x544）
             yolo_yaml = 'lib/networks/YOLOV8/cfg/models/v8/yolov8-p2.yaml'
@@ -926,6 +973,19 @@ class Network(nn.Module):
         else:
             self.gcn = Evolution()
             self.diffusion_loss_fn = None
+
+        if (
+            self.pure2d_cnn_context is not None
+            and bool(getattr(cfg, 'pure2d_cnn_freeze_flow_parameters', False))
+            and self.gcn is not None
+        ):
+            for parameter in self.gcn.parameters():
+                parameter.requires_grad = False
+            print(
+                '[Flow2D-CNN] Flow parameters frozen for CNN feature alignment; '
+                'forward/backpropagation through Flow remains active.',
+                flush=True,
+            )
 
         if self.use_extreme_refine:
             # V4.6c detext 配置启用该分支：bbox 先变 40 点初始轮廓，
@@ -1629,7 +1689,10 @@ class Network(nn.Module):
             return output
 
         if (
-            self.detector_backend.startswith('heatmap_')
+            self.detector_backend in (
+                'flow_gt_only', 'flow_box_only', 'flow_gt_cnn', 'flow_box_cnn'
+            )
+            or self.detector_backend.startswith('heatmap_')
             or self.detector_backend.startswith('convnext')
             or self.detector_backend.startswith('moonvit')
         ):
@@ -1639,12 +1702,34 @@ class Network(nn.Module):
                 self.training,
                 batch,
             )
+            has_external_detection = bool(
+                batch is not None and batch.get('external_detection') is not None
+            )
+            if self.detector_backend in ('flow_gt_only', 'flow_gt_cnn') and not use_gt_detection:
+                raise RuntimeError(
+                    f'{self.detector_backend} has no detector fallback; '
+                    'GT detections must be active'
+                )
+            if (
+                self.detector_backend in ('flow_box_only', 'flow_box_cnn')
+                and not use_gt_detection
+                and not has_external_detection
+            ):
+                raise RuntimeError(
+                    f'{self.detector_backend} requires active GT detections '
+                    'or validated external_detection'
+                )
             skip_heatmap_detector = (
-                use_gt_detection
-                and bool(getattr(cfg, 'skip_heatmap_detector_when_gt', False))
-                and self.locate_feat_replace
-                and self.locate_feat_replacer is not None
-                and not self.use_extreme_refine
+                self.detector_backend in (
+                    'flow_gt_only', 'flow_box_only', 'flow_gt_cnn', 'flow_box_cnn'
+                )
+                or (
+                    use_gt_detection
+                    and bool(getattr(cfg, 'skip_heatmap_detector_when_gt', False))
+                    and self.locate_feat_replace
+                    and self.locate_feat_replacer is not None
+                    and not self.use_extreme_refine
+                )
             )
             if skip_heatmap_detector:
                 det_loss_weight = float(getattr(cfg, 'loss_scales', {}).get('det', 1.0))
@@ -1652,21 +1737,27 @@ class Network(nn.Module):
                     raise RuntimeError(
                         'skip_heatmap_detector_when_gt requires loss_scales.det=0 during training'
                     )
-                stride = max(int(round(self.down_ratio)), 1)
-                feature_h = (int(x.size(2)) + stride - 1) // stride
-                feature_w = (int(x.size(3)) + stride - 1) // stride
-                feature_channels = int(getattr(cfg, 'heatmap_feat_channels', 256))
-                feature_dtype = (
-                    torch.get_autocast_gpu_dtype()
-                    if torch.is_autocast_enabled() else x.dtype
-                )
-                cnn_feature = x.new_zeros(
-                    (x.size(0), feature_channels, feature_h, feature_w), dtype=feature_dtype
-                )
+                if self.detector_backend in ('flow_gt_cnn', 'flow_box_cnn'):
+                    cnn_feature = self.pure2d_cnn_context(x)
+                    feature_h, feature_w = cnn_feature.shape[-2:]
+                else:
+                    stride = max(int(round(self.down_ratio)), 1)
+                    feature_h = (int(x.size(2)) + stride - 1) // stride
+                    feature_w = (int(x.size(3)) + stride - 1) // stride
+                    feature_dtype = (
+                        torch.get_autocast_gpu_dtype()
+                        if torch.is_autocast_enabled() else x.dtype
+                    )
+                    cnn_feature = x.new_zeros(
+                        (x.size(0), 1, feature_h, feature_w), dtype=feature_dtype
+                    )
                 ct_hm = x.new_zeros(
-                    (x.size(0), self.detector_num_classes, feature_h, feature_w), dtype=feature_dtype
+                    (x.size(0), self.detector_num_classes, feature_h, feature_w),
+                    dtype=cnn_feature.dtype,
                 )
-                wh = x.new_zeros((x.size(0), 2, feature_h, feature_w), dtype=feature_dtype)
+                wh = x.new_zeros(
+                    (x.size(0), 2, feature_h, feature_w), dtype=cnn_feature.dtype
+                )
                 mask_logits = None
             else:
                 cnn_feature, ct_hm, wh, mask_logits = self.heatmap_detector(x)

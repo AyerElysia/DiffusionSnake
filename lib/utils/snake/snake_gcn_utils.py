@@ -55,7 +55,16 @@ def prepare_testing(output):
         i_it_py = torch.zeros([0, snake_config.poly_num, 2], device=i_it_4py.device, dtype=i_it_4py.dtype)
         c_it_py = torch.zeros_like(i_it_py)
     else:
-        i_it_py = uniform_upsample(i_it_4py.unsqueeze(0), snake_config.poly_num)[0]
+        if snake_config.init == 'octagon':
+            # Detector boxes are expressed in 512-input coordinates, whereas
+            # Flow and the training ``i_gt_py`` polygons use stride-4 feature
+            # coordinates.  Build the direct 128-point octagon used by the
+            # bbox-octagon training route, but only after converting scales.
+            _valid = score > 1e-4
+            _valid_boxes = box[_valid] / float(snake_config.down_ratio)
+            i_it_py = _box_to_octagon_init(_valid_boxes, snake_config.poly_num)
+        else:
+            i_it_py = uniform_upsample(i_it_4py.unsqueeze(0), snake_config.poly_num)[0]
         c_it_py = img_poly_to_can_poly(i_it_py)
     init.update({'i_it_py': i_it_py, 'c_it_py': c_it_py, 'py_ind': ind})
     return init
@@ -104,21 +113,259 @@ def build_box_octagon_from_poly(gt_poly, p_num=None):
     return _box_to_octagon_init(box, int(p_num))
 
 
-def replace_training_init_with_gt_box_octagon(train_dict):
-    """Make diffusion train from bbox-derived octagons instead of GT extremes."""
+def resolve_routeb_box_jitter_config(config):
+    """Validate and normalize the config for Route-B box augmentation."""
+    probabilities = [
+        float(value)
+        for value in getattr(
+            config, 'routeb_box_jitter_probabilities', [1.0, 0.0, 0.0, 0.0]
+        )
+    ]
+    shift_fractions = [
+        float(value)
+        for value in getattr(
+            config, 'routeb_box_jitter_shift_fractions', [0.0, 0.05, 0.10, 0.15]
+        )
+    ]
+    log_scale_fractions = [
+        float(value)
+        for value in getattr(
+            config,
+            'routeb_box_jitter_log_scale_fractions',
+            [0.0, 0.10, 0.20, 0.30],
+        )
+    ]
+    edge_fractions = [
+        float(value)
+        for value in getattr(
+            config, 'routeb_box_jitter_edge_fractions', [0.0, 0.03, 0.08, 0.15]
+        )
+    ]
+    lengths = {
+        len(probabilities),
+        len(shift_fractions),
+        len(log_scale_fractions),
+        len(edge_fractions),
+    }
+    if len(lengths) != 1 or len(probabilities) < 1:
+        raise ValueError(
+            'Route-B box jitter probability and amplitude lists must have the same '
+            'non-zero length'
+        )
+    if any(value < 0.0 for value in probabilities):
+        raise ValueError('Route-B box jitter probabilities must be non-negative')
+    if not all(np.isfinite(value) for value in probabilities):
+        raise ValueError('Route-B box jitter probabilities must be finite')
+    probability_sum = sum(probabilities)
+    if probability_sum <= 0.0:
+        raise ValueError('Route-B box jitter probabilities must have positive sum')
+    if any(value < 0.0 for value in shift_fractions + log_scale_fractions + edge_fractions):
+        raise ValueError('Route-B box jitter amplitudes must be non-negative')
+    if not all(
+        np.isfinite(value)
+        for value in shift_fractions + log_scale_fractions + edge_fractions
+    ):
+        raise ValueError('Route-B box jitter amplitudes must be finite')
+    if any(
+        abs(values[0]) > 1e-12
+        for values in (shift_fractions, log_scale_fractions, edge_fractions)
+    ):
+        raise ValueError('Route-B severity index 0 must be the exact clean-box route')
+
+    min_iou = float(getattr(config, 'routeb_box_jitter_min_iou', 0.20))
+    if not np.isfinite(min_iou) or not 0.0 <= min_iou <= 1.0:
+        raise ValueError('routeb_box_jitter_min_iou must be in [0, 1]')
+    return {
+        'enabled': bool(getattr(config, 'routeb_box_jitter_enabled', False)),
+        'probabilities': [value / probability_sum for value in probabilities],
+        'shift_fractions': shift_fractions,
+        'log_scale_fractions': log_scale_fractions,
+        'edge_fractions': edge_fractions,
+        'min_iou': min_iou,
+    }
+
+
+def _aligned_box_iou(box_a, box_b):
+    """Return IoU for aligned ``[N,4]`` xyxy box pairs."""
+    inter_lo = torch.maximum(box_a[:, :2], box_b[:, :2])
+    inter_hi = torch.minimum(box_a[:, 2:], box_b[:, 2:])
+    inter_wh = (inter_hi - inter_lo).clamp(min=0.0)
+    intersection = inter_wh[:, 0] * inter_wh[:, 1]
+    area_a_wh = (box_a[:, 2:] - box_a[:, :2]).clamp(min=0.0)
+    area_b_wh = (box_b[:, 2:] - box_b[:, :2]).clamp(min=0.0)
+    area_a = area_a_wh[:, 0] * area_a_wh[:, 1]
+    area_b = area_b_wh[:, 0] * area_b_wh[:, 1]
+    return intersection / (area_a + area_b - intersection).clamp(min=1e-6)
+
+
+def jitter_routeb_boxes_xyxy(box, jitter_config, image_hw=None):
+    """Perturb GT boxes before the shared Route-B box-to-octagon transform.
+
+    The target contour is never changed.  Severity zero is byte-for-byte the
+    clean GT-box route.  Positive severities combine normalized center shift,
+    anisotropic log-scale, and asymmetric edge error, then enforce a minimum
+    aligned IoU so augmentation cannot silently become a missing-detection task.
+    """
+    if box.dim() != 2 or box.size(-1) != 4:
+        raise ValueError(f'box must have shape [N,4], got {tuple(box.shape)}')
+    if not torch.is_floating_point(box):
+        raise TypeError('Route-B box jitter requires floating-point boxes')
+
+    instance_count = int(box.size(0))
+    if instance_count == 0:
+        zero = box.new_tensor(0.0)
+        return box.clone(), {
+            'routeb_box_jitter_count': zero,
+            'routeb_box_jitter_clean_count': zero,
+            'routeb_box_jitter_mean_iou': zero,
+            'routeb_box_jitter_min_iou': zero,
+            'routeb_box_jitter_severity_counts': box.new_zeros(
+                (len(jitter_config['probabilities']),)
+            ),
+        }
+
+    enabled = bool(jitter_config.get('enabled', False))
+    probabilities_list = jitter_config['probabilities']
+    clean_only = (
+        abs(float(probabilities_list[0]) - 1.0) <= 1e-12
+        and all(abs(float(value)) <= 1e-12 for value in probabilities_list[1:])
+    )
+    if not enabled or clean_only:
+        severity_counts = box.new_zeros((len(probabilities_list),))
+        severity_counts[0] = float(instance_count)
+        return box.clone(), {
+            'routeb_box_jitter_count': box.new_tensor(0.0),
+            'routeb_box_jitter_clean_count': box.new_tensor(float(instance_count)),
+            'routeb_box_jitter_mean_iou': box.new_tensor(1.0),
+            'routeb_box_jitter_min_iou': box.new_tensor(1.0),
+            'routeb_box_jitter_severity_counts': severity_counts,
+        }
+
+    probabilities = torch.as_tensor(
+        probabilities_list, dtype=torch.float32, device=box.device
+    )
+    severity = torch.multinomial(probabilities, instance_count, replacement=True)
+
+    amplitudes = {}
+    for name in ('shift_fractions', 'log_scale_fractions', 'edge_fractions'):
+        values = torch.as_tensor(jitter_config[name], dtype=box.dtype, device=box.device)
+        amplitudes[name] = values[severity]
+
+    gt_lo = box[:, :2]
+    gt_hi = box[:, 2:]
+    gt_wh = (gt_hi - gt_lo).clamp(min=1e-3)
+    gt_center = (gt_lo + gt_hi) * 0.5
+
+    center_noise = torch.rand_like(gt_center) * 2.0 - 1.0
+    jitter_center = gt_center + center_noise * amplitudes['shift_fractions'][:, None] * gt_wh
+    scale_noise = torch.rand_like(gt_wh) * 2.0 - 1.0
+    jitter_wh = gt_wh * torch.exp(
+        scale_noise * amplitudes['log_scale_fractions'][:, None]
+    )
+    candidate = torch.cat(
+        [jitter_center - jitter_wh * 0.5, jitter_center + jitter_wh * 0.5], dim=1
+    )
+
+    edge_noise = torch.rand_like(candidate) * 2.0 - 1.0
+    edge_scale = torch.cat([gt_wh, gt_wh], dim=1)
+    candidate = candidate + edge_noise * amplitudes['edge_fractions'][:, None] * edge_scale
+
+    active = severity > 0
+    candidate = torch.where(active[:, None], candidate, box)
+    if image_hw is not None:
+        image_h, image_w = int(image_hw[0]), int(image_hw[1])
+        if image_h < 2 or image_w < 2:
+            raise ValueError(f'image_hw must be at least 2x2, got {image_hw}')
+        max_xy = box.new_tensor([image_w - 1.0, image_h - 1.0])
+        lo = torch.maximum(
+            torch.minimum(candidate[:, :2], max_xy), torch.zeros_like(candidate[:, :2])
+        )
+        hi = torch.maximum(
+            torch.minimum(candidate[:, 2:], max_xy), torch.zeros_like(candidate[:, 2:])
+        )
+        lo, hi = torch.minimum(lo, hi), torch.maximum(lo, hi)
+        hi = torch.maximum(hi, lo + 1e-3)
+        hi = torch.minimum(hi, max_xy)
+        lo = torch.minimum(lo, hi - 1e-3).clamp(min=0.0)
+        candidate = torch.cat([lo, hi], dim=1)
+
+    finite_candidate = torch.isfinite(candidate).all(dim=1)
+    candidate = torch.where(finite_candidate[:, None], candidate, box)
+
+    min_iou = float(jitter_config.get('min_iou', 0.0))
+    if min_iou > 0.0:
+        # Deterministic projection toward the GT box avoids rejection loops and
+        # preserves strict checkpoint RNG reproducibility.
+        for _ in range(12):
+            iou = _aligned_box_iou(candidate, box)
+            bad = active & ((iou < min_iou) | (~torch.isfinite(iou)))
+            candidate = torch.where(
+                bad[:, None], (candidate + box) * 0.5, candidate
+            )
+
+        # The bounded production amplitudes converge well before twelve
+        # projections. This final tensor-only fallback makes the IoU floor an
+        # exact contract even for future, more aggressive configurations.
+        iou = _aligned_box_iou(candidate, box)
+        unresolved = active & ((iou < min_iou) | (~torch.isfinite(iou)))
+        candidate = torch.where(unresolved[:, None], box, candidate)
+
+    # In a mixed batch, clean members must stay identical to the historical
+    # Route-B geometry even if a legacy annotation lies on a map boundary.
+    candidate = torch.where(active[:, None], candidate, box)
+
+    iou = _aligned_box_iou(candidate, box)
+    severity_count = len(jitter_config['probabilities'])
+    severity_counts = torch.stack(
+        [(severity == index).sum() for index in range(severity_count)]
+    ).to(dtype=box.dtype)
+    stats = {
+        'routeb_box_jitter_count': active.sum().to(dtype=box.dtype),
+        'routeb_box_jitter_clean_count': (~active).sum().to(dtype=box.dtype),
+        'routeb_box_jitter_mean_iou': iou.mean(),
+        'routeb_box_jitter_min_iou': iou.min(),
+        'routeb_box_jitter_severity_counts': severity_counts,
+    }
+    return candidate, stats
+
+
+def replace_training_init_with_gt_box_octagon(
+    train_dict,
+    jitter_config=None,
+    image_hw=None,
+    return_jitter_stats=False,
+):
+    """Make diffusion train from one shared, optionally jittered GT box."""
     if 'i_gt_py' not in train_dict:
-        return train_dict
+        return (train_dict, {}) if return_jitter_stats else train_dict
     i_gt_py = train_dict['i_gt_py']
     if not torch.is_tensor(i_gt_py) or i_gt_py.numel() == 0:
-        return train_dict
+        return (train_dict, {}) if return_jitter_stats else train_dict
 
-    i_it_py = build_box_octagon_from_poly(i_gt_py, snake_config.poly_num)
-    i_it_4py = build_box_octagon_from_poly(i_gt_py, snake_config.init_poly_num)
+    gt_box = torch.cat([i_gt_py.min(dim=1)[0], i_gt_py.max(dim=1)[0]], dim=1)
+    if jitter_config is None:
+        jitter_config = {
+            'enabled': False,
+            'probabilities': [1.0],
+            'shift_fractions': [0.0],
+            'log_scale_fractions': [0.0],
+            'edge_fractions': [0.0],
+            'min_iou': 0.0,
+        }
+    init_box, jitter_stats = jitter_routeb_boxes_xyxy(
+        gt_box, jitter_config, image_hw=image_hw
+    )
+    # Both 40-point and 128-point initializations must come from the same box;
+    # sampling separate perturbations here would break the training contract.
+    i_it_py = _box_to_octagon_init(init_box, snake_config.poly_num)
+    i_it_4py = _box_to_octagon_init(init_box, snake_config.init_poly_num)
     train_dict = dict(train_dict)
     train_dict['i_it_py'] = i_it_py
     train_dict['c_it_py'] = img_poly_to_can_poly(i_it_py)
     train_dict['i_it_4py'] = i_it_4py
     train_dict['c_it_4py'] = img_poly_to_can_poly(i_it_4py)
+    if return_jitter_stats:
+        return train_dict, jitter_stats
     return train_dict
 
 

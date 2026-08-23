@@ -11,6 +11,10 @@ import json
 import lib.utils.snake.snake_gcn_utils as snake_gcn_utils
 from lib.utils.snake import snake_config, snake_decode
 from lib.config import cfg as global_cfg
+from lib.networks.snake.pure2d_context_utils import (
+    contour_geometry_features,
+    project_and_pad_feature_maps,
+)
 
 class FlowMatchingEvolution(nn.Module):
     """
@@ -67,64 +71,33 @@ class FlowMatchingEvolution(nn.Module):
             or getattr(global_cfg, 'use_dit_v4_2', False)
         )
         self.use_fourier_smooth = int(getattr(global_cfg, 'fourier_smooth_k', 0))
+        self.routeb_box_jitter_config = (
+            snake_gcn_utils.resolve_routeb_box_jitter_config(global_cfg)
+        )
+        if self.routeb_box_jitter_config['enabled']:
+            init_source = str(
+                getattr(global_cfg, 'diffusion_init_source', 'extreme')
+            ).strip().lower()
+            if init_source not in (
+                'gt_box_octagon',
+                'gt_bbox_octagon',
+                'box_octagon',
+                'bbox_octagon',
+            ):
+                raise ValueError(
+                    'routeb_box_jitter_enabled requires bbox-octagon training init'
+                )
+            print(
+                '[RouteBBoxJitter] enabled '
+                f"probabilities={self.routeb_box_jitter_config['probabilities']} "
+                f"shift={self.routeb_box_jitter_config['shift_fractions']} "
+                f"log_scale={self.routeb_box_jitter_config['log_scale_fractions']} "
+                f"edge={self.routeb_box_jitter_config['edge_fractions']} "
+                f"min_iou={self.routeb_box_jitter_config['min_iou']}"
+            )
 
         # V3.7: Per-Point Output Head (per-point embedding + per-point linear)
-        if getattr(global_cfg, 'use_dit_v3_7', False):
-            from .dit_denoiser_v3_7 import DiTFlowMatchingV3_7
-            _pt_scale = float(getattr(global_cfg, 'v3_7_point_embed_scale', 0.1))
-            _lap_w = float(getattr(global_cfg, 'v3_7_laplacian_weight', 0.0))
-            _inject_in = bool(getattr(global_cfg, 'v3_7_inject_at_input', False))
-            _inject_out = bool(getattr(global_cfg, 'v3_7_inject_at_output', False))
-            _per_pt = bool(getattr(global_cfg, 'v3_7_use_per_point_head', True))
-            _f64_head = bool(getattr(global_cfg, 'v3_7_use_float64_head', False))
-            _reg_pt = bool(getattr(global_cfg, 'v3_7_use_regularized_per_point', False))
-            _delta_scale = float(getattr(global_cfg, 'v3_7_delta_scale', 0.1))
-            _delta_reg = float(getattr(global_cfg, 'v3_7_delta_reg_weight', 0.001))
-            _scale_cond = bool(getattr(global_cfg, 'v3_7_use_scale_conditioning', False))
-            _detail_ctx = bool(getattr(global_cfg, 'v3_7_use_detail_context', False))
-            _detail_curve_ctx = bool(getattr(global_cfg, 'v3_7_use_detail_curve_context', False))
-            _detail_curve_inject_mode = str(
-                getattr(global_cfg, 'v3_7_detail_curve_inject_mode', 'both')
-            ).strip().lower()
-            _detail_mode = str(getattr(global_cfg, 'v3_7_detail_context_mode', 'normal')).strip().lower()
-            _detail_mult = self._detail_feature_multiplier(_detail_mode) if _detail_ctx else 0
-            _global_ctx_mode = str(getattr(global_cfg, 'v3_7_global_context_mode', 'patch')).strip().lower()
-            _global_queries = int(getattr(global_cfg, 'v3_7_global_num_queries', 256))
-            print(f"[FlowMatchingEvolution] Using DiT Flow Network V3.7 "
-                  f"(per_point_head={_per_pt}, regularized={_reg_pt}, "
-                  f"float64_head={_f64_head}, "
-                  f"inject_in={_inject_in}, inject_out={_inject_out}, "
-                  f"scale_cond={_scale_cond}, detail_ctx={_detail_ctx}, "
-                  f"detail_curve_ctx={_detail_curve_ctx}, "
-                  f"detail_mode={_detail_mode}, "
-                  f"curve_inject={_detail_curve_inject_mode}, "
-                  f"global_ctx={_global_ctx_mode}, global_queries={_global_queries}, "
-                  f"ODE steps={ode_steps})")
-            self.denoiser = DiTFlowMatchingV3_7(
-                state_dim=dit_state_dim,
-                feature_dim=feature_dim,
-                num_layers=dit_num_layers,
-                num_heads=dit_num_heads,
-                num_points=num_points,
-                use_per_point_head=_per_pt,
-                use_float64_head=_f64_head,
-                use_regularized_per_point=_reg_pt,
-                delta_scale=_delta_scale,
-                delta_reg_weight=_delta_reg,
-                point_embed_scale=_pt_scale,
-                laplacian_weight=_lap_w,
-                inject_at_input=_inject_in,
-                inject_at_output=_inject_out,
-                use_scale_conditioning=_scale_cond,
-                use_detail_context=_detail_ctx,
-                use_detail_curve_context=_detail_curve_ctx,
-                detail_curve_inject_mode=_detail_curve_inject_mode,
-                detail_feature_dim=feature_dim * _detail_mult,
-                use_self_conditioning=bool(getattr(global_cfg, 'v3_7_use_self_conditioning', False)),
-                global_context_mode=_global_ctx_mode,
-                global_num_queries=_global_queries,
-            )
-        elif getattr(global_cfg, 'use_dit_v3_1', False):
+        if getattr(global_cfg, 'use_dit_v3_1', False):
             from .dit_denoiser_v3_1 import DiTDenoiserV3_1
             print(f"[FlowMatchingEvolution] Using DiT Flow Network V3.1 "
                   f"(Patchify + Self->Cross, ODE steps={ode_steps})")
@@ -134,43 +107,6 @@ class FlowMatchingEvolution(nn.Module):
                 num_layers=dit_num_layers,
                 num_heads=dit_num_heads,
                 num_points=num_points,
-            )
-        elif getattr(global_cfg, 'use_dit_v4_2', False):
-            from .dit_denoiser_v4_2 import DiTFlowMatchingV4_2
-            _detail_ctx = bool(
-                getattr(global_cfg, 'v4_2_use_detail_context', False)
-                or getattr(global_cfg, 'v4_1_use_detail_context', False)
-                or getattr(global_cfg, 'v3_4_use_detail_context', False)
-            )
-            _detail_mode = self._resolve_detail_context_mode(global_cfg)
-            _detail_mult = self._detail_feature_multiplier(_detail_mode) if _detail_ctx else 1
-            _use_pp_delta = bool(getattr(global_cfg, 'v4_2_use_per_point_delta', True))
-            _pp_delta_scale = float(getattr(global_cfg, 'v4_2_per_point_delta_scale', 0.10))
-            _pp_delta_reg = float(getattr(global_cfg, 'v4_2_per_point_delta_reg_weight', 0.0))
-            _use_curv_cond = bool(getattr(global_cfg, 'v4_2_use_curvature_conditioning', True))
-            _curv_scale = float(getattr(global_cfg, 'v4_2_curvature_embed_scale', 0.10))
-            _use_delta_gate = bool(getattr(global_cfg, 'v4_2_use_delta_gate', True))
-            _delta_gate_bias = float(getattr(global_cfg, 'v4_2_delta_gate_bias', -2.0))
-            print(f"[FlowMatchingEvolution] Using DiT Flow Network V4.2 "
-                  f"(detail_ctx={_detail_ctx}, detail_mode={_detail_mode}, "
-                  f"per_point_delta={_use_pp_delta}, delta_scale={_pp_delta_scale}, "
-                  f"delta_reg={_pp_delta_reg}, curvature_cond={_use_curv_cond}, "
-                  f"delta_gate={_use_delta_gate}, ODE steps={ode_steps})")
-            self.denoiser = DiTFlowMatchingV4_2(
-                state_dim=dit_state_dim,
-                feature_dim=feature_dim,
-                num_layers=dit_num_layers,
-                num_heads=dit_num_heads,
-                num_points=num_points,
-                use_detail_context=_detail_ctx,
-                detail_feature_dim=feature_dim * _detail_mult,
-                use_per_point_delta=_use_pp_delta,
-                per_point_delta_scale=_pp_delta_scale,
-                per_point_delta_reg_weight=_pp_delta_reg,
-                use_curvature_conditioning=_use_curv_cond,
-                curvature_embed_scale=_curv_scale,
-                use_delta_gate=_use_delta_gate,
-                delta_gate_bias=_delta_gate_bias,
             )
         elif getattr(global_cfg, 'use_dit_v4_1', False):
             from .dit_denoiser_v4_1 import DiTFlowMatchingV4_1
@@ -451,18 +387,6 @@ class FlowMatchingEvolution(nn.Module):
                 detail_feature_dim=feature_dim * _detail_mult,
             )
         # V3.6: V3 global query + iterative refinement + Flow Matching
-        elif getattr(global_cfg, 'use_dit_v3_6', False):
-            from .dit_denoiser_v3_6 import DiTFlowMatchingV3_6
-            print(f"[FlowMatchingEvolution] Using DiT Flow Network V3.6 "
-                  f"(V3 global query + iterative refinement, ODE steps={ode_steps})")
-            self.denoiser = DiTFlowMatchingV3_6(
-                state_dim=dit_state_dim,
-                feature_dim=feature_dim,
-                num_layers=dit_num_layers,
-                num_heads=dit_num_heads,
-                num_points=num_points,
-            )
-        # V3.2: Efficient Self+Cross Attention with Flow Matching
         elif getattr(global_cfg, 'use_dit_v3_2', False):
             from .dit_denoiser_v3_2 import DiTFlowMatchingV3_2
             print(f"[FlowMatchingEvolution] Using DiT Flow Network V3.2 "
@@ -494,11 +418,15 @@ class FlowMatchingEvolution(nn.Module):
         self._locate_roi_grid = int(getattr(global_cfg, 'v11_locate_roi_grid', 6))
         self._locate_use_roi_tokens = bool(getattr(global_cfg, 'v11_locate_use_roi_tokens', True))
         self._locate_use_normal_tangent = bool(getattr(global_cfg, 'v11_locate_use_normal_tangent', True))
+        self._locate_use_geometry_token = bool(
+            getattr(global_cfg, 'v11_locate_use_geometry_token', False)
+        )
         self.locate_feat_proj = None
         self.locate_point_mixer = None
         self.locate_global_queries = None
         self.locate_global_attn = None
         self.locate_global_norm = None
+        self.locate_geometry_mlp = None
         if self._locate_token_enabled:
             locate_in_dim = int(getattr(global_cfg, 'locate_feat_dim', 2304))
             point_samples = 5 if self._locate_use_normal_tangent else 1
@@ -520,11 +448,19 @@ class FlowMatchingEvolution(nn.Module):
                 batch_first=True,
             )
             self.locate_global_norm = nn.LayerNorm(self._locate_token_dim)
+            if self._locate_use_geometry_token:
+                self.locate_geometry_mlp = nn.Sequential(
+                    nn.Linear(6, self._locate_token_dim),
+                    nn.SiLU(),
+                    nn.Linear(self._locate_token_dim, self._locate_token_dim),
+                    nn.LayerNorm(self._locate_token_dim),
+                )
             print(
                 f"[FlowMatchingEvolution] V11 LocateToken-DiT enabled "
                 f"(locate_only={self._locate_token_only}, dim={self._locate_token_dim}, "
                 f"global_tokens={self._locate_global_tokens}, roi_grid={self._locate_roi_grid}, "
-                f"normal_tangent={self._locate_use_normal_tangent})",
+                f"normal_tangent={self._locate_use_normal_tangent}, "
+                f"geometry_token={self._locate_use_geometry_token})",
                 flush=True,
             )
 
@@ -1018,6 +954,7 @@ class FlowMatchingEvolution(nn.Module):
         points: torch.Tensor,
         py_ind: torch.Tensor,
         batch: Dict[str, Any],
+        sample_hw: Optional[Tuple[int, int]] = None,
     ) -> torch.Tensor:
         """Map output-coordinate contour points to Locate patch-grid coordinates."""
         device, dtype = points.device, points.dtype
@@ -1081,8 +1018,12 @@ class FlowMatchingEvolution(nn.Module):
         feat_x = (src_x * scale + pad_left) / patch - 0.5
         feat_y = (src_y * scale + pad_top) / patch - 0.5
 
-        gh = grid_hw[py_ind, 0].view(n_contours, 1).clamp_min(1.0)
-        gw = grid_hw[py_ind, 1].view(n_contours, 1).clamp_min(1.0)
+        if sample_hw is None:
+            gh = grid_hw[py_ind, 0].view(n_contours, 1).clamp_min(1.0)
+            gw = grid_hw[py_ind, 1].view(n_contours, 1).clamp_min(1.0)
+        else:
+            gh = points.new_full((n_contours, 1), float(sample_hw[0])).clamp_min(1.0)
+            gw = points.new_full((n_contours, 1), float(sample_hw[1])).clamp_min(1.0)
         norm_x = torch.where(gw > 1.0, (feat_x / (gw - 1.0)) * 2.0 - 1.0, torch.zeros_like(feat_x))
         norm_y = torch.where(gh > 1.0, (feat_y / (gh - 1.0)) * 2.0 - 1.0, torch.zeros_like(feat_y))
         return torch.stack([norm_x, norm_y], dim=-1).unsqueeze(2)
@@ -1096,7 +1037,9 @@ class FlowMatchingEvolution(nn.Module):
         contour_scale: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         if not self._locate_use_normal_tangent:
-            grid = self._points_to_locate_grid(points, py_ind, batch)
+            grid = self._points_to_locate_grid(
+                points, py_ind, batch, sample_hw=locate_map.shape[-2:]
+            )
             sampled = F.grid_sample(
                 locate_map[py_ind.to(device=locate_map.device, dtype=torch.long)],
                 grid,
@@ -1124,7 +1067,9 @@ class FlowMatchingEvolution(nn.Module):
         feat_n = locate_map[py_ind.to(device=locate_map.device, dtype=torch.long)]
         sampled_terms = []
         for pts in sample_points:
-            grid = self._points_to_locate_grid(pts, py_ind, batch)
+            grid = self._points_to_locate_grid(
+                pts, py_ind, batch, sample_hw=locate_map.shape[-2:]
+            )
             sampled = F.grid_sample(
                 feat_n,
                 grid,
@@ -1160,7 +1105,12 @@ class FlowMatchingEvolution(nn.Module):
             y_max - y_min
         ).clamp_min(1.0).view(n_contours, 1, 1)
         roi_points = torch.stack([roi_x, roi_y], dim=-1).view(n_contours, grid_size * grid_size, 2)
-        grid = self._points_to_locate_grid(roi_points, py_ind, batch).view(n_contours, grid_size, grid_size, 2)
+        grid = self._points_to_locate_grid(
+            roi_points,
+            py_ind,
+            batch,
+            sample_hw=locate_map.shape[-2:],
+        ).view(n_contours, grid_size, grid_size, 2)
         sampled = F.grid_sample(
             locate_map[py_ind.to(device=locate_map.device, dtype=torch.long)],
             grid,
@@ -1185,11 +1135,27 @@ class FlowMatchingEvolution(nn.Module):
                 "Run Locate feature extraction or check locate_feat_cache_root."
             )
         raw = batch['locate_feat']
-        if not torch.is_tensor(raw):
-            raw = torch.as_tensor(raw)
         param = next(self.locate_feat_proj.parameters())
-        raw = raw.to(device=points.device, dtype=param.dtype, non_blocking=True)
-        locate_map = self.locate_feat_proj(raw).to(dtype=points.dtype)
+        if isinstance(raw, (list, tuple)):
+            locate_map, valid_spatial = project_and_pad_feature_maps(
+                raw,
+                self.locate_feat_proj,
+                device=points.device,
+                dtype=param.dtype,
+            )
+        else:
+            if not torch.is_tensor(raw):
+                raw = torch.as_tensor(raw)
+            raw = raw.to(device=points.device, dtype=param.dtype, non_blocking=True)
+            if raw.dim() == 3:
+                raw = raw.unsqueeze(0)
+            locate_map = self.locate_feat_proj(raw)
+            valid_spatial = torch.ones(
+                (locate_map.size(0), locate_map.size(2), locate_map.size(3)),
+                device=locate_map.device,
+                dtype=torch.bool,
+            )
+        locate_map = locate_map.to(dtype=points.dtype)
 
         point_ctx = self._sample_locate_points(
             locate_map,
@@ -1201,21 +1167,46 @@ class FlowMatchingEvolution(nn.Module):
 
         bsz, channels, h, w = locate_map.shape
         tokens = locate_map.flatten(2).transpose(1, 2)
+        key_padding_mask = ~valid_spatial.flatten(1)
         queries = self.locate_global_queries.weight.to(device=points.device, dtype=points.dtype)
         queries = queries.unsqueeze(0).expand(bsz, -1, -1)
-        global_ctx, _ = self.locate_global_attn(queries, tokens, tokens, need_weights=False)
+        global_ctx, _ = self.locate_global_attn(
+            queries,
+            tokens,
+            tokens,
+            key_padding_mask=key_padding_mask,
+            need_weights=False,
+        )
         global_ctx = self.locate_global_norm(global_ctx + queries)
         global_ctx = global_ctx[py_ind.to(device=points.device, dtype=torch.long)]
         if self._locate_use_roi_tokens:
             roi_ctx = self._sample_locate_roi_tokens(locate_map, points, py_ind, batch)
             global_ctx = torch.cat([global_ctx, roi_ctx], dim=1)
-        return {
+        geometry_ctx = None
+        if self._locate_use_geometry_token:
+            inp_out_hw = self._batch_meta_tensor(
+                batch, 'inp_out_hw', points.device, points.dtype
+            )
+            if inp_out_hw is None:
+                raise KeyError(
+                    "v11_locate_use_geometry_token=True requires meta.inp_out_hw"
+                )
+            geometry = contour_geometry_features(points, py_ind, inp_out_hw)
+            geometry_param = next(self.locate_geometry_mlp.parameters())
+            geometry_ctx = self.locate_geometry_mlp(
+                geometry.to(dtype=geometry_param.dtype)
+            ).to(dtype=points.dtype).unsqueeze(1)
+            global_ctx = torch.cat([global_ctx, geometry_ctx], dim=1)
+        result = {
             'locate_point_ctx': point_ctx,
             'locate_global_ctx': global_ctx,
             'locate_only': self._locate_token_only,
             'locate_map_absmax': locate_map.detach().abs().max(),
             'locate_point_ctx_absmax': point_ctx.detach().abs().max(),
         }
+        if geometry_ctx is not None:
+            result['locate_geometry_ctx_absmax'] = geometry_ctx.detach().abs().max()
+        return result
 
     @staticmethod
     def fourier_smooth(disp: torch.Tensor, k: int) -> torch.Tensor:
@@ -2447,7 +2438,23 @@ class FlowMatchingEvolution(nn.Module):
                     )
             init_source = str(getattr(global_cfg, 'diffusion_init_source', 'extreme')).strip().lower()
             if init_source in ('gt_box_octagon', 'gt_bbox_octagon', 'box_octagon', 'bbox_octagon'):
-                train_dict = snake_gcn_utils.replace_training_init_with_gt_box_octagon(train_dict)
+                train_dict, box_jitter_stats = (
+                    snake_gcn_utils.replace_training_init_with_gt_box_octagon(
+                        train_dict,
+                        jitter_config=self.routeb_box_jitter_config,
+                        image_hw=(cnn_feature.size(2), cnn_feature.size(3)),
+                        return_jitter_stats=True,
+                    )
+                )
+                severity_counts = box_jitter_stats.get(
+                    'routeb_box_jitter_severity_counts'
+                )
+                if isinstance(severity_counts, torch.Tensor):
+                    for severity_index, severity_count in enumerate(severity_counts):
+                        box_jitter_stats[
+                            f'routeb_box_jitter_severity_{severity_index}_count'
+                        ] = severity_count
+                ret.update(box_jitter_stats)
                 ret['diffusion_init_source'] = init_source
             elif (
                 bool(getattr(global_cfg, 'use_pred_extreme_init_for_diffusion', False))
@@ -2555,9 +2562,56 @@ class FlowMatchingEvolution(nn.Module):
                 iter_steps = int(getattr(global_cfg, 'iterative_num_steps', 3))
                 full_disp = x1_raw.clone()
                 B = x1_raw.size(0)
+                use_v4_10_cont = bool(getattr(global_cfg, 'v4_10_use_continuous_sampling', False))
                 use_rich_state_sampling = bool(getattr(global_cfg, 'v4_9_use_rich_state_sampling', False))
                 use_mixed_iter_interp = bool(getattr(global_cfg, 'v4_4_use_mixed_iter_interp', False))
-                if use_rich_state_sampling:
+                if use_v4_10_cont:
+                    # v4_10 continuous sampling: mixture-of-Gaussians centred at outer-loop
+                    # inference targets, blended with uniform background. Fully vectorised,
+                    # no host<->device syncs. Design details committed in AGENTS.md §v4_10.
+                    # centers = {0} ∪ v4_9_infer_target_fractions[:-1]
+                    # weights = work-proportional blended with uniform (λ=0.30)
+                    # noise   = folded Gaussian σ=0.05, background = 15% Uniform[0,0.999]
+                    _sigma = max(float(getattr(global_cfg, 'v4_10_sigma', 0.05)), 1e-6)
+                    _bg_p  = min(max(float(getattr(global_cfg, 'v4_10_uniform_bg_prob', 0.15)), 0.0), 1.0)
+
+                    # Build center list (host-side, tiny, no device sync)
+                    _raw_c = list(getattr(global_cfg, 'v4_10_centers', None) or [])
+                    if not _raw_c:
+                        _inf = list(getattr(global_cfg, 'v4_9_infer_target_fractions',
+                                            [0.3333, 0.5, 0.80, 0.97, 1.0]))
+                        _raw_c = [0.0] + [float(f) for f in _inf[:-1]]
+                    _centers = [min(max(float(_c), 0.0), 0.999) for _c in _raw_c]
+                    _K = max(len(_centers), 1)
+
+                    _raw_w = list(getattr(global_cfg, 'v4_10_center_weights', None) or [])
+                    if len(_raw_w) != _K:
+                        # Default work-proportional weights (for 5-center default config)
+                        # from tools/volmem/design_continuous_sampling.py, λ=0.30 blend.
+                        _wp_def = [0.2933, 0.1767, 0.27, 0.179, 0.081]
+                        _raw_w = _wp_def if len(_wp_def) == _K else [1.0 / _K] * _K
+                    _ws = sum(_raw_w)
+                    _weights = [w / _ws for w in _raw_w] if _ws > 0 else [1.0 / _K] * _K
+
+                    # Vectorised categorical draw via CDF + single uniform (sync-free)
+                    _ct  = torch.tensor(_centers, device=device, dtype=full_disp.dtype)  # (K,)
+                    _wt  = torch.tensor(_weights, device=device, dtype=full_disp.dtype)  # (K,)
+                    _cdf = _wt.cumsum(0)                                                  # (K,)
+                    _r   = torch.rand(B, device=device, dtype=full_disp.dtype)            # (B,)
+                    # index = number of CDF steps strictly below r (i.e. argmax of r < cdf)
+                    _cidx  = (_r.unsqueeze(1) >= _cdf.unsqueeze(0)).sum(1).clamp_(0, _K - 1)
+                    _sel_c = _ct[_cidx]                                                   # (B,)
+
+                    # Gaussian noise + fold to [0, 0.999]
+                    _noise  = torch.randn(B, device=device, dtype=full_disp.dtype).mul_(_sigma)
+                    _frac_g = (_sel_c + _noise).clamp_(0.0, 0.999)
+
+                    # Uniform background override
+                    _bg_mask = torch.rand(B, device=device) < _bg_p
+                    _frac_u  = torch.rand(B, device=device, dtype=full_disp.dtype).mul_(0.999)
+                    frac = torch.where(_bg_mask, _frac_u, _frac_g).view(B, 1, 1)
+                    used_mixed_iter_interp = True
+                elif use_rich_state_sampling:
                     cont_p = max(float(getattr(global_cfg, 'v4_9_continuous_state_prob', 0.60)), 0.0)
                     disc_p = max(float(getattr(global_cfg, 'v4_9_discrete_state_prob', 0.0)), 0.0)
                     small_p = max(float(getattr(global_cfg, 'v4_9_small_state_prob', 0.25)), 0.0)

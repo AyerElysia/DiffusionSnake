@@ -128,6 +128,13 @@ cfg.sagittal_moonvit_expected_input_size = 448
 cfg.sagittal_moonvit_expected_patch_size = 14
 cfg.sagittal_moonvit_expected_normalization = 'moonvit_pretrained_rgb_mean_std'
 cfg.sagittal_moonvit_expected_checkpoint = ''
+cfg.sagittal_train_exclude_case_ids = []
+cfg.sagittal_eval_include_case_ids = []
+cfg.sagittal_forbidden_case_ids = []
+cfg.sagittal_expected_train_case_count = 0
+cfg.sagittal_expected_train_row_count = 0
+cfg.sagittal_expected_eval_case_count = 0
+cfg.sagittal_expected_eval_row_count = 0
 cfg.use_swin_snake_feature = False
 cfg.swin_model_name = 'swin_tiny_patch4_window7_224'
 cfg.swin_img_size = 672
@@ -475,6 +482,18 @@ cfg.diffusion_init_source = 'extreme'
 cfg.ex_box_jitter_scale = 0.0
 cfg.ex_box_jitter_shift = 0.0
 cfg.pred_extreme_init_prob = -1.0  # <0 keeps legacy use_pred_extreme_init_for_diffusion behavior.
+
+# Route-B detector-box robustness augmentation.  This is deliberately
+# independent of ``flow_train_noise_scale`` (state noise) and the legacy
+# ``ex_box_jitter_*`` extreme-refiner augmentation.  Severity index 0 must be
+# the exact clean GT-box route; later entries describe progressively stronger
+# center, log-scale, and asymmetric edge perturbations.
+cfg.routeb_box_jitter_enabled = False
+cfg.routeb_box_jitter_probabilities = [1.0, 0.0, 0.0, 0.0]
+cfg.routeb_box_jitter_shift_fractions = [0.0, 0.05, 0.10, 0.15]
+cfg.routeb_box_jitter_log_scale_fractions = [0.0, 0.10, 0.20, 0.30]
+cfg.routeb_box_jitter_edge_fractions = [0.0, 0.03, 0.08, 0.15]
+cfg.routeb_box_jitter_min_iou = 0.20
 
 # -----------------------------------------------------------------------------
 # snake
