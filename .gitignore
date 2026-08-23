@@ -201,6 +201,15 @@ clash/
 .gemini/
 SAMSnake/
 
+# Small, signed mainline metadata is source code, not generated data.
+!/configs/manifests/
+!/configs/manifests/volmem_fourier_validation37.csv
+!/data/
+/data/*
+!/data/stats/
+/data/stats/*
+!/data/stats/volmem_sagittal_disp_stats.json
+
 ################################################################################
 # Temporary / Generated Files (2026-07-31 cleanup)
 ################################################################################

@@ -378,60 +378,15 @@ cfg.enable_tf32 = True
 cfg.cudnn_benchmark = True
 cfg.cuda_empty_cache_interval = 0
 
-# V5.0: optional SAM mask-based contour initialization.
 cfg.contour_init_method = 'octagon'
-cfg.sam_weight = ''
-cfg.sam_allow_download = False
-cfg.sam_imgsz = 1024
-cfg.sam_prompt_source = 'yolo_box'
-cfg.sam_train_prompt_source = 'gt_box'
-cfg.sam_train_match_iou_min = 0.10
-cfg.sam_train_det_score_thresh = 1e-4
-cfg.sam_det_score_thresh = 1e-4
-cfg.sam_min_mask_area = 16
-cfg.sam_fallback = 'octagon'
-cfg.sam_use_in_train = True
-cfg.sam_backend = ''
-cfg.efficient_sam_weight = ''
-cfg.efficient_sam_encoder_dim = 192
-cfg.efficient_sam_encoder_heads = 3
-cfg.efficient_sam_bgr_to_rgb = True
-cfg.efficient_sam_mask_threshold = 0.0
-cfg.efficient_sam_multimask_select = 'area'
-cfg.samsnake_dla_pretrained = False
-cfg.samsnake_use_dcn = False
-cfg.samsnake_dla_last_level = 5
-cfg.v5_2_use_samsnake_refine = False
-cfg.samsnake_refine_stride = 4.0
-cfg.samsnake_refine_zero_init = True
-cfg.samsnake_refine_max_disp_frac = 0.0
-cfg.samsnake_refine_ignore = False
 cfg.fm_max_disp_frac = 0.0
-
-# demo
-cfg.demo_vis = '/mnt/date/zhangrch/EnergeSnake/zrc_visual/2301/'
-#cfg.demo_path = '/home/ub/PycharmProjects/EnergeSnake/multiple_segmentdata/808/'
-cfg.demo_path = '/mnt/date/zhangrch/EnergeSnake/multiple_segmentdata/setA/'
-
-# -----------------------------------------------------------------------------
-# pretrain for drn
-# -----------------------------------------------------------------------------
-cfg.pretrain_drn = CN()
-# 训练数据路径
-cfg.pretrain_drn.train_images_path = '/mnt/date/zhangrch/EnergeSnake/multiple_segmentdata/newenergy/resized'
-# 模型参数保存位置
-cfg.pretrain_drn.state_dir = '/mnt/date/zhangrch/EnergeSnake/data/model/pretrain_drn/pretrain_epoch_100.pth'
-# 训练数据数量
-cfg.pretrain_drn.image_nums = 808
-# batch_size
-cfg.pretrain_drn.batch_size = 3
 
 # -----------------------------------------------------------------------------
 # train
 # -----------------------------------------------------------------------------
 cfg.train = CN()
 
-cfg.train.dataset = 'SbdTrain'
+cfg.train.dataset = 'VolMemTrain'
 cfg.train.epoch = 140
 cfg.train.max_steps = 0
 cfg.train.num_workers = 8
@@ -451,17 +406,10 @@ cfg.train.gamma = 0.5
 
 cfg.train.batch_size = 4
 
-cfg.train.data_path = '/multiple_segmentdata/2301/'
-
-
-# -----------------------------------------------------------------------------
-# vis_GT
-# -----------------------------------------------------------------------------
 cfg.test = CN()
-cfg.test.dataset = 'SbdMini'
+cfg.test.dataset = 'VolMemDev8'
 cfg.test.batch_size = 1
 cfg.test.epoch = -1
-cfg.test.img_path = '/mnt/date/zhangrch/EnergeSnake/multiple_segmentdata/setA/'
 cfg.test.visual_save_root = 'data/eval_vis'
 
 # recorder
@@ -534,17 +482,9 @@ def _infer_default_cfg(args):
     if env_cfg:
         return env_cfg
     script = Path(sys.argv[0]).stem.lower()
-    if "grpo_train" in script:
-        btcv_grpo_cfg = Path("configs/btcv_diffusion_dit_v3_4_fm_yolom_grpo_posttrain.yaml")
-        if btcv_grpo_cfg.exists():
-            return str(btcv_grpo_cfg)
-        btcv_grpo_cfg = Path("configs/btcv_diffusion_dit_v3_1_fm_posttrain.yaml")
-        if btcv_grpo_cfg.exists():
-            return str(btcv_grpo_cfg)
-        return "configs/grpo_snake.yaml"
-    if "diffusion_train" in script:
-        return "configs/diffusion_snake.yaml"
-    return "configs/sbd_snake.yaml"
+    if "train_rl" in script:
+        return "configs/stage2_rl.yaml"
+    return "configs/stage1.yaml"
 
 
 def make_cfg(args):

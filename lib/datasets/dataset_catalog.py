@@ -1,173 +1,59 @@
-from lib.config import cfg
+"""Dataset registry for the VerSe sagittal mainline."""
+
+from __future__ import annotations
+
+import os
+from pathlib import Path
 
 
-class DatasetCatalog(object):
-    dataset_attrs = {
-        'SbdTrain': {
-            'id': 'sbd',
-            'data_root': 'data/sbd/img',
-            'ann_file': 'data/sbd/annotations/sbd_train_instance.json',
-            'split': 'train'
-        },
-        'SbdVal': {
-            'id': 'sbd',
-            'data_root': 'data/sbd/img',
-            'ann_file': 'data/sbd/annotations/sbd_trainval_instance.json',
-            'split': 'val'
-        },
-        'SbdMini': {
-            'id': 'sbd',
-            'data_root': 'data/sbd/img',
-            'ann_file': 'data/sbd/annotations/sbd_trainval_instance.json',
-            'split': 'mini'
-        },
-        'SbdMedicalTrain': {
-            'id': 'sbd',
-            'data_root': '/mnt/sdb1/leijh/EnergySnake1/Data_processed/1232processed',
-            'ann_file': 'dummy_annotations.json',
-            'split': 'mini'
-        },
-        'BtcvTrain': {
-            'id': 'sbd',
-            'data_root': '/home/medteam/Zhrch/Datasets/BTCV/btcv_png_snake',
-            'ann_file': 'dummy_annotations.json',
-            'split': 'train'
-        },
-        'BtcvVal': {
-            'id': 'sbd',
-            'data_root': '/home/medteam/Zhrch/Datasets/BTCV/btcv_png_snake',
-            'ann_file': 'dummy_annotations.json',
-            'split': 'val'
-        },
-        'BtcvMini': {
-            'id': 'sbd',
-            'data_root': '/home/medteam/Zhrch/Datasets/BTCV/btcv_png_snake',
-            'ann_file': 'dummy_annotations.json',
-            'split': 'mini'
-        },
-        'RaosTrain': {
-            'id': 'sbd',
-            'data_root': '/home/medteam/Zhrch/Datasets/RAOS/RAOS-Real/CancerImages_Set1/processed_Tr_resized',
-            'ann_file': 'dummy_annotations.json',
-            'split': 'train'
-        },
-        'RaosVal': {
-            'id': 'sbd',
-            'data_root': '/home/medteam/Zhrch/Datasets/RAOS/RAOS-Real/CancerImages_Set1/processed_Ts_resized',
-            'ann_file': 'dummy_annotations.json',
-            'split': 'val'
-        },
-        'RaosMini': {
-            'id': 'sbd',
-            'data_root': '/home/medteam/Zhrch/Datasets/RAOS/RAOS-Real/CancerImages_Set1/processed_Tr_resized',
-            'ann_file': 'dummy_annotations.json',
-            'split': 'mini'
-        },
-        'PanNukeTrain': {
-            'id': 'sbd',
-            'data_root': '/home/medteam/Zhrch/Datasets/PanNuke/pannuke_snake',
-            'ann_file': 'dummy_annotations.json',
-            'split': 'train'
-        },
-        'PanNukeVal': {
-            'id': 'sbd',
-            'data_root': '/home/medteam/Zhrch/Datasets/PanNuke/pannuke_snake',
-            'ann_file': 'dummy_annotations.json',
-            'split': 'val'
-        },
-        'PanNukeMini': {
-            'id': 'sbd',
-            'data_root': '/home/medteam/Zhrch/Datasets/PanNuke/pannuke_snake',
-            'ann_file': 'dummy_annotations.json',
-            'split': 'mini'
-        },
-        'AvbceTrain': {
-            'id': 'sbd',
-            'data_root': '/home/medteam/Zhrch/Datasets/MR_AVBCE/1232processed',
-            'ann_file': 'dummy_annotations.json',
-            'split': 'train'
-        },
-        'AvbceVal': {
-            'id': 'sbd',
-            'data_root': '/home/medteam/Zhrch/Datasets/MR_AVBCE/230processed',
-            'ann_file': 'dummy_annotations.json',
-            'split': 'val'
-        },
-        'AvbceMini': {
-            'id': 'sbd',
-            'data_root': '/home/medteam/Zhrch/Datasets/MR_AVBCE/1232processed',
-            'ann_file': 'dummy_annotations.json',
-            'split': 'mini'
-        },
-        'Proc1232Train': {
-            'id': 'sbd',
-            'data_root': '/home/medteam/Zhrch/Data_processed/1232processed',
-            'ann_file': 'dummy_annotations.json',
-            'split': 'train'
-        },
-        'Proc1232Val': {
-            'id': 'sbd',
-            'data_root': '/home/medteam/Zhrch/Data_processed/1232processed',
-            'ann_file': 'dummy_annotations.json',
-            'split': 'val'
-        },
-        'Proc1232Mini': {
-            'id': 'sbd',
-            'data_root': '/home/medteam/Zhrch/Data_processed/1232processed',
-            'ann_file': 'dummy_annotations.json',
-            'split': 'mini'
-        },
-        'VolMemTrain': {
-            'id': 'sagittal_2d_fixed',
-            'data_root': '/home/medteam/Zhrch/detect_3D_lgz2/datasets/sagittal_2d_fixed',
-            'ann_file': '/home/medteam/Zhrch/detect_3D_lgz2/datasets/sagittal_2d_fixed/manifests/slice_manifest.csv',
-            'split': 'train'
-        },
-        'VolMemVal': {
-            'id': 'sagittal_2d_fixed',
-            'data_root': '/home/medteam/Zhrch/detect_3D_lgz2/datasets/sagittal_2d_fixed',
-            'ann_file': '/home/medteam/Zhrch/detect_3D_lgz2/datasets/sagittal_2d_fixed/manifests/slice_manifest.csv',
-            'split': 'val'
-        },
-        'VolMemDev8': {
-            'id': 'sagittal_2d_fixed',
-            'data_root': '/home/medteam/Zhrch/detect_3D_lgz2/datasets/sagittal_2d_fixed',
-            'ann_file': '/home/medteam/Zhrch/detect_3D_lgz2/datasets/sagittal_2d_fixed/manifests/slice_manifest.csv',
-            'split': 'dev'
-        },
-        'VolMemTest': {
-            'id': 'sagittal_2d_fixed',
-            'data_root': '/home/medteam/Zhrch/detect_3D_lgz2/datasets/sagittal_2d_fixed',
-            'ann_file': '/home/medteam/Zhrch/detect_3D_lgz2/datasets/sagittal_2d_fixed/manifests/slice_manifest.csv',
-            'split': 'test'
-        },
-        'SagittalPseudo3DTrain': {
-            'id': 'sagittal_2d_fixed',
-            'data_root': '/home/medteam/Zhrch/detect_3D_lgz2/datasets/sagittal_2d_fixed',
-            'ann_file': '/home/medteam/Zhrch/detect_3D_lgz2/datasets/sagittal_2d_fixed/manifests/slice_manifest.csv',
-            'split': 'train'
-        },
-        'SagittalPseudo3DVal': {
-            'id': 'sagittal_2d_fixed',
-            'data_root': '/home/medteam/Zhrch/detect_3D_lgz2/datasets/sagittal_2d_fixed',
-            'ann_file': '/home/medteam/Zhrch/detect_3D_lgz2/datasets/sagittal_2d_fixed/manifests/slice_manifest.csv',
-            'split': 'val'
-        },
-        'SagittalPseudo3DMini': {
-            'id': 'sagittal_2d_fixed',
-            'data_root': '/home/medteam/Zhrch/detect_3D_lgz2/datasets/sagittal_2d_fixed',
-            'ann_file': '/home/medteam/Zhrch/detect_3D_lgz2/datasets/sagittal_2d_fixed/manifests/slice_manifest.csv',
-            'split': 'mini'
-        },
-        'SagittalPseudo3DTest': {
-            'id': 'sagittal_2d_fixed',
-            'data_root': '/home/medteam/Zhrch/detect_3D_lgz2/datasets/sagittal_2d_fixed',
-            'ann_file': '/home/medteam/Zhrch/detect_3D_lgz2/datasets/sagittal_2d_fixed/manifests/slice_manifest.csv',
-            'split': 'test'
-        }
+def _dataset_paths() -> tuple[str, str]:
+    """Resolve data from environment variables, with repository-local defaults."""
+    root = Path(os.environ.get("DIFFUSIONSNAKE_DATA_ROOT", "data/verse_sagittal"))
+    manifest = Path(
+        os.environ.get(
+            "DIFFUSIONSNAKE_SLICE_MANIFEST",
+            str(root / "manifests" / "slice_manifest.csv"),
+        )
+    )
+    return str(root), str(manifest)
+
+
+def _entry(split: str) -> dict[str, str]:
+    root, manifest = _dataset_paths()
+    return {
+        "id": "sagittal_2d_fixed",
+        "data_root": root,
+        "ann_file": manifest,
+        "split": split,
     }
 
-    @staticmethod
-    def get(name):
-        attrs = DatasetCatalog.dataset_attrs[name]
-        return attrs.copy()
+
+class DatasetCatalog:
+    """The four sequence-safe VerSe splits used by training and evaluation."""
+
+    dataset_attrs = {
+        "VolMemTrain": _entry("train"),
+        "VolMemVal": _entry("val"),
+        "VolMemDev8": _entry("dev"),
+        "VolMemTest": _entry("test"),
+    }
+
+    @classmethod
+    def refresh_paths(cls) -> None:
+        """Apply environment overrides set after module import."""
+        for name, split in (
+            ("VolMemTrain", "train"),
+            ("VolMemVal", "val"),
+            ("VolMemDev8", "dev"),
+            ("VolMemTest", "test"),
+        ):
+            cls.dataset_attrs[name] = _entry(split)
+
+    @classmethod
+    def get(cls, name: str) -> dict:
+        if name not in cls.dataset_attrs:
+            raise KeyError(
+                f"unknown mainline dataset {name!r}; "
+                f"available={sorted(cls.dataset_attrs)}"
+            )
+        return cls.dataset_attrs[name].copy()

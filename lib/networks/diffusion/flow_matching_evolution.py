@@ -11,7 +11,7 @@ import json
 import lib.utils.snake.snake_gcn_utils as snake_gcn_utils
 from lib.utils.snake import snake_config, snake_decode
 from lib.config import cfg as global_cfg
-from lib.networks.snake.pure2d_context_utils import (
+from lib.networks.feature_sampling import (
     contour_geometry_features,
     project_and_pad_feature_maps,
 )
@@ -2422,20 +2422,6 @@ class FlowMatchingEvolution(nn.Module):
         
         if self.training:
             train_dict = snake_gcn_utils.prepare_training(output, batch)
-            from lib.utils.snake.sam_init import sam_init_enabled
-            if sam_init_enabled():
-                h, w = cnn_feature.size(2), cnn_feature.size(3)
-                from lib.utils.snake.sam_init import maybe_replace_training_init, maybe_use_output_sam_training_init
-                train_dict = maybe_use_output_sam_training_init(train_dict, output)
-                if not torch.is_tensor(output.get('sam_i_it_py', None)):
-                    train_dict = maybe_replace_training_init(
-                        train_dict,
-                        output,
-                        batch,
-                        device=device,
-                        out_h=h,
-                        out_w=w,
-                    )
             init_source = str(getattr(global_cfg, 'diffusion_init_source', 'extreme')).strip().lower()
             if init_source in ('gt_box_octagon', 'gt_bbox_octagon', 'box_octagon', 'bbox_octagon'):
                 train_dict, box_jitter_stats = (
@@ -2586,8 +2572,7 @@ class FlowMatchingEvolution(nn.Module):
 
                     _raw_w = list(getattr(global_cfg, 'v4_10_center_weights', None) or [])
                     if len(_raw_w) != _K:
-                        # Default work-proportional weights (for 5-center default config)
-                        # from tools/volmem/design_continuous_sampling.py, λ=0.30 blend.
+                        # Fixed work-proportional weights for the five-center schedule.
                         _wp_def = [0.2933, 0.1767, 0.27, 0.179, 0.081]
                         _raw_w = _wp_def if len(_wp_def) == _K else [1.0 / _K] * _K
                     _ws = sum(_raw_w)

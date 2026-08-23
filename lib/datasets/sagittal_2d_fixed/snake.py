@@ -7,7 +7,7 @@ import torch
 import torch.utils.data as data
 
 from lib.config import cfg
-from lib.datasets.voc.snake import Dataset as VocDataset
+from lib.datasets.contour_targets import ContourTargetMixin
 from lib.utils.snake import snake_config, snake_voc_utils
 
 
@@ -28,7 +28,7 @@ _MOONVIT_PATCH_SIZE = 14
 _MOONVIT_NORMALIZATION = 'moonvit_pretrained_rgb_mean_std'
 
 
-class Dataset(VocDataset):
+class Dataset(ContourTargetMixin, data.Dataset):
     """Sagittal pseudo-3D slices with center-slice contour supervision."""
 
     @staticmethod

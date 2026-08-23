@@ -1,1 +1,1 @@
-from .make_evaluator import make_evaluator
+"""Evaluation adapters used by the fixed VerSe mainline."""

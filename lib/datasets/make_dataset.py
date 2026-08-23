@@ -1,45 +1,32 @@
-from .transforms import make_transforms
-from . import samplers
-from .dataset_catalog import DatasetCatalog
+import importlib
+import os
+
 import torch
 import torch.utils.data
 import torch.utils.data.distributed
-import importlib.util
-import os
+
+from . import samplers
 from .collate_batch import make_collator
+from .dataset_catalog import DatasetCatalog
+from .transforms import make_transforms
 
 
 torch.multiprocessing.set_sharing_strategy('file_system')
 
 
 def _dataset_factory(data_source, task):
-    module_name = '.'.join(['lib.datasets', data_source, task])
-    path = os.path.join('lib/datasets', data_source, task+'.py')
-
-    # Use importlib instead of deprecated imp
-    spec = importlib.util.spec_from_file_location(module_name, path)
-    module = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(module)
-    dataset = module.Dataset
-    return dataset
-    # 动态加载类， 函数返回 Dataset 类，而不是类的实例，用的时候要创建实例化对象。
+    if data_source != 'sagittal_2d_fixed' or task != 'snake':
+        raise ValueError('the mainline only supports sagittal_2d_fixed/snake')
+    return importlib.import_module(
+        'lib.datasets.sagittal_2d_fixed.snake'
+    ).Dataset
 
 def make_dataset(cfg, dataset_name, transforms, is_train=True):
     args = DatasetCatalog.get(dataset_name)
-    ''' :args 长这个样子：    'SbdTrain': {
-                              'id': 'sbd',
-                              'data_root': 'data/sbd/img',
-                              'ann_file': 'data/sbd/annotations/sbd_train_instance.json',
-                                'split': 'train'
-                                  },'''
     data_source = args['id']
     dataset = _dataset_factory(data_source, cfg.task)
-    del args['id']  # 删除args字典中的元素（id为键）
-    # args['cfg'] = cfg
-    # args['transforms'] = transforms
-    # args['is_train'] = is_train
-    dataset = dataset(**args)  # 创建 Dataset 类的实例化对象
-    return dataset
+    del args['id']
+    return dataset(**args)
 
 
 def make_data_sampler(
