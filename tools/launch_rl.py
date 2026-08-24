@@ -24,6 +24,7 @@ PYTHON = Path(sys.executable).resolve()
 TRAINER = REPO / 'tools/train_rl.py'
 CONFIG = REPO / 'configs/stage2_rl.yaml'
 SUPERVISED_CONFIG = REPO / 'configs/stage1.yaml'
+REWARD_MODULE = REPO / 'lib/train/rewards/region_reward.py'
 SOURCE = REPO / 'artifacts/checkpoints/moonvit_stage1_step19000.pt'
 TUNE_MANIFEST = REPO / 'configs/manifests/volmem_fourier_validation37.csv'
 PREFLIGHT = REPO / 'data/outputs/stage2_rl_preflight'
@@ -65,7 +66,14 @@ def atomic_json(path: Path, payload: dict) -> None:
 def verify_inputs() -> dict:
     expected = {SOURCE: EXPECTED_SOURCE_SHA256, TUNE_MANIFEST: EXPECTED_TUNE_MANIFEST_SHA256}
     observed = {}
-    for path in (TRAINER, CONFIG, SUPERVISED_CONFIG, SOURCE, TUNE_MANIFEST):
+    for path in (
+        TRAINER,
+        CONFIG,
+        SUPERVISED_CONFIG,
+        REWARD_MODULE,
+        SOURCE,
+        TUNE_MANIFEST,
+    ):
         if not path.is_file():
             raise FileNotFoundError(path)
         observed_digest = sha256(path)
@@ -122,7 +130,8 @@ def audit_preflight(output: Path, launch_log: Path) -> dict:
         raise RuntimeError('preflight must contain exactly effective steps 1 and 2')
     finite_keys = (
         'reward_mean', 'reward_std_mean', 'policy_loss', 'grad_norm',
-        'ratio_mean', 'approx_kl',
+        'ratio_mean', 'approx_kl', 'baseline_nsd_mean', 'final_nsd_mean',
+        'step_quality_std_mean', 'step_burr_penalty_mean',
     )
     for row in rows:
         for key in finite_keys:
@@ -132,6 +141,8 @@ def audit_preflight(output: Path, launch_log: Path) -> dict:
                 )
         if row.get('action_policy') != 'geom':
             raise RuntimeError('wrong action policy')
+        if row.get('reward_mode') != 'delta_nsd@2px':
+            raise RuntimeError('wrong reward mode')
         if int(row.get('geom_lowfreq_modes', -1)) != 8:
             raise RuntimeError('wrong Fourier mode count')
         if [round(float(x), 4) for x in row['geom_sigma_px']] != [
@@ -143,23 +154,27 @@ def audit_preflight(output: Path, launch_log: Path) -> dict:
 
     hparams = json.loads(hparams_path.read_text())
     fourier = hparams.get('fourier_configuration', {})
-    reward_weights = hparams.get('reward_weights', {})
     reward_mode = hparams.get('reward_mode', {})
+    credit = hparams.get('credit_assignment', {})
     deployment = hparams.get('deployment_schedule', {})
-    observed_weights = [
-        round(float(reward_weights.get(key, -1.0)), 4)
-        for key in ('region', 'dice', 'iou', 'dist')
-    ]
     if (
-        fourier.get('profile')
+        hparams.get('schema') != 'diffusionsnake.mainline.stage2_rl.v2'
+        or fourier.get('profile')
         != 'five_stage_m8_sigma_080_070_060_050_040'
         or fourier.get('eval_dataset') != 'VolMemFourierVal37'
         or int(fourier.get('eval_panel_size', -1)) != 80
         or fourier.get('dev8_used_for_selection') is not False
         or fourier.get('eval_latent_policy')
         != 'fixed_per_panel_row_across_all_steps'
-        or observed_weights != [0.1, 0.4, 0.4, 0.1]
-        or reward_mode.get('delta_nsd') is not False
+        or reward_mode.get('name') != 'delta_nsd'
+        or reward_mode.get('delta_nsd') is not True
+        or round(float(reward_mode.get('nsd_delta_px', -1.0)), 4) != 2.0
+        or reward_mode.get('coordinate_space') != '2d_image_pixels'
+        or reward_mode.get('deterministic_reference')
+        != 'same_stage_same_latent_flow'
+        or reward_mode.get('composite_region_score_used_for_policy') is not False
+        or credit.get('stage_reward')
+        != 'sampled_delta_nsd_minus_deterministic_delta_nsd_minus_sampled_burr'
         or [round(float(x), 4) for x in hparams.get('stage_s_values', [])]
         != [0.0, 0.2, 0.4, 0.6, 0.8]
         or int(deployment.get('outer_steps', -1)) != 2
@@ -178,6 +193,7 @@ def audit_preflight(output: Path, launch_log: Path) -> dict:
         int(baseline.get('eval_n', -1)) <= 0
         or float(baseline.get('eval_iou', -1.0)) < 0.45
         or float(baseline.get('eval_dice', -1.0)) < 0.60
+        or not 0.0 <= float(baseline.get('eval_nsd_2px', -1.0)) <= 1.0
     ):
         raise RuntimeError(f'supervised baseline sanity gate failed: {baseline}')
 
@@ -303,7 +319,7 @@ def main() -> int:
     manifest = {
         'status': 'STARTED',
         'mode': args.mode,
-        'pipeline': 'moonvit_flow_five_action_fourier_grpo_2x4_deploy',
+        'pipeline': 'moonvit_flow_five_action_fourier_delta_nsd_grpo_2x4_deploy',
         'output': str(output),
         'gpu': args.gpu,
         'launcher_pid': os.getpid(),
@@ -343,11 +359,14 @@ def main() -> int:
             'used_for_all_reported_evaluation': True,
             'five_stage_training_rollout_is_not_reported_as_deployment': True,
         },
-        'reward_weights': {
-            'boundary': 0.1,
-            'dice': 0.4,
-            'iou': 0.4,
-            'distance': 0.1,
+        'reward_contract': {
+            'mode': 'delta_nsd',
+            'nsd_delta_px': 2.0,
+            'coordinate_space': '2d_image_pixels',
+            'deterministic_reference': 'same_stage_same_latent_flow',
+            'terminal_and_full_extrap_use_same_metric': True,
+            'composite_region_score_used_for_policy': False,
+            'sampled_burr_penalty_weight': 0.06,
         },
     }
     atomic_json(manifest_path, manifest)

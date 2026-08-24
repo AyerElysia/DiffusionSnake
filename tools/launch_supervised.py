@@ -298,7 +298,6 @@ def main():
 
     cfg.resume_path = str(source)
     cfg.locate_feat_cache_root = str(moonvit_cache)
-    cache_root = moonvit_cache
     import torch
     from lib.networks import make_network
 

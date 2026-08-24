@@ -1,5 +1,6 @@
-from .trainers import make_trainer
-from .optimizer import make_optimizer
-from .scheduler import make_lr_scheduler, set_lr_scheduler
-from .recorder import make_recorder
+"""Training objectives and utilities for the two released stages.
 
+Entry points import the concrete trainer, optimizer and recorder modules
+directly. Keeping this package initializer side-effect free lets reward and
+policy tests run without parsing command-line training arguments.
+"""

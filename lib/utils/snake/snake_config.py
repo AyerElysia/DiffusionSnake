@@ -1,92 +1,28 @@
+"""Fixed geometry constants for the released MoonViT + Flow mainline."""
+
+from __future__ import annotations
+
 import numpy as np
-from lib.config import cfg
 
 
-mean = np.array([0.40789654, 0.44719302, 0.47026115],
-                    dtype=np.float32).reshape(1, 1, 3)
-std = np.array([0.28863828, 0.27408164, 0.27809835],
-               dtype=np.float32).reshape(1, 1, 3)
 data_rng = np.random.RandomState(123)
-eig_val = np.array([0.2141788, 0.01817699, 0.00341571],
-                   dtype=np.float32)
-eig_vec = np.array([
-    [-0.58752847, -0.69563484, 0.41340352],
-    [-0.5832747, 0.00994535, -0.81221408],
-    [-0.56089297, 0.71832671, 0.41158938]
-], dtype=np.float32)
+eig_val = np.asarray([0.2141788, 0.01817699, 0.00341571], dtype=np.float32)
+eig_vec = np.asarray(
+    [
+        [-0.58752847, -0.69563484, 0.41340352],
+        [-0.5832747, 0.00994535, -0.81221408],
+        [-0.56089297, 0.71832671, 0.41158938],
+    ],
+    dtype=np.float32,
+)
 
+# Images and contours are represented on the stride-four feature plane.
 down_ratio = 4
-scale = np.array([800, 800])
-input_w, input_h = (800, 800)
-scale_range = np.arange(0.6, 1.4, 0.1)
+voc_input_h = 512
+voc_input_w = 512
 
-voc_input_h, voc_input_w = (512, 512)
-voc_scale_range = np.arange(0.6, 1.4, 0.1)
-
-box_center = False
-center_scope = False
-
-def is_v3_family():
-    return any([
-        getattr(cfg, 'use_dit_v3', False),
-        getattr(cfg, 'use_dit_v3_1', False),
-        getattr(cfg, 'use_dit_v3_2', False),
-        getattr(cfg, 'use_dit_v3_3', False),
-        getattr(cfg, 'use_dit_v3_4', False),
-        getattr(cfg, 'use_dit_v4', False),
-        getattr(cfg, 'use_dit_v4_1', False),
-        getattr(cfg, 'use_dit_v4_2', False),
-        getattr(cfg, 'use_dit_v3_5', False),
-        getattr(cfg, 'use_dit_v3_6', False),
-        getattr(cfg, 'use_dit_v3_8', False),
-    ])
-
-
-def get_box_init_mode():
-    if is_v3_family():
-        return 'octagon'
-    return 'quadrangle'
-
-
-def get_evolve_init_mode():
-    return 'octagon'
-
-
-init = get_box_init_mode()
-evolve_init = get_evolve_init_mode()
-
+# Route-B always starts from a bbox octagon and evolves 128 ordered points.
 init_poly_num = 40
-# Allow poly_num to be configured via cfg, default to 128 for backward compatibility
-poly_num = getattr(cfg, 'poly_num', 128)
-gt_poly_num = getattr(cfg, 'gt_poly_num', 128)
-spline_num = 10
-
-# V3.10: 自适应点数配置
-adaptive_points_enabled = getattr(cfg, 'adaptive_points_enabled', False)
-min_points = getattr(cfg, 'min_points', 32)
-max_points = getattr(cfg, 'max_points', 512)
-target_density = getattr(cfg, 'target_density', 2.5)
-round_to_multiple = getattr(cfg, 'round_to_multiple', 8)
-point_strategy = getattr(cfg, 'point_strategy', 'perimeter')
-adaptive_use_area_threshold = getattr(cfg, 'adaptive_use_area_threshold', False)
-adaptive_area_threshold = float(getattr(cfg, 'adaptive_area_threshold', 4096.0))
-adaptive_small_points = int(getattr(cfg, 'adaptive_small_points', 64))
-adaptive_large_points = int(getattr(cfg, 'adaptive_large_points', 128))
-poly_resample_mode = getattr(cfg, 'poly_resample_mode', 'uniform')
-poly_resample_curvature_alpha = getattr(cfg, 'poly_resample_curvature_alpha', 1.5)
-
+poly_num = 128
+gt_poly_num = 128
 adj_num = 4
-
-train_pred_box = False
-box_iou = 0.7
-confidence = 0.1
-train_pred_box_only = True
-
-train_pred_ex = False
-train_nearest_gt = True
-
-ct_score = cfg.ct_score
-
-ro = 4
-
-segm_or_bbox = 'segm'

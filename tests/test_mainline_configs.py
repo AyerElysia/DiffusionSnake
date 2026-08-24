@@ -1,0 +1,47 @@
+from pathlib import Path
+import unittest
+
+import yaml
+
+
+ROOT = Path(__file__).resolve().parents[1]
+
+
+class MainlineConfigTest(unittest.TestCase):
+    def load(self, name):
+        with (ROOT / "configs" / name).open("r", encoding="utf-8") as handle:
+            return yaml.safe_load(handle)
+
+    def test_only_two_released_yaml_configs_exist(self):
+        paths = {
+            path.relative_to(ROOT).as_posix()
+            for path in (ROOT / "configs").rglob("*.yaml")
+        }
+        self.assertEqual(
+            paths,
+            {"configs/stage1.yaml", "configs/stage2_rl.yaml"},
+        )
+
+    def test_stage1_contract(self):
+        config = self.load("stage1.yaml")
+        self.assertEqual(config["pure2d_expected_parameter_count"], 14_373_444)
+        self.assertEqual(config["train"]["max_steps"], 60_000)
+        self.assertEqual(config["locate_feat_keys"], ["layer_18"])
+        self.assertEqual(config["iterative_fractions"], [0.6667, 1.0])
+        self.assertEqual(config["flow_ode_solver"], "ab2")
+
+    def test_stage2_fourier_delta_nsd_contract(self):
+        config = self.load("stage2_rl.yaml")
+        self.assertEqual(config["rl_fractions"], [0.2, 0.25, 0.3333, 0.5, 1.0])
+        self.assertEqual(config["rl_deployment_fractions"], [0.6667, 1.0])
+        self.assertEqual(config["rl_deployment_ode_steps"], 4)
+        self.assertEqual(config["rl_geom_lowfreq_modes"], 8)
+        self.assertEqual(config["rl_geom_sigma_px"], [0.8, 0.7, 0.6, 0.5, 0.4])
+        self.assertEqual(config["rl_per_step_credit_mode"], "full_extrap")
+        self.assertTrue(config["rl_use_delta_nsd_reward"])
+        self.assertEqual(config["rl_nsd_delta_px"], 2.0)
+        self.assertTrue(config["rl_flow_only_update"])
+
+
+if __name__ == "__main__":
+    unittest.main()

@@ -1,6 +1,10 @@
-import numpy as np
+"""Non-differentiable contour rewards used by supervised evaluation and GRPO."""
+
 import cv2
+import numpy as np
 import torch
+
+
 def _poly_to_mask_np(poly: np.ndarray, H: int, W: int) -> np.ndarray:
     """将多边形轮廓转换为二值掩码。"""
     m = np.zeros((H, W), dtype=np.uint8)
@@ -81,6 +85,39 @@ def _calc_boundary_distance_score(
     return float(1.0 - np.clip(dist / max_dist, 0.0, 1.0))
 
 
+def _calc_nsd(
+    pred_mask: np.ndarray,
+    gt_mask: np.ndarray,
+    delta_px: float = 2.0,
+) -> float:
+    """Symmetric normalized surface Dice at a 2D pixel tolerance.
+
+    Half of the score measures the fraction of predicted boundary pixels that
+    lie within ``delta_px`` of the GT boundary.  The other half measures the
+    reverse direction. This is the released contour-RL reward and is
+    intentionally expressed in image pixels, not the millimetre-space 3D NSD
+    reported by the VerSe evaluator.
+    """
+
+    pred_contour = _extract_contour(pred_mask, 1) > 0
+    gt_contour = _extract_contour(gt_mask, 1) > 0
+    n_pred = int(pred_contour.sum())
+    n_gt = int(gt_contour.sum())
+    if n_pred == 0 or n_gt == 0:
+        return 0.0
+
+    delta = max(float(delta_px), 0.5)
+    gt_distance = cv2.distanceTransform(
+        (~gt_contour).astype(np.uint8), cv2.DIST_L2, 3
+    )
+    pred_distance = cv2.distanceTransform(
+        (~pred_contour).astype(np.uint8), cv2.DIST_L2, 3
+    )
+    pred_covered = float((gt_distance[pred_contour] <= delta).sum()) / n_pred
+    gt_covered = float((pred_distance[gt_contour] <= delta).sum()) / n_gt
+    return 0.5 * pred_covered + 0.5 * gt_covered
+
+
 def compute_region_score(poly_py: torch.Tensor,
                          gt_py: torch.Tensor,
                          H: int,
@@ -120,3 +157,44 @@ def compute_region_score(poly_py: torch.Tensor,
         scores.append(score)
 
     return torch.tensor(scores, device=device, dtype=torch.float32)
+
+
+def compute_nsd_score(
+    poly_py: torch.Tensor,
+    gt_py: torch.Tensor,
+    H: int,
+    W: int,
+    delta_px: float = 2.0,
+    coord_scale: float = 1.0,
+) -> torch.Tensor:
+    """Return per-contour 2D NSD scores in ``[0, 1]``."""
+
+    device = poly_py.device
+    pred_np = poly_py.detach().float().cpu().numpy() * float(coord_scale)
+    gt_np = gt_py.detach().float().cpu().numpy() * float(coord_scale)
+    scores = []
+    for index in range(pred_np.shape[0]):
+        pred_mask = _poly_to_mask_np(pred_np[index], H, W)
+        gt_mask = _poly_to_mask_np(gt_np[index], H, W)
+        scores.append(_calc_nsd(pred_mask, gt_mask, delta_px=delta_px))
+    return torch.tensor(scores, device=device, dtype=torch.float32)
+
+
+def compute_delta_nsd_reward(
+    sampled_nsd: torch.Tensor,
+    deterministic_nsd: torch.Tensor,
+    sampled_burr: torch.Tensor,
+    burr_weight: float = 0.06,
+) -> torch.Tensor:
+    """Return the released five-stage Fourier GRPO reward.
+
+    The deterministic term is a same-stage, same-latent counterfactual.  The
+    burr regularizer is absolute on the sampled endpoint; it is deliberately
+    not a sampled-minus-deterministic burr difference.
+    """
+
+    return (
+        sampled_nsd
+        - deterministic_nsd
+        - float(burr_weight) * sampled_burr
+    )

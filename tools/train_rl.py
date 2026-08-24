@@ -26,7 +26,7 @@ if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 # lib.config consumes --cfg_file while importing. Preserve it and hide any
-# launcher-only arguments from the legacy parser.
+# launcher-only arguments before importing the shared configuration parser.
 _pre_parser = argparse.ArgumentParser(add_help=False)
 _pre_parser.add_argument("--cfg_file", default="", type=str)
 _pre_args, _remaining_argv = _pre_parser.parse_known_args()
@@ -55,7 +55,11 @@ from lib.rl import (
     standard_normal_logprob,
 )
 from lib.train.grpo_v2_utils import EMA, freeze_bn_running_stats, percentiles
-from lib.train.rewards.region_reward import compute_region_score
+from lib.train.rewards.region_reward import (
+    compute_delta_nsd_reward,
+    compute_nsd_score,
+    compute_region_score,
+)
 from lib.utils.snake import snake_config, snake_gcn_utils
 
 
@@ -72,7 +76,7 @@ EXPECTED_TRAIN_PROGRESS = (0.0, 0.2, 0.4, 0.6, 0.8)
 EXPECTED_DEPLOYMENT_FRACTIONS = (0.6667, 1.0)
 EXPECTED_DEPLOYMENT_PROGRESS = (0.0, 0.6667)
 EXPECTED_SIGMA_PX = (0.8, 0.7, 0.6, 0.5, 0.4)
-EXPECTED_REWARD_WEIGHTS = (0.1, 0.4, 0.4, 0.1)
+EXPECTED_NSD_DELTA_PX = 2.0
 TUNE_DATASET = "VolMemFourierVal37"
 TUNE_MANIFEST = PROJECT_ROOT / "configs/manifests/volmem_fourier_validation37.csv"
 EXPECTED_TUNE_MANIFEST_SHA256 = (
@@ -86,8 +90,6 @@ class _CheckpointWrapper(nn.Module):
 
     def __init__(self, network: nn.Module):
         super().__init__()
-        if getattr(network, "yolo", None) is not None:
-            raise RuntimeError("detector-free RL contract failed: YOLO is present")
         self.net = network
 
 
@@ -333,15 +335,8 @@ def main() -> None:
     seed = int(_cfg_value("seed", 20260824))
     baseline_iou_floor = float(_cfg_value("min_baseline_iou", 0.45))
     baseline_dice_floor = float(_cfg_value("min_baseline_dice", 0.60))
-    reward_weights = (
-        float(_cfg_value("reward_w_region", 0.1)),
-        float(_cfg_value("reward_w_dice", 0.4)),
-        float(_cfg_value("reward_w_iou", 0.4)),
-        float(_cfg_value("reward_w_dist", 0.1)),
-    )
-    distance_max_px = float(_cfg_value("reward_dist_max_px", 8.0))
-    distance_quantile = float(_cfg_value("reward_dist_quantile", 95.0))
-    distance_quantile_weight = float(_cfg_value("reward_dist_quantile_weight", 0.5))
+    use_delta_nsd_reward = bool(_cfg_value("use_delta_nsd_reward", True))
+    nsd_delta_px = float(_cfg_value("nsd_delta_px", EXPECTED_NSD_DELTA_PX))
     burr_weight = float(_cfg_value("reward_burr_weight", 0.06))
     burr_max_px = float(_cfg_value("reward_burr_max_px", 1.5))
     burr_margin_px = float(_cfg_value("reward_burr_margin_px", 0.5))
@@ -360,11 +355,12 @@ def main() -> None:
         "deployment_progress": tuple(round(x, 4) for x in deployment_progress),
         "ode_steps": ode_steps,
         "deployment_ode_steps": deployment_ode_steps,
-        "solver": str(getattr(cfg, "v3_7_ode_solver", "")).lower(),
+        "solver": str(getattr(cfg, "flow_ode_solver", "")).lower(),
         "action_policy": str(_cfg_value("action_policy", "geom")),
         "modes": modes,
         "sigma_px": tuple(round(x, 4) for x in sigma_px),
-        "reward_weights": tuple(round(x, 4) for x in reward_weights),
+        "reward_mode": "delta_nsd" if use_delta_nsd_reward else "invalid",
+        "nsd_delta_px": round(nsd_delta_px, 4),
         "credit": str(_cfg_value("per_step_credit_mode", "full_extrap")),
         "credit_weight": float(_cfg_value("per_step_reward_weight", 1.0)),
         "group_centering": bool(_cfg_value("adv_center_group", True)),
@@ -387,7 +383,8 @@ def main() -> None:
         "action_policy": "geom",
         "modes": 8,
         "sigma_px": EXPECTED_SIGMA_PX,
-        "reward_weights": EXPECTED_REWARD_WEIGHTS,
+        "reward_mode": "delta_nsd",
+        "nsd_delta_px": EXPECTED_NSD_DELTA_PX,
         "credit": "full_extrap",
         "credit_weight": 1.0,
         "group_centering": True,
@@ -531,7 +528,7 @@ def main() -> None:
     eval_seed_base = 91_000_000 + seed
     expected_rms_px = [value * math.sqrt(modes / 128.0) for value in sigma_px]
     hparams = {
-        "schema": "diffusionsnake.mainline.stage2_rl.v1",
+        "schema": "diffusionsnake.mainline.stage2_rl.v2",
         "cfg_file": _cfg_file_used(),
         "base_checkpoint": str(source_path),
         "base_checkpoint_sha256": EXPECTED_SOURCE_SHA256,
@@ -569,11 +566,18 @@ def main() -> None:
         "credit_assignment": {
             "mode": "full_extrap",
             "outer_credit_map": [0, 1, 2, 3, 4],
+            "stage_reward": "sampled_delta_nsd_minus_deterministic_delta_nsd_minus_sampled_burr",
             "advantage_centered_across_k": True,
             "advantage_std_floor": adv_std_floor,
         },
-        "reward_weights": dict(zip(("region", "dice", "iou", "dist"), reward_weights)),
-        "reward_mode": {"delta_nsd": False},
+        "reward_mode": {
+            "name": "delta_nsd",
+            "delta_nsd": True,
+            "nsd_delta_px": nsd_delta_px,
+            "coordinate_space": "2d_image_pixels",
+            "deterministic_reference": "same_stage_same_latent_flow",
+            "composite_region_score_used_for_policy": False,
+        },
         "burr": {
             "weight": burr_weight,
             "max_px": burr_max_px,
@@ -633,23 +637,19 @@ def main() -> None:
             "image_hw": tuple(int(x) for x in batch["inp"].shape[-2:]),
         }
 
-    def score(poly: torch.Tensor, target: torch.Tensor, image_hw) -> torch.Tensor:
-        return compute_region_score(
+    def nsd_score(poly: torch.Tensor, target: torch.Tensor, image_hw) -> torch.Tensor:
+        return compute_nsd_score(
             poly,
             target,
             H=image_hw[0],
             W=image_hw[1],
-            w_boundary=reward_weights[0],
-            w_dice=reward_weights[1],
-            w_iou=reward_weights[2],
-            w_dist=reward_weights[3],
-            dist_max_px=distance_max_px,
-            dist_quantile=distance_quantile,
-            dist_quantile_weight=distance_quantile_weight,
+            delta_px=nsd_delta_px,
             coord_scale=float(snake_config.down_ratio),
         )
 
     def metric(poly: torch.Tensor, target: torch.Tensor, image_hw, name: str) -> torch.Tensor:
+        if name == "nsd":
+            return nsd_score(poly, target, image_hw)
         weights = {
             "iou": (0.0, 0.0, 1.0, 0.0),
             "dice": (0.0, 1.0, 0.0, 0.0),
@@ -746,7 +746,7 @@ def main() -> None:
 
     @torch.no_grad()
     def compute_eval() -> dict:
-        values = {name: [] for name in ("iou", "dice", "mboundf")}
+        values = {name: [] for name in ("iou", "dice", "mboundf", "nsd")}
         for index, batch in enumerate(eval_batches):
             output = manual_context(batch)
             if output["i_it_py"].numel() == 0:
@@ -770,6 +770,7 @@ def main() -> None:
             "eval_iou": _finite_scalar(merged["iou"].mean(), "eval_iou"),
             "eval_dice": _finite_scalar(merged["dice"].mean(), "eval_dice"),
             "eval_mboundf": _finite_scalar(merged["mboundf"].mean(), "eval_mboundf"),
+            "eval_nsd_2px": _finite_scalar(merged["nsd"].mean(), "eval_nsd_2px"),
             "eval_n": int(merged["iou"].numel()),
         }
 
@@ -812,6 +813,8 @@ def main() -> None:
                     "deployment_progress": list(deployment_progress),
                     "fourier_modes": modes,
                     "fourier_sigma_px": list(sigma_px),
+                    "reward_mode": "delta_nsd",
+                    "nsd_delta_px": nsd_delta_px,
                     "flow_only": True,
                     "frozen_bn_layers": frozen_bn,
                 },
@@ -836,7 +839,8 @@ def main() -> None:
     )
     print(
         "[RL] baseline panel: IoU={eval_iou:.6f} Dice={eval_dice:.6f} "
-        "mBoundF={eval_mboundf:.6f} n={eval_n}".format(**baseline_eval),
+        "mBoundF={eval_mboundf:.6f} NSD@2px={eval_nsd_2px:.6f} "
+        "n={eval_n}".format(**baseline_eval),
         flush=True,
     )
 
@@ -923,11 +927,15 @@ def main() -> None:
         deterministic = deterministic_rollout(
             output, gcn, fractions, train_progress, ode_steps, shared_latents
         )
-        baseline_score = score(deterministic["py"], output["i_gt_py"], output["image_hw"]).detach()
+        baseline_nsd = nsd_score(
+            deterministic["py"], output["i_gt_py"], output["image_hw"]
+        ).detach()
         rollouts = [sample_rollout(output, shared_latents) for _ in range(k_rollouts)]
-        final_scores, rewards, burr_values = [], [], []
+        final_nsd_scores, rewards, burr_values = [], [], []
         for rollout in rollouts:
-            final_score = score(rollout["py"], output["i_gt_py"], output["image_hw"]).detach()
+            final_nsd = nsd_score(
+                rollout["py"], output["i_gt_py"], output["image_hw"]
+            ).detach()
             burr, _ = _burr_penalty(
                 rollout["py"],
                 output["i_gt_py"],
@@ -936,9 +944,16 @@ def main() -> None:
                 burr_max_px,
                 burr_quantile,
             )
-            final_scores.append(final_score)
+            final_nsd_scores.append(final_nsd)
             burr_values.append(burr.detach())
-            rewards.append(final_score - burr_weight * burr.detach() - baseline_score)
+            rewards.append(
+                compute_delta_nsd_reward(
+                    final_nsd,
+                    baseline_nsd,
+                    burr.detach(),
+                    burr_weight=burr_weight,
+                )
+            )
         quality = torch.stack(rewards)
         quality_std = quality.std(dim=0, unbiased=False, keepdim=True)
         terminal_advantage = (
@@ -946,26 +961,56 @@ def main() -> None:
             / quality_std.clamp_min(adv_std_floor)
         ).clamp(-adv_clip, adv_clip)
 
-        # Full-extrap: project every residual action to a complete endpoint and
-        # compare it with the deterministic endpoint from the same stage.
+        # Full-extrap: judge every outer action with the same delta-NSD@2px
+        # contract as the terminal trajectory.  The sampled and deterministic
+        # endpoints share the stage state and latent; only the Fourier action
+        # differs. The sampled endpoint also keeps the released burr penalty.
         with torch.no_grad():
-            deterministic_step_scores = []
+            deterministic_step_nsd = []
             for index, fraction in enumerate(fractions):
                 start, end = deterministic["polys"][index : index + 2]
-                deterministic_step_scores.append(
-                    score(start + (end - start) / fraction, output["i_gt_py"], output["image_hw"])
+                deterministic_step_nsd.append(
+                    nsd_score(
+                        start + (end - start) / fraction,
+                        output["i_gt_py"],
+                        output["image_hw"],
+                    )
                 )
-            deterministic_step_scores = torch.stack(deterministic_step_scores)
-            rollout_step_scores = []
+            deterministic_step_nsd = torch.stack(deterministic_step_nsd)
+            rollout_step_rewards = []
+            rollout_step_burrs = []
             for rollout in rollouts:
-                scores = []
+                rewards_at_stage = []
+                burrs_at_stage = []
                 for index, fraction in enumerate(fractions):
                     start, end = rollout["polys"][index : index + 2]
-                    scores.append(
-                        score(start + (end - start) / fraction, output["i_gt_py"], output["image_hw"])
+                    extrapolated = start + (end - start) / fraction
+                    extrapolated_nsd = nsd_score(
+                        extrapolated,
+                        output["i_gt_py"],
+                        output["image_hw"],
                     )
-                rollout_step_scores.append(torch.stack(scores))
-            step_quality = torch.stack(rollout_step_scores) - deterministic_step_scores.unsqueeze(0)
+                    extrapolated_burr, _ = _burr_penalty(
+                        extrapolated,
+                        output["i_gt_py"],
+                        float(snake_config.down_ratio),
+                        burr_margin_px,
+                        burr_max_px,
+                        burr_quantile,
+                    )
+                    rewards_at_stage.append(
+                        compute_delta_nsd_reward(
+                            extrapolated_nsd,
+                            deterministic_step_nsd[index],
+                            extrapolated_burr.detach(),
+                            burr_weight=burr_weight,
+                        )
+                    )
+                    burrs_at_stage.append(extrapolated_burr.detach())
+                rollout_step_rewards.append(torch.stack(rewards_at_stage))
+                rollout_step_burrs.append(torch.stack(burrs_at_stage))
+            step_quality = torch.stack(rollout_step_rewards)
+            step_burr = torch.stack(rollout_step_burrs)
             step_std = step_quality.std(dim=0, unbiased=False, keepdim=True)
             step_advantage = (
                 (step_quality - step_quality.mean(dim=0, keepdim=True))
@@ -1058,9 +1103,15 @@ def main() -> None:
             "ratio_min": _finite_scalar(ratio_tensor.min(), "ratio_min"),
             "ratio_max": _finite_scalar(ratio_tensor.max(), "ratio_max"),
             "early_stop_epoch": early_stop_epoch,
-            "baseline_score_mean": _finite_scalar(baseline_score.mean(), "baseline_score_mean"),
-            "final_score_mean": _finite_scalar(torch.stack(final_scores).mean(), "final_score_mean"),
+            "reward_mode": "delta_nsd@2px",
+            "baseline_nsd_mean": _finite_scalar(baseline_nsd.mean(), "baseline_nsd_mean"),
+            "final_nsd_mean": _finite_scalar(
+                torch.stack(final_nsd_scores).mean(), "final_nsd_mean"
+            ),
             "burr_penalty_mean": _finite_scalar(torch.stack(burr_values).mean(), "burr_penalty_mean"),
+            "step_burr_penalty_mean": _finite_scalar(
+                step_burr.mean(), "step_burr_penalty_mean"
+            ),
             "quality_best_mean": _finite_scalar(quality.max(dim=0).values.mean(), "quality_best_mean"),
             "quality_p10": percentiles(quality.flatten())["p10"],
             "quality_p50": percentiles(quality.flatten())["p50"],
@@ -1093,7 +1144,7 @@ def main() -> None:
             if step % save_every == 0:
                 save_checkpoint(checkpoint_dir / f"step_{step}.pt", step, metrics)
 
-        del batch, output, deterministic, rollouts, quality, step_quality
+        del batch, output, deterministic, rollouts, quality, step_quality, step_burr
         gc.collect()
         torch.cuda.empty_cache()
 

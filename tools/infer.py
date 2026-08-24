@@ -433,7 +433,7 @@ def main(argv=None):
     from lib.config import cfg
     from lib.datasets.collate_batch import snake_collator
     from lib.datasets.dataset_catalog import DatasetCatalog
-    from lib.datasets.sagittal_2d_fixed.snake import Dataset as LegacyDataset
+    from lib.datasets.sagittal_2d_fixed.snake import Dataset
     from lib.evaluators.sagittal_2d_fixed.snake import (
         Evaluator,
         _path_key,
@@ -445,10 +445,8 @@ def main(argv=None):
     from lib.utils.snake.snake_voc_utils import get_octagon, get_quadrangle
 
     cfg.use_grpo = False
-    cfg.use_grpo_kl = False
     cfg.use_gt_det = True
     cfg.use_gt_det_train_only = False
-    cfg.skip_heatmap_detector_when_gt = True
     cfg.sagittal_eval_box_mode = "gt"
     configured_backend = str(getattr(cfg, "detector_backend", ""))
     if configured_backend != str(args.expected_detector_backend):
@@ -460,26 +458,18 @@ def main(argv=None):
     cfg.detector_backend = str(args.expected_detector_backend)
     cfg.locate_feat_cache_root = os.fspath(locate_root)
     cfg.sagittal_moonvit_cache_root = os.fspath(locate_root)
-    cfg.pseudo3d_input_mode = "center_repeat"
-    cfg.pseudo3d_color_aug = False
-    cfg.pseudo3d_lr_flip = False
-    cfg.pseudo3d_random_crop = False
-    cfg.prev_contour_init_prob = 0.0
+    cfg.image_color_aug = False
+    cfg.image_lr_flip = False
+    cfg.image_random_crop = False
     cfg.flow_ode_steps = 4
     cfg.iterative_num_steps = 2
     cfg.iterative_fractions = [0.6667, 1.0]
     cfg.iterative_ode_steps = 4
-    cfg.v3_7_ode_solver = "ab2"
-    cfg.v4_9_use_rich_infer_schedule = False
-    cfg.v4_9_infer_target_fractions = [0.6667, 1.0]
-
-    class Pure2DSingleSliceDataset(LegacyDataset):
-        def _neighbor_rows(self, center_row):
-            return center_row, center_row, center_row
+    cfg.flow_ode_solver = "ab2"
 
     attrs = DatasetCatalog.get("VolMemDev8")
     attrs.pop("id", None)
-    dataset = Pure2DSingleSliceDataset(**attrs)
+    dataset = Dataset(**attrs)
     cases = sorted({str(row["case_id"]) for row in dataset.records})
     if len(dataset) != EXPECTED_SLICES or tuple(cases) != tuple(sorted(DEV8_CASES)):
         raise RuntimeError("Dev8 identity drift: slices={} cases={}".format(len(dataset), cases))
@@ -530,8 +520,6 @@ def main(argv=None):
     checkpoint, loaded_tensor_count = strict_load(wrapper, checkpoint_path)
     checkpoint_step = int(checkpoint.get("step", -1))
     wrapper = wrapper.to(device).eval()
-    if getattr(wrapper.net, "yolo", None) is not None:
-        raise RuntimeError("internal detector unexpectedly exists")
     memory_parameter_count = int(sum(
         parameter.numel() for name, parameter in wrapper.named_parameters()
         if "memory" in name.lower()

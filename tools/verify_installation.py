@@ -38,7 +38,7 @@ def main() -> None:
         Path(args.slice_manifest).resolve()
     )
 
-    # lib.config owns the historical command-line parser. Give it only the
+    # lib.config owns the shared command-line parser. Give it only the
     # selected production config, after this verifier has parsed its arguments.
     sys.argv = [sys.argv[0], "--cfg_file", str(Path(args.config))]
 
@@ -56,11 +56,20 @@ def main() -> None:
         stage_progress,
         standard_normal_logprob,
     )
+    from lib.train.rewards.region_reward import (
+        compute_delta_nsd_reward,
+        compute_nsd_score,
+    )
     from lib.train.trainers.diffusion_trainer import DiffusionPretrainNetworkWrapper
 
     cache_root = str(Path(args.moonvit_cache).resolve())
     cfg.locate_feat_cache_root = cache_root
     cfg.sagittal_moonvit_cache_root = cache_root
+    if bool(getattr(cfg, "rl_use_delta_nsd_reward", False)) is not True:
+        raise RuntimeError("stage-2 reward must be delta-NSD")
+    nsd_delta_px = float(getattr(cfg, "rl_nsd_delta_px", -1.0))
+    if abs(nsd_delta_px - 2.0) > 1e-8:
+        raise RuntimeError(f"stage-2 NSD tolerance drift: {nsd_delta_px} != 2.0")
     random.seed(20260823)
     np.random.seed(20260823)
     torch.manual_seed(20260823)
@@ -168,6 +177,45 @@ def main() -> None:
     if any(abs(a - b) > 1e-8 for a, b in zip(progress, expected_progress)):
         raise RuntimeError(f"five-stage progress mismatch: {progress}")
 
+    # Reward smoke test: the production contract is symmetric 2D NSD@2px.
+    # Keep this beside the Fourier checks so a clean installation cannot pass
+    # while silently falling back to the former composite region reward.
+    target_poly = torch.tensor(
+        [[[16.0, 16.0], [40.0, 16.0], [40.0, 40.0], [16.0, 40.0]]]
+    )
+    shifted_poly = target_poly + torch.tensor([[[1.0, 0.0]]])
+    distant_poly = target_poly + torch.tensor([[[32.0, 32.0]]])
+
+    def nsd(first: torch.Tensor, second: torch.Tensor) -> float:
+        return float(
+            compute_nsd_score(
+                first,
+                second,
+                H=96,
+                W=96,
+                delta_px=nsd_delta_px,
+            ).item()
+        )
+
+    nsd_identical = nsd(target_poly, target_poly)
+    nsd_shifted = nsd(shifted_poly, target_poly)
+    nsd_shifted_reverse = nsd(target_poly, shifted_poly)
+    nsd_distant = nsd(distant_poly, target_poly)
+    if abs(nsd_identical - 1.0) > 1e-7:
+        raise RuntimeError(f"identical NSD smoke test failed: {nsd_identical}")
+    if abs(nsd_shifted - nsd_shifted_reverse) > 1e-7:
+        raise RuntimeError("NSD symmetry smoke test failed")
+    if not nsd_shifted > nsd_distant:
+        raise RuntimeError("NSD ordering smoke test failed")
+    reward_probe = compute_delta_nsd_reward(
+        torch.tensor([0.80]),
+        torch.tensor([0.75]),
+        torch.tensor([0.50]),
+        burr_weight=0.06,
+    ).item()
+    if abs(reward_probe - 0.02) > 1e-7:
+        raise RuntimeError(f"delta-NSD reward smoke test failed: {reward_probe}")
+
     report = {
         "status": "PASS",
         "config": str(Path(args.config)),
@@ -186,6 +234,15 @@ def main() -> None:
         "flow_parameters": flow_parameter_count,
         "feature_replacer_parameters": replacer_parameter_count,
         "five_stage_progress": progress,
+        "reward_contract": {
+            "mode": "delta_nsd",
+            "nsd_delta_px": nsd_delta_px,
+            "coordinate_space": "2d_image_pixels",
+            "identical_score": nsd_identical,
+            "shifted_score": nsd_shifted,
+            "distant_score": nsd_distant,
+            "reward_probe": reward_probe,
+        },
         "fourier_projection_max_abs": float(
             (projected_logprob - direct_logprob).abs().max().item()
         ),

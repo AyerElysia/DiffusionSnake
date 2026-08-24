@@ -12,10 +12,6 @@ except ImportError:
             def add_histogram(self, *a, **kw): pass
             def flush(self): pass
             def close(self): pass
-import os
-
-# 这个文件没啥看的
-
 class SmoothedValue(object):
     """Track a series of values and provide access to smoothed values over a
     window or the global series average.

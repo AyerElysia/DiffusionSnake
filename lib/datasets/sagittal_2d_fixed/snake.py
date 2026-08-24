@@ -3,7 +3,6 @@ import os
 
 import cv2
 import numpy as np
-import torch
 import torch.utils.data as data
 
 from lib.config import cfg
@@ -22,14 +21,13 @@ _CACHE_SPLITS = dict(_MANIFEST_SPLITS)
 _REQUIRED_COLUMNS = {'split', 'case_id', 'slice_idx', 'image_path', 'mask_path'}
 _MOONVIT_FEATURE_KEY = 'layer_18'
 _MOONVIT_LAYER_CHANNELS = 1152
-_MOONVIT_FUSED_CHANNELS = 2304
 _MOONVIT_INPUT_SIZE = 448
 _MOONVIT_PATCH_SIZE = 14
 _MOONVIT_NORMALIZATION = 'moonvit_pretrained_rgb_mean_std'
 
 
 class Dataset(ContourTargetMixin, data.Dataset):
-    """Sagittal pseudo-3D slices with center-slice contour supervision."""
+    """Pure-2D sagittal slices with center-slice MoonViT features."""
 
     @staticmethod
     def _config_value(names, default=None):
@@ -281,17 +279,15 @@ class Dataset(ContourTargetMixin, data.Dataset):
                 ),
                 _MOONVIT_FEATURE_KEY,
             )).strip()
-            # Accept 'layer_18' (single) or 'layer_18,layer_26' (multi, comma-separated).
-            _VALID_BASE_KEY = _MOONVIT_FEATURE_KEY
             parsed_keys = [k.strip() for k in feature_key.split(',') if k.strip()]
-            if not parsed_keys or parsed_keys[0] != _VALID_BASE_KEY:
+            if parsed_keys != [_MOONVIT_FEATURE_KEY]:
                 raise ValueError(
-                    'Sagittal MoonViT feature keys must start with {!r}; got {!r}'.format(
-                        _VALID_BASE_KEY, feature_key
+                    'The mainline requires only MoonViT {!r}; got {!r}'.format(
+                        _MOONVIT_FEATURE_KEY, feature_key
                     )
                 )
-            self.locate_feat_key = parsed_keys[0]     # primary key (for compat checks)
-            self.locate_feat_keys = parsed_keys        # all keys to load and concatenate
+            self.locate_feat_key = parsed_keys[0]
+            self.locate_feat_keys = parsed_keys
             self.sagittal_moonvit_feature_key = parsed_keys[0]
 
             fusion_mode = str(self._config_value(
@@ -300,14 +296,12 @@ class Dataset(ContourTargetMixin, data.Dataset):
                     'sagittal_moonvit_fusion',
                     'locate_feat_fusion_mode',
                 ),
-                'center_neighbor_mean',
+                'center_only',
             )).strip().lower()
-            _VALID_FUSION_MODES = ('center_neighbor_mean', 'center_only')
-            if fusion_mode not in _VALID_FUSION_MODES:
+            if fusion_mode != 'center_only':
                 raise ValueError(
-                    'Unsupported sagittal MoonViT fusion mode {!r}; expected one of {}'.format(
-                        fusion_mode, _VALID_FUSION_MODES
-                    )
+                    "The mainline requires locate_feat_fusion_mode='center_only'; "
+                    'got {!r}'.format(fusion_mode)
                 )
             self.locate_feat_fusion_mode = fusion_mode
             self.sagittal_moonvit_fusion_mode = fusion_mode
@@ -375,28 +369,20 @@ class Dataset(ContourTargetMixin, data.Dataset):
             self.locate_feat_patch_size = self.locate_feat_expected_patch_size
             self.locate_feat_checkpoint = self.locate_feat_expected_checkpoint
 
-        self.input_mode = str(getattr(cfg, 'pseudo3d_input_mode', 'neighbors')).strip().lower()
-        if self.input_mode not in ('neighbors', 'center_repeat'):
-            raise ValueError(
-                "cfg.pseudo3d_input_mode must be 'neighbors' or 'center_repeat', got {!r}".format(
-                    self.input_mode
-                )
-            )
-
-        mean = float(getattr(cfg, 'pseudo3d_mean', 0.5))
-        std = float(getattr(cfg, 'pseudo3d_std', 0.5))
+        mean = float(getattr(cfg, 'image_mean', 0.5))
+        std = float(getattr(cfg, 'image_std', 0.5))
         if std <= 0:
-            raise ValueError('cfg.pseudo3d_std must be positive')
+            raise ValueError('cfg.image_std must be positive')
         self.mean = np.full((1, 1, 3), mean, dtype=np.float32)
         self.std = np.full((1, 1, 3), std, dtype=np.float32)
-        self.color_aug = bool(getattr(cfg, 'pseudo3d_color_aug', False))
-        self.lr_flip = bool(getattr(cfg, 'pseudo3d_lr_flip', False))
-        self.random_crop = bool(getattr(cfg, 'pseudo3d_random_crop', True))
+        self.color_aug = bool(getattr(cfg, 'image_color_aug', False))
+        self.lr_flip = bool(getattr(cfg, 'image_lr_flip', False))
+        self.random_crop = bool(getattr(cfg, 'image_random_crop', True))
 
-        if int(cfg.heads.ct_hm) != 26:
+        if int(cfg.anatomical_class_count) != 26:
             raise ValueError(
-                'Sagittal pseudo-3D requires cfg.heads.ct_hm=26, got {}'.format(
-                    cfg.heads.ct_hm
+                'The sagittal mainline requires anatomical_class_count=26, got {}'.format(
+                    cfg.anatomical_class_count
                 )
             )
 
@@ -419,14 +405,6 @@ class Dataset(ContourTargetMixin, data.Dataset):
             (self.manifest_split, row['case_id'], row['slice_idx']) in foreground_keys
             for row in self.records
         ]
-
-        # Prev-contour initialization: during training, with this probability the
-        # adjacent slice's GT contour is used as the Snake init instead of the bbox
-        # octagon.  Falls back to octagon when the adjacent slice has no matching
-        # class or is a boundary (same slice repeated).
-        self.prev_contour_init_prob = float(
-            getattr(cfg, 'prev_contour_init_prob', 0.0)
-        )
 
     def _resolve_path(self, path):
         path = os.fspath(path)
@@ -540,36 +518,6 @@ class Dataset(ContourTargetMixin, data.Dataset):
                     'Duplicate slice_idx values for case {!r}'.format(case_id)
                 )
         return grouped
-
-    def _neighbor_rows(self, center_row):
-        case_rows = self._case_rows[center_row['case_id']]
-        by_index = {row['slice_idx']: row for row in case_rows}
-        center_idx = center_row['slice_idx']
-        first_idx = case_rows[0]['slice_idx']
-        last_idx = case_rows[-1]['slice_idx']
-
-        if center_idx == first_idx:
-            previous = center_row
-        else:
-            previous = by_index.get(center_idx - 1)
-            if previous is None:
-                raise ValueError(
-                    'Missing slice {} before case {!r} slice {}'.format(
-                        center_idx - 1, center_row['case_id'], center_idx
-                    )
-                )
-
-        if center_idx == last_idx:
-            following = center_row
-        else:
-            following = by_index.get(center_idx + 1)
-            if following is None:
-                raise ValueError(
-                    'Missing slice {} after case {!r} slice {}'.format(
-                        center_idx + 1, center_row['case_id'], center_idx
-                    )
-                )
-        return previous, center_row, following
 
     def _sagittal_moonvit_cache_path(self, row):
         case_id = str(row['case_id'])
@@ -915,51 +863,10 @@ class Dataset(ContourTargetMixin, data.Dataset):
                 'path': path,
             }
 
-    def _load_locate_feature(self, neighbor_rows, expected_orig_hw=None):
+    def _load_locate_feature(self, row, expected_orig_hw=None):
         if not self.locate_feat_enabled:
             return {}
-        if len(neighbor_rows) != 3:
-            raise ValueError(
-                'Sagittal MoonViT fusion requires prev/center/next rows, got {}'.format(
-                    len(neighbor_rows)
-                )
-            )
-        center_row = neighbor_rows[1]
-        case_id = str(center_row['case_id'])
-        for row in neighbor_rows:
-            if str(row['case_id']) != case_id:
-                raise ValueError(
-                    'Sagittal MoonViT neighbor rows must be case-local; got case IDs {}'.format(
-                        [item['case_id'] for item in neighbor_rows]
-                    )
-                )
-
-        # center_only: load and validate only the center slice, skip neighbor fusion.
-        if self.locate_feat_fusion_mode == 'center_only':
-            center_entry = self._load_sagittal_moonvit_file(center_row)
-            if expected_orig_hw is not None:
-                expected_orig = tuple(int(value) for value in expected_orig_hw)
-                if tuple(center_entry['orig_hw'].tolist()) != expected_orig:
-                    raise ValueError(
-                        'MoonViT cache {} orig_hw={} does not match center image shape={}'.format(
-                            center_entry['path'], center_entry['orig_hw'].tolist(), expected_orig
-                        )
-                    )
-            feature = center_entry['feature'].astype(np.float16, copy=False)
-            return {
-                'locate_feat': np.ascontiguousarray(feature),
-                'locate_feat_grid_hw': center_entry['grid_hw'].copy(),
-                'locate_feat_orig_hw': center_entry['orig_hw'].copy(),
-                'locate_feat_resized_hw': center_entry['resized_hw'].copy(),
-                'locate_feat_padded_hw': center_entry['padded_hw'].copy(),
-                'locate_feat_pad': center_entry['pad'].copy(),
-                'locate_feat_scale': center_entry['scale'].copy(),
-                'locate_feat_patch_size': center_entry['patch_size'].copy(),
-                'locate_feat_path': center_entry['path'],
-            }
-
-        entries = [self._load_sagittal_moonvit_file(row) for row in neighbor_rows]
-        center_entry = entries[1]
+        center_entry = self._load_sagittal_moonvit_file(row)
         if expected_orig_hw is not None:
             expected_orig = tuple(int(value) for value in expected_orig_hw)
             if tuple(center_entry['orig_hw'].tolist()) != expected_orig:
@@ -969,69 +876,7 @@ class Dataset(ContourTargetMixin, data.Dataset):
                     )
                 )
 
-        for entry in entries:
-            if tuple(entry['feature'].shape[-2:]) != tuple(center_entry['feature'].shape[-2:]):
-                raise ValueError(
-                    'MoonViT neighbor feature spatial sizes differ for case {!r}: {} has {}, '
-                    'center {} has {}'.format(
-                        case_id,
-                        entry['path'],
-                        tuple(entry['feature'].shape[-2:]),
-                        center_entry['path'],
-                        tuple(center_entry['feature'].shape[-2:]),
-                    )
-                )
-            for key in ('input_size', 'patch_size', 'normalization', 'checkpoint'):
-                if entry[key] != center_entry[key]:
-                    raise ValueError(
-                        'MoonViT neighbor metadata {} mismatch for case {!r}: {} has {!r}, '
-                        'center {} has {!r}'.format(
-                            key,
-                            case_id,
-                            entry['path'],
-                            entry[key],
-                            center_entry['path'],
-                            center_entry[key],
-                        )
-                    )
-            for key in ('grid_hw', 'orig_hw', 'resized_hw', 'padded_hw', 'pad'):
-                if not np.array_equal(entry[key], center_entry[key]):
-                    raise ValueError(
-                        'MoonViT neighbor metadata {} mismatch for case {!r}: {} has {}, '
-                        'center {} has {}'.format(
-                            key,
-                            case_id,
-                            entry['path'],
-                            entry[key].tolist(),
-                            center_entry['path'],
-                            center_entry[key].tolist(),
-                        )
-                    )
-            if not np.allclose(entry['scale'], center_entry['scale'], rtol=0.0, atol=1e-7):
-                raise ValueError(
-                    'MoonViT neighbor metadata scale mismatch for case {!r}: {} has {}, '
-                    'center {} has {}'.format(
-                        case_id,
-                        entry['path'],
-                        entry['scale'].tolist(),
-                        center_entry['path'],
-                        center_entry['scale'].tolist(),
-                    )
-                )
-
-        previous_feature = entries[0]['feature'].astype(np.float32)
-        following_feature = entries[2]['feature'].astype(np.float32)
-        neighbor_mean = ((previous_feature + following_feature) * 0.5).astype(np.float16)
-        feature = np.concatenate(
-            (entries[1]['feature'], neighbor_mean), axis=0
-        ).astype(np.float16, copy=False)
-        if feature.shape[0] != _MOONVIT_FUSED_CHANNELS:
-            raise ValueError(
-                'Sagittal MoonViT fusion produced {} channels, expected {}'.format(
-                    feature.shape[0], _MOONVIT_FUSED_CHANNELS
-                )
-            )
-
+        feature = center_entry['feature'].astype(np.float16, copy=False)
         return {
             'locate_feat': np.ascontiguousarray(feature),
             'locate_feat_grid_hw': center_entry['grid_hw'].copy(),
@@ -1137,7 +982,7 @@ class Dataset(ContourTargetMixin, data.Dataset):
 
         # A single polygon cannot represent disconnected anatomy.  Treat each
         # retained component as an instance of the same vertebra class.  The
-        # global cap prevents noisy masks from recreating the historical
+        # global cap prevents noisy masks from recreating an unbounded
         # 51-contour OOM case.  Full-dataset audit for top-4/area>=2/global-32:
         # 99.52% train and 99.73% validation foreground-pixel coverage.
         candidates.sort(key=lambda item: (-item[0], item[1]))
@@ -1181,64 +1026,19 @@ class Dataset(ContourTargetMixin, data.Dataset):
 
     def __getitem__(self, index):
         row = self.records[index]
-        neighbor_rows = self._neighbor_rows(row)
-        neighbor_images = [
-            self._read_grayscale_image(neighbor['image_path'])
-            for neighbor in neighbor_rows
-        ]
-        center_image = neighbor_images[1]
-        for neighbor, image in zip(neighbor_rows, neighbor_images):
-            if image.shape != center_image.shape:
-                raise ValueError(
-                    'Inconsistent image shape in case {!r}: slice {} is {}, center is {}'.format(
-                        row['case_id'], neighbor['slice_idx'], image.shape, center_image.shape
-                    )
-                )
+        center_image = self._read_grayscale_image(row['image_path'])
 
         locate_feat = {}
         if self.locate_feat_enabled:
             locate_feat = self._load_locate_feature(
-                neighbor_rows, expected_orig_hw=center_image.shape
+                row, expected_orig_hw=center_image.shape
             )
 
-        if self.input_mode == 'center_repeat':
-            image = np.repeat(center_image[:, :, None], 3, axis=2)
-        else:
-            image = np.stack(neighbor_images, axis=2)
+        image = np.repeat(center_image[:, :, None], 3, axis=2)
 
         height, width = center_image.shape
         mask = self._read_mask(row['mask_path'], center_image.shape)
         instance_polys, cls_ids = self._mask_to_instances(mask)
-
-        # --- prev-contour init: collect adjacent-slice raw polys (pre-transform) ---
-        use_prev_contour = (
-            self.split == 'train'
-            and self.prev_contour_init_prob > 0.0
-            and np.random.rand() < self.prev_contour_init_prob
-        )
-        adj_raw_polys_by_class = {}  # {cls_id (int): np.ndarray [N,2]}
-        if use_prev_contour:
-            center_slice_idx = int(row['slice_idx'])
-            for adj_row in [neighbor_rows[0], neighbor_rows[2]]:
-                if int(adj_row['slice_idx']) != center_slice_idx:
-                    adj_mask = self._read_mask(adj_row['mask_path'], center_image.shape)
-                    for label in np.unique(adj_mask):
-                        label = int(label)
-                        if label == 0:
-                            continue
-                        binary = np.asarray(adj_mask == label, dtype=np.uint8)
-                        contours, _ = cv2.findContours(
-                            binary, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_NONE
-                        )
-                        if contours:
-                            # keep largest contour per class
-                            largest = max(contours, key=cv2.contourArea)
-                            poly = largest.reshape(-1, 2).astype(np.float32)
-                            if len(poly) >= 4:
-                                adj_raw_polys_by_class[label] = poly
-                    break  # found a valid adjacent slice, stop
-            if not adj_raw_polys_by_class:
-                use_prev_contour = False
 
         augmented, inp, trans_input, trans_output, flipped, center, scale, inp_out_hw = \
             snake_voc_utils.augment(
@@ -1256,26 +1056,10 @@ class Dataset(ContourTargetMixin, data.Dataset):
         instance_polys = self.get_valid_polys(instance_polys, inp_out_hw)
         extreme_points = self.get_extreme_points(instance_polys)
 
-        # Apply the same spatial transform to adjacent-slice polys.
-        adj_polys_by_class = {}  # {cls_id: transformed poly [N,2]}
-        if use_prev_contour:
-            for cls_id, raw_poly in adj_raw_polys_by_class.items():
-                transformed = self.transform_original_data(
-                    [[raw_poly]], flipped, width, trans_output, inp_out_hw
-                )
-                transformed = self.get_valid_polys(transformed, inp_out_hw)
-                if transformed and transformed[0]:
-                    adj_polys_by_class[cls_id] = transformed[0][0]
-            if not adj_polys_by_class:
-                use_prev_contour = False
-
         output_h, output_w = inp_out_hw[2:]
-        ct_hm = np.zeros([26, output_h, output_w], dtype=np.float32)
         wh = []
         ct_cls = []
         ct_ind = []
-        yolo_xywh = []
-        yolo_cls = []
 
         i_it_4pys = []
         c_it_4pys = []
@@ -1296,61 +1080,23 @@ class Dataset(ContourTargetMixin, data.Dataset):
                     continue
                 bbox = [x_min, y_min, x_max, y_max]
 
-                self.prepare_detection(
-                    bbox, poly, ct_hm, cls_id, wh, ct_cls, ct_ind
+                self.prepare_box_target(
+                    bbox, cls_id, output_w, wh, ct_cls, ct_ind
                 )
-                input_h, input_w = inp_out_hw[:2]
-                scale_x = float(input_w) / float(output_w)
-                scale_y = float(input_h) / float(output_h)
-                yolo_xywh.append([
-                    ((x_min + x_max) / 2.0 * scale_x) / input_w,
-                    ((y_min + y_max) / 2.0 * scale_y) / input_h,
-                    ((x_max - x_min) * scale_x) / input_w,
-                    ((y_max - y_min) * scale_y) / input_h,
-                ])
-                yolo_cls.append(float(cls_id - 1))
                 self.prepare_init(
                     bbox, extreme_point,
                     i_it_4pys, c_it_4pys, i_gt_4pys, c_gt_4pys,
                     output_h, output_w,
                 )
-                # Use adjacent-slice contour as init when available, else octagon.
-                if use_prev_contour and cls_id in adj_polys_by_class:
-                    adj_poly = adj_polys_by_class[cls_id]
-                    ep_x_min = float(np.min(extreme_point[:, 0]))
-                    ep_y_min = float(np.min(extreme_point[:, 1]))
-                    ep_x_max = float(np.max(extreme_point[:, 0]))
-                    ep_y_max = float(np.max(extreme_point[:, 1]))
-                    num_points = self.compute_adaptive_points(
-                        [ep_x_min, ep_y_min, ep_x_max, ep_y_max]
-                    )
-                    img_init_poly = snake_voc_utils.uniformsample(adj_poly, num_points)
-                    can_init_poly = snake_voc_utils.img_poly_to_can_poly(
-                        img_init_poly, ep_x_min, ep_y_min, ep_x_max, ep_y_max
-                    )
-                    img_gt_poly = snake_voc_utils.uniformsample(poly, len(poly) * num_points)
-                    tt_idx = np.argmin(
-                        np.power(img_gt_poly - img_init_poly[0], 2).sum(axis=1)
-                    )
-                    img_gt_poly = np.roll(img_gt_poly, -tt_idx, axis=0)[::len(poly)]
-                    can_gt_poly = snake_voc_utils.img_poly_to_can_poly(
-                        img_gt_poly, ep_x_min, ep_y_min, ep_x_max, ep_y_max
-                    )
-                    i_it_pys.append(img_init_poly)
-                    c_it_pys.append(can_init_poly)
-                    i_gt_pys.append(img_gt_poly)
-                    c_gt_pys.append(can_gt_poly)
-                else:
-                    self.prepare_evolution(
-                        poly, extreme_point, i_it_4pys[-1],
-                        i_it_pys, c_it_pys, i_gt_pys, c_gt_pys,
-                    )
+                self.prepare_evolution(
+                    poly, extreme_point, i_it_4pys[-1],
+                    i_it_pys, c_it_pys, i_gt_pys, c_gt_pys,
+                )
 
         ret = {
             'inp': inp,
             'orig_img': orig_img,
             'img_path': row['image_path'],
-            'ct_hm': ct_hm,
             'wh': wh,
             'ct_cls': ct_cls,
             'ct_ind': ct_ind,
@@ -1363,14 +1109,6 @@ class Dataset(ContourTargetMixin, data.Dataset):
             'i_gt_py': i_gt_pys,
             'c_gt_py': c_gt_pys,
         }
-        if yolo_xywh:
-            ret['bboxes'] = torch.tensor(yolo_xywh, dtype=torch.float32)
-            ret['cls'] = torch.tensor(yolo_cls, dtype=torch.float32).unsqueeze(1)
-            ret['batch_idx'] = torch.zeros((len(yolo_xywh), 1), dtype=torch.float32)
-        else:
-            ret['bboxes'] = torch.zeros((0, 4), dtype=torch.float32)
-            ret['cls'] = torch.zeros((0, 1), dtype=torch.float32)
-            ret['batch_idx'] = torch.zeros((0, 1), dtype=torch.float32)
         if locate_feat:
             ret.update(locate_feat)
 
@@ -1387,10 +1125,6 @@ class Dataset(ContourTargetMixin, data.Dataset):
             'img_id': int(index),
             'case_id': row['case_id'],
             'slice_idx': int(row['slice_idx']),
-            'neighbor_indices': np.asarray(
-                [neighbor['slice_idx'] for neighbor in neighbor_rows],
-                dtype=np.int64,
-            ),
         }
         return ret
 

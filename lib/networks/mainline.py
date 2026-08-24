@@ -1,9 +1,6 @@
 """MoonViT-cache + Flow network used by the official VerSe mainline.
 
-The original project routed this detector-free model through a multi-backend
-network that imported YOLOv8, SAM, Swin, ResNet and Mamba implementations even
-though none of them were constructed.  This module contains only the deployed
-path while preserving the checkpoint-facing attribute names:
+The checkpoint-facing attribute names are preserved:
 
 ``locate_feat_replacer``
     Projects cached MoonViT layer-18 features to the 256-channel contour grid.
@@ -25,7 +22,7 @@ from lib.utils import data_utils
 class MoonViTFeatureReplacer(nn.Module):
     """Project cached MoonViT tokens and align them to the contour grid.
 
-    The layer order intentionally matches the historical
+    The layer order intentionally matches the signed source checkpoint's
     ``LocateFeatReplacer`` so official checkpoints load with ``strict=True``.
     """
 
@@ -120,15 +117,9 @@ class Network(nn.Module):
 
     def __init__(
         self,
-        num_layers: int = 34,
-        heads: dict | None = None,
-        head_conv: int = 256,
         down_ratio: int = 4,
-        det_dir: str = "",
     ) -> None:
-        del num_layers, head_conv, det_dir
         super().__init__()
-        heads = heads or {"ct_hm": 26, "wh": 2}
         self.detector_backend = str(cfg.detector_backend).strip().lower()
         if self.detector_backend != "flow_box_only":
             raise ValueError(
@@ -146,10 +137,9 @@ class Network(nn.Module):
             raise ValueError("The mainline requires Flow-matching evolution.")
 
         self.down_ratio = float(down_ratio)
-        self.detector_num_classes = int(
-            getattr(cfg, "yolo_num_classes", 0) or heads.get("ct_hm", 1)
-        )
-        self.freeze_snake = bool(getattr(cfg, "freeze_snake", False))
+        self.detector_num_classes = int(cfg.anatomical_class_count)
+        if self.detector_num_classes != 26:
+            raise ValueError("the VerSe mainline requires 26 anatomical classes")
         self.locate_feat_replace = True
         self.locate_feat_replace_upscale = int(cfg.locate_feat_replace_upscale)
         self.locate_feat_replacer = MoonViTFeatureReplacer(
@@ -160,21 +150,9 @@ class Network(nn.Module):
             input_layers=int(cfg.locate_feat_input_layers),
         )
 
-        from lib.networks.diffusion import make_evolution
+        from lib.networks.diffusion import FlowMatchingEvolution
 
-        self.gcn = make_evolution(
-            use_grpo=bool(getattr(cfg, "use_grpo", False)),
-            state_dim=128,
-            feature_dim=int(getattr(cfg, "snake_feature_dim", 256)),
-            num_points=128,
-            loss_weight=float(getattr(cfg, "diffusion_loss_weight", 1.0)),
-            loss_type=str(getattr(cfg, "diffusion_loss_type", "adaptive")),
-            use_flow_matching=True,
-            flow_ode_steps=int(getattr(cfg, "flow_ode_steps", 4)),
-            dit_num_layers=int(getattr(cfg, "dit_num_layers", 6)),
-            dit_num_heads=int(getattr(cfg, "dit_num_heads", 8)),
-            dit_state_dim=int(getattr(cfg, "dit_state_dim", 256)),
-        )
+        self.gcn = FlowMatchingEvolution()
         self.diffusion_loss_fn = None
 
         replacer_parameters = sum(
@@ -491,13 +469,6 @@ class Network(nn.Module):
             placeholder, batch
         )
         output = {
-            "ct_hm": image.new_zeros(
-                (image.shape[0], self.detector_num_classes, feature_h, feature_w),
-                dtype=features.dtype,
-            ),
-            "wh": image.new_zeros(
-                (image.shape[0], 2, feature_h, feature_w), dtype=features.dtype
-            ),
             "ct": image.new_zeros((image.shape[0], 0, 2)),
             "detection": image.new_zeros((image.shape[0], 0, 6)),
             "feat_hw": (feature_h, feature_w),
@@ -510,27 +481,12 @@ class Network(nn.Module):
             self._use_gt_detection(output, batch)
         self._apply_external_detection(output, batch)
 
-        detector_outputs = {
-            key: output[key] for key in ("ct_hm", "wh", "ct", "detection")
+        detection_context = {
+            key: output[key] for key in ("ct", "detection")
         }
-        if (
-            self.gcn is not None
-            and not self.freeze_snake
-            and not bool(getattr(cfg, "skip_diffusion_forward", False))
-        ):
-            output = self.gcn(output, features, batch)
-        output.update(detector_outputs)
+        output = self.gcn(output, features, batch)
+        output.update(detection_context)
         output["feat_hw"] = (feature_h, feature_w)
         output["cnn_feature"] = features
         output.update(feature_stats)
         return output
-
-
-def get_network(
-    num_layers: int,
-    heads: dict,
-    head_conv: int = 256,
-    down_ratio: int = 4,
-    det_dir: str = "",
-) -> Network:
-    return Network(num_layers, heads, head_conv, down_ratio, det_dir)

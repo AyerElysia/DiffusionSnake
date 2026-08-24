@@ -527,7 +527,6 @@ def evaluate_scan(case_id, gt_volume, pred_volume, affine, signed_centroids):
         label: mask_centroid_world(pred_volume == label, affine) for label in pred_labels
     }
     pred_centroids = {label: point for label, point in pred_centroids.items() if point is not None}
-    pred_labels_with_centroids = sorted(pred_centroids)
     per_label = []
     for label in gt_labels:
         gt_mask = gt_volume == label

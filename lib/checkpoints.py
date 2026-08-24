@@ -17,7 +17,7 @@ def sha256_file(path: str | Path) -> str:
 
 
 def extract_state_dict(checkpoint: dict) -> dict:
-    """Return a model state from either a modern or historical envelope."""
+    """Return a model state from any supported source envelope."""
     for key in ("state_dict", "model", "net", "network"):
         candidate = checkpoint.get(key)
         if isinstance(candidate, dict) and candidate:
@@ -28,16 +28,16 @@ def extract_state_dict(checkpoint: dict) -> dict:
 
 
 def normalize_state_dict(state_dict: dict) -> OrderedDict:
-    """Remove DDP prefixes and apply the one supported historical key rename."""
-    legacy_time = re.compile(r"(\.?)time_emb_(\d)(\..*)")
+    """Remove DDP prefixes and apply the signed-source time-key rename."""
+    source_time = re.compile(r"(\.?)time_emb_(\d)(\..*)")
     normalized = OrderedDict()
     for raw_key, value in state_dict.items():
         key = str(raw_key)
         while key.startswith("module."):
             key = key[len("module.") :]
-        match = legacy_time.search(key)
+        match = source_time.search(key)
         if match:
-            key = legacy_time.sub(r"\1time_emb_net.\2\3", key)
+            key = source_time.sub(r"\1time_emb_net.\2\3", key)
         if key in normalized:
             raise ValueError(f"checkpoint key collision after normalization: {key}")
         normalized[key] = value

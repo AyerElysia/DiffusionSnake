@@ -1,243 +1,55 @@
-# Byte-compiled / optimized / DLL files
+# Python
 __pycache__/
 *.py[cod]
-*$py.class
+.pytest_cache/
+.mypy_cache/
+.coverage
+htmlcov/
 
-# C extensions
+# Local environments and editors
+.venv/
+venv/
+.idea/
+.vscode/
+.env
+
+# Build artifacts
+build/
+dist/
+*.egg-info/
 *.so
 
-# Distribution / packaging
-.Python
-build/
-develop-eggs/
-dist/
-downloads/
-eggs/
-.eggs/
-parts/
-sdist/
-var/
-wheels/
-share/python-wheels/
-
-# PyInstaller
-#  Usually these files are written by a python script between OS and version
-#  specific directories. python-setup-py.py is the standard name for this.
-*.manifest
-*.spec
-
-# Installer logs
-pip-log.txt
-pip-delete-this-directory.txt
-
-# Unit test / coverage reports
-htmlcov/
-.tox/
-.nox/
-.coverage
-.coverage.*
-.cache
-nosetests.xml
-coverage.xml
-*.cover
-*.py,cover
-.hypothesis/
-.pytest_cache/
-cover/
-
-# Translations
-*.mo
-*.pot
-
-# Django stuff:
-*.log
-local_settings.py
-db.sqlite3
-db.sqlite3-journal
-
-# Flask stuff:
-instance/
-.webassets-cache
-
-# Scrapy stuff:
-.scrapy
-
-# Sphinx documentation
-docs/_build/
-
-# PyBuilder
-.pybuilder/
-target/
-
-# Jupyter Notebook
-.ipynb_checkpoints
-
-# IPython
-profile_default/
-ipython_config.py
-
-# pyenv
-#   For a library or package, you might want to ignore these files since the Python is
-#   environment specific.
-# .python-version
-
-# pipenv
-#   According to pypa/pipenv#1181, it is recommended to include Pipfile.lock in version control.
-#   However, in case of collaboration, if having platform-specific dependencies or dependencies
-#   having no cross-platform support, pipenv may install dependencies that don't work, or even
-#   fail to install them on other platforms.
-#Pipfile.lock
-
-# poetry
-#   Similar to Pipfile.lock, poetry.lock contains specific versions of dependencies
-#   and should be tracked in a library to ensure reproducible builds.
-#poetry.lock
-
-# pdm
-#   Similar to Pipfile.lock, pdm.lock contains specific versions of dependencies
-#   and should be tracked in a library to ensure reproducible builds.
-#pdm.lock
-
-# PEP 582; used by e.g. github.com/pdm-project/pdm
-__pypackages__/
-
-# Celery stuff
-celerybeat-schedule
-celerybeat.pid
-
-# SageMath parsed files
-*.sage.py
-
-# Environments
-.env
-.venv
-env/
-venv/
-ENV/
-env.bak/
-venv.bak/
-
-# Spyder project settings
-.spyderproject
-.spyproject
-
-# Rope project settings
-.ropeproject
-
-# mkdocs documentation
-/site
-
-# Mypy
-.mypy_cache/
-.dmypy.json
-dmypy.json
-
-# Pyre type checker
-.pyre/
-
-# pytype static type analyzer
-.pytype/
-
-# Cython debug symbols
-cython_debug/
-
-# PyCharm
-.idea/
-
-# VS Code
-.vscode/
-
-################################################################################
-# Deep Learning Specific Exclusions
-################################################################################
-
-# Model Weights and Checkpoints
+# Model weights and experiment outputs
+*.pt
 *.pth
 *.pth.tar
 *.ckpt
 *.bin
-*.model
-*.h5
-*.weights
-/data/model/
-/model/
-/checkpoints/
-/weights/
-/trained_models/
-/output/
-/outputs/
-
-# Dataset Files
-/data/
-/dataset/
-/datasets/
-*.zip
-*.tar
-*.gz
-*.7z
-*.rar
-*.csv
-*.json
-*.txt
-!requirements.txt
-!README.md
-
-# Logging and Experiments
+*.safetensors
+/artifacts/checkpoints/
+/data/outputs/
+/data/records/
+/data/results/
 /logs/
 /wandb/
 /tensorboard/
-/events.out.tfevents.*
-
-# Results and Visualization
 /visual/
-/scripts/visual/
 /results/
 /test_results/
 /vis/
+nohup*.out
 
-# Custom project specifics
-*.sh.bak
-clash/
-.gemini/
-SAMSnake/
+# Local VerSe images, masks, and MoonViT cache
+/data/verse_sagittal/
+/data/sagittal_moonvit_cache/
 
-# Small, signed mainline metadata is source code, not generated data.
-!/configs/manifests/
-!/configs/manifests/volmem_fourier_validation37.csv
+# Keep the small released statistics file under data/.
 !/data/
 /data/*
 !/data/stats/
 /data/stats/*
 !/data/stats/volmem_sagittal_disp_stats.json
 
-################################################################################
-# Temporary / Generated Files (2026-07-31 cleanup)
-################################################################################
-
-# Virtual environments
-.venv_pptx/
-
-# nohup outputs
-nohup.out
-nohup2.out
-nohup*.out
-test/*.nohup*.out
-test/*.nohup*.out.*
-
-# HTML render check temp
-
-# Eagle third-party
-Eagle/
-
-# Large evaluation result image directories (use scripts to regenerate)
-docs/archive/report/perpoint_final_eval/
-docs/archive/report/nsd_clear_full_20260708/
-docs/archive/report/nsd_full_eval_20260708/
-docs/archive/report/moonvit_pseudo3d_formal_training_assets/
-docs/archive/report/perpoint_bottleneck_analysis/
-docs/archive/report/perpoint_policy_bottlenecks/
-docs/archive/report/perpoint_grouped_comparison/
-docs/archive/report/sagittal_pseudo3d_assets/
-
-# Backup files (already tracked in original locations)
-grpo_train_v5_geom_action.py.bak_before_cleanup
+# OS files
+.DS_Store
+Thumbs.db

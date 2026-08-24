@@ -13,7 +13,7 @@
 - 训练与评估使用 GT bounding box 和 GT anatomical class，属于 `oracle_prompt` 口径。检测器框或预测类别必须另表报告。
 - Stage 1 同时训练 Flow 和 MoonViT 特征替换器；Stage 2 只训练继承的 Flow。
 - Stage 2 的五阶段轨迹只是一种训练课程。所有可报告评估和部署始终使用两外阶段、每阶段 4 次 AB2 函数求值，共 8 NFE。
-- `prev_contour_init_prob` 在两个正式配置中固定为 `0.0`。仓库中的上一切片初始化钩子不属于本版本的正式结果，不能静默打开后与主线混报。
+- 数据管线只读取中心切片和该切片的 `layer_18` 缓存；仓库不再包含相邻切片或上一切片轮廓初始化分支。
 - Train72、Val37、Dev8 互相分工；`sub-verse010/011/013` 永远禁止访问。
 
 ## 2. 从输入到输出
@@ -53,7 +53,8 @@ configs/
 lib/
   datasets/                           # VerSe 切片、目标构造、划分门
   networks/mainline.py                # MoonViT cache + Flow 唯一网络
-  networks/diffusion/                 # Flow 与 AB2 实现
+  networks/diffusion/mainline_denoiser.py  # 唯一 6-layer/256-dim Flow 主干
+  networks/diffusion/flow_matching_evolution.py # 监督目标与固定 2×4 AB2
   rl/fourier.py                       # 傅里叶动作、log-prob、KL
   evaluation/                         # TEAMS 2D 与 VerSe 3D 指标
   runtime/gpu.py                      # 两次 15 秒严格空闲 GPU 门
@@ -262,13 +263,17 @@ SHA256 = a337ba1566fe423c10a82dc4c08f8d6936ce8fc49ff1d61c8f735435854a337f
 
 ### 8.1 五阶段训练网格
 
-| 动作 | residual fraction | 实际输入进度 `s` | Fourier sigma（原图 px） | 每阶段 NFE |
-|---:|---:|---:|---:|---:|
-| a0 | 0.2 | 0.0 | 0.8 | 4 |
-| a1 | 0.25 | 0.2 | 0.7 | 4 |
-| a2 | 0.3333 | 0.4 | 0.6 | 4 |
-| a3 | 0.5 | 0.59998 | 0.5 | 4 |
-| a4 | 1.0 | 0.79999 | 0.4 | 4 |
+每个阶段的 Flow 都预测当前位置到目标的完整剩余位移，`residual fraction` 决定本阶段只执行其中多少。由 `s_next = s + (1-s) × fraction` 可知，这五个比例把累计进度推进到约 20% / 40% / 60% / 80% / 100%。
+
+| 动作 | 阶段开始进度 `s` | 取当前剩余位移的比例 | 阶段结束进度 | Fourier 系数 σ | 单点期望 RMS | 每阶段 NFE |
+|---:|---:|---:|---:|---:|---:|---:|
+| a0 | 0.0 | 0.2 | 0.2 | 0.8 | 约 0.20 px | 4 |
+| a1 | 0.2 | 0.25 | 0.4 | 0.7 | 约 0.175 px | 4 |
+| a2 | 0.4 | 0.3333 | 0.59998 | 0.6 | 约 0.15 px | 4 |
+| a3 | 0.59998 | 0.5 | 0.79999 | 0.5 | 约 0.125 px | 4 |
+| a4 | 0.79999 | 1.0 | 1.0 | 0.4 | 约 0.10 px | 4 |
+
+例如初始剩余位移为 100：五阶段依次执行 `20、80×0.25、60×1/3、40×0.5、20×1`，每次约推进原始总位移的 20。Fourier σ 是八个正交低频系数的尺度；128 点轮廓上的单点期望 RMS 为 `σ×sqrt(8/128)=σ/4`，不能把 σ 直接理解为每个点固定移动同样多。
 
 每个阶段只有一个 RL 动作：8 个低频正交傅里叶系数生成标量场，再沿轮廓法向形成几何扰动。一次训练 rollout 有 5 个动作和 20 NFE；`outer_log_count_mean` 必须为 5，不是 20。
 
@@ -280,15 +285,21 @@ SHA256 = a337ba1566fe423c10a82dc4c08f8d6936ce8fc49ff1d61c8f735435854a337f
 x_full = x_start + (x_end - x_start) / f
 ```
 
-每个动作都与同阶段、同 latent 的确定性 Flow 外推端点比较，因此 credit map 为 `[0,1,2,3,4]`。这不是把最终奖励复制五次；每个阶段拥有自己的反事实完整端点评分。
+每个动作都与同阶段、同 latent 的确定性 Flow 外推端点比较，因此 credit map 为 `[0,1,2,3,4]`。这不是把最终奖励复制五次；每个阶段拥有自己的反事实完整端点。
 
-主评分权重固定为：
+策略奖励统一使用正式主线的二维 `delta-NSD@2px`：
 
 ```text
-0.10 × boundary + 0.40 × Dice + 0.40 × IoU + 0.10 × distance
+stage_reward = NSD@2px(sampled_full_extrap)
+             - NSD@2px(deterministic_full_extrap)
+             - 0.06 × sampled_burr_penalty
+
+terminal_reward = NSD@2px(sampled_final)
+                - NSD@2px(deterministic_final)
+                - 0.06 × sampled_burr_penalty
 ```
 
-另外有权重 0.06、margin 0.5 px、上限 1.5 px、q95 的 bounded burr penalty。奖励是相对同一监督模型确定性 rollout 的改进量。
+NSD 对称统计“预测边界落在 GT 边界 2 px 内的比例”和“GT 边界落在预测边界 2 px 内的比例”，两项各占一半。这里是二维图像坐标中的 2 px，不是最终 VerSe 三维评估中的 NSD@2mm。Dice、IoU、mBoundF 只用于验证与报告，不进入策略奖励。毛刺项继续使用 margin 0.5 px、尺度上限 1.5 px 和 q95。
 
 ### 8.3 GRPO/PPO 固定值
 
@@ -416,7 +427,7 @@ FULL_OUT=data/outputs/inference_dev8_YYYYMMDD
 - Route-B 初始化、GT、预测和 FP/FN 误差可视化；
 - 输入/代码/checkpoint SHA、GPU 门、运行时间和完整身份 JSON。
 
-RL 训练的五阶段轨迹从不用于这里；`tools/infer.py` 会强制关闭 RL 探索、上一切片初始化和数据增强，并固定 2×4 AB2。
+RL 训练的五阶段轨迹从不用于这里；`tools/infer.py` 会强制关闭 RL 探索和数据增强，并固定 2×4 AB2。
 
 ## 10. 输出验收与故障处理
 

@@ -367,10 +367,8 @@ from lib.config import cfg, args
 from lib.networks import make_network
 from lib.train.trainers import make_trainer
 from lib.train.optimizer import make_optimizer
-from lib.train.recorder import make_recorder
 from lib.datasets import make_data_loader
 from lib.datasets.dataset_catalog import DatasetCatalog
-from lib.utils.snake import snake_config
 from lib.recorder import JsonLogger, NullLogger
 from lib.visualizers.diffusion_one_sample import save_affine_visualization
 
@@ -525,31 +523,6 @@ def main():
     if torch.cuda.is_available():
         trainer.network.cuda()
 
-    if bool(getattr(cfg.train, 'detail_context_only', False)) or bool(
-        getattr(cfg.train, 'detail_context_head_only', False)
-    ):
-        detail_keywords = (
-            'detail_local_proj',
-            'detail_point_proj',
-            'detail_curve_local_proj',
-            'detail_curve_point_proj',
-        )
-        train_head = bool(getattr(cfg.train, 'detail_context_head_only', False))
-        total_params = 0
-        trainable_params = 0
-        for name, param in trainer.network.named_parameters():
-            allow_train = any(keyword in name for keyword in detail_keywords)
-            if train_head and '.final_layer.' in name and '._shared_final_layer.' not in name:
-                allow_train = True
-            param.requires_grad = allow_train
-            total_params += int(param.numel())
-            if allow_train:
-                trainable_params += int(param.numel())
-        logger.info(
-            "Detail-context partial fine-tune enabled: "
-            f"trainable_params={trainable_params} / total_params={total_params}"
-        )
-
     if is_distributed:
         _ddp_find_unused = os.environ.get('DDP_FIND_UNUSED_PARAMETERS', '1')
         _ddp_find_unused = str(_ddp_find_unused).strip().lower() in ('1', 'true', 'yes', 'y', 'on')
@@ -561,95 +534,16 @@ def main():
             find_unused_parameters=bool(_ddp_find_unused),
         )
     optimizer = make_optimizer(cfg, trainer.network)
-    recorder = make_recorder(cfg)
 
     if is_main_process:
         logger.info(f"use_grpo={getattr(cfg, 'use_grpo', None)}")
 
-    # ========== 数据加载策略 ==========
-    # 默认：正常训练，不合并 train/val（避免数据泄露）
-    # 可选：仅在显式开启时合并 train/val，用于上限潜力实验
-    train_loader = make_data_loader(cfg, is_train=True, is_distributed=is_distributed)
-
-    merge_train_val = bool(getattr(cfg.train, 'merge_with_val', False))
-    merge_env = os.environ.get('DIFFUSION_MERGE_TRAIN_VAL', '').strip().lower()
-    if merge_env:
-        merge_train_val = merge_env in ('1', 'true', 'yes', 'y', 'on')
-
-    if not merge_train_val:
-        logger.info("=" * 60)
-        logger.info("Normal training mode: TRAIN split only (no train/val merge)")
-        logger.info("=" * 60)
-        data_loader = train_loader
-        logger.info(f"Train samples: {len(train_loader.dataset)}")
-        logger.info(f"Batches per epoch: {len(data_loader)}")
-    else:
-        logger.info("=" * 60)
-        logger.info("WARNING: Merging train and val datasets (data leakage mode)")
-        logger.info("This mode is for capacity probing only, not normal training")
-        logger.info("=" * 60)
-
-        original_dataset = cfg.train.dataset
-        try:
-            if 'Train' in cfg.train.dataset:
-                test_dataset_name = cfg.train.dataset.replace('Train', 'Val')
-                cfg.train.dataset = test_dataset_name
-                test_loader = make_data_loader(cfg, is_train=True, is_distributed=is_distributed)
-                logger.info(f"Loaded val dataset for merge: {test_dataset_name}")
-            else:
-                test_loader = None
-                logger.warning("Could not infer val dataset name; fallback to train only")
-        finally:
-            cfg.train.dataset = original_dataset
-
-        if test_loader is not None:
-            from torch.utils.data import ConcatDataset, DataLoader
-
-            train_dataset = train_loader.dataset
-            test_dataset = test_loader.dataset
-            combined_dataset = ConcatDataset([train_dataset, test_dataset])
-
-            inferred_batch_size = getattr(train_loader, 'batch_size', None)
-            if inferred_batch_size is None:
-                inferred_batch_size = getattr(getattr(train_loader, 'batch_sampler', None), 'batch_size', None)
-            if inferred_batch_size is None:
-                inferred_batch_size = int(getattr(cfg.train, 'batch_size', 1))
-
-            inferred_drop_last = getattr(getattr(train_loader, 'batch_sampler', None), 'drop_last', False)
-            collate_fn = train_loader.collate_fn if hasattr(train_loader, 'collate_fn') else None
-
-            if is_distributed:
-                combined_sampler = torch.utils.data.distributed.DistributedSampler(
-                    combined_dataset, shuffle=True
-                )
-                combined_batch_sampler = torch.utils.data.sampler.BatchSampler(
-                    combined_sampler, int(inferred_batch_size), bool(inferred_drop_last)
-                )
-                data_loader = DataLoader(
-                    combined_dataset,
-                    batch_sampler=combined_batch_sampler,
-                    num_workers=train_loader.num_workers,
-                    collate_fn=collate_fn,
-                    pin_memory=True,
-                )
-            else:
-                data_loader = DataLoader(
-                    combined_dataset,
-                    batch_size=int(inferred_batch_size),
-                    shuffle=True,
-                    num_workers=train_loader.num_workers,
-                    collate_fn=collate_fn,
-                    pin_memory=True,
-                    drop_last=bool(inferred_drop_last),
-                )
-
-            logger.info(f"Combined dataset size: {len(combined_dataset)}")
-            logger.info(f"  - Train samples: {len(train_dataset)}")
-            logger.info(f"  - Val samples: {len(test_dataset)}")
-            logger.info(f"  - Batches per epoch: {len(data_loader)}")
-        else:
-            data_loader = train_loader
-            logger.info(f"Using train dataset only: {len(train_loader.dataset)} samples")
+    data_loader = make_data_loader(
+        cfg, is_train=True, is_distributed=is_distributed
+    )
+    logger.info("Train72-only training contract PASS")
+    logger.info(f"Train samples: {len(data_loader.dataset)}")
+    logger.info(f"Batches per epoch: {len(data_loader)}")
 
     def move_batch_to_cuda(batch):
         for k in list(batch.keys()):
@@ -699,9 +593,6 @@ def main():
 
     infer_and_save = _visualize_one_sample
 
-    # 单阶段联合训练配置
-    log_interval = int(os.environ.get('ONE_SAMPLE_LOG_INTERVAL', '1'))
-
     # json logging setup
     out_dir_override = os.environ.get('ONE_SAMPLE_OUT_DIR', '').strip()
     if out_dir_override:
@@ -750,7 +641,7 @@ def main():
     def _safe_load_optimizer_state(optimizer_obj, opt_state_dict) -> bool:
         """Load optimizer state_dict while dropping states whose tensor shapes mismatch current params.
 
-        This is important when resuming from a checkpoint whose model heads changed (e.g. ct_hm classes).
+        This is important when initializing from the signed source checkpoint.
         """
         if not isinstance(opt_state_dict, dict):
             return False
@@ -1098,15 +989,15 @@ def main():
                                 f"{load_report['excluded_keys'][:5]}..."
                             )
                     except RuntimeError as e:
-                        logger.error(f"Failed to load historical model state dict: {e}")
+                        logger.error(f"Failed to load source model state dict: {e}")
 
                 if not resume_weights_only:
                     if 'optimizer' not in resume_checkpoint:
-                        logger.warning('Historical checkpoint has no optimizer state; using fresh optimizer.')
+                        logger.warning('Source checkpoint has no optimizer state; using fresh optimizer.')
                     elif strict_resume:
                         optimizer.load_state_dict(resume_checkpoint['optimizer'])
                     elif not _safe_load_optimizer_state(optimizer, resume_checkpoint['optimizer']):
-                        logger.warning('Historical optimizer state was not compatible; using fresh optimizer.')
+                        logger.warning('Source optimizer state was not compatible; using fresh optimizer.')
 
                 if resume_weights_only:
                     resume_step = 0

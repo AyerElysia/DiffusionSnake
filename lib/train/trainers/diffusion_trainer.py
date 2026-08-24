@@ -28,11 +28,7 @@ class DiffusionPretrainNetworkWrapper(nn.Module):
         self.net = net
         if str(cfg.detector_backend).strip().lower() != "flow_box_only":
             raise ValueError("the mainline trainer only supports flow_box_only")
-        if float(cfg.loss_scales.get("det", 0.0)) != 0.0:
-            raise ValueError("detector loss must be zero for the detector-free mainline")
-        self.diffusion_weight = float(cfg.diffusion_loss_weight) * float(
-            cfg.loss_scales.get("diff", 1.0)
-        )
+        self.diffusion_weight = float(cfg.diffusion_loss_weight)
         if self.diffusion_weight <= 0.0:
             raise ValueError("diffusion loss weight must be positive")
 
@@ -44,18 +40,9 @@ class DiffusionPretrainNetworkWrapper(nn.Module):
         if not torch.isfinite(diffusion_loss).all():
             raise FloatingPointError("non-finite supervised Flow loss")
         loss = self.diffusion_weight * diffusion_loss
-        zero = loss.detach() * 0.0
         scalar_stats = {
-            "det_loss": zero,
-            "mask_loss": zero,
-            "ex_loss": zero,
-            "eagle_ex_loss": zero,
-            "L_loss": zero,
-            "smooth_loss": zero,
-            "curv_loss": zero,
             "diff_loss": diffusion_loss.detach(),
             "diff_loss_scaled": loss.detach(),
-            "det_plus_diff_loss": diffusion_loss.detach(),
             "loss": loss.detach(),
         }
         for key, value in output.items():
@@ -71,12 +58,6 @@ class DiffusionPretrainNetworkWrapper(nn.Module):
                 else torch.tensor(float(value), device=loss.device)
             )
 
-        if self.training and not bool(cfg.volmem_return_training_prediction):
+        if self.training:
             output = {}
-        elif self.training:
-            output = {
-                key: output[key]
-                for key in ("pred_contours", "py_ind")
-                if key in output
-            }
         return output, loss, scalar_stats, {}

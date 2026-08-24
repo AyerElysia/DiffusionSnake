@@ -7,12 +7,8 @@ image dataset and its COCO-specific initialization path.
 
 from __future__ import annotations
 
-import math
-
 import numpy as np
 
-from lib.config import cfg
-from lib.utils import data_utils
 from lib.utils.snake import snake_config, snake_voc_utils
 
 
@@ -66,9 +62,8 @@ class ContourTargetMixin:
         ]
 
     @staticmethod
-    def prepare_detection(box, poly, ct_hm, cls_id, wh, ct_cls, ct_ind):
-        del poly
-        class_heatmap = ct_hm[cls_id]
+    def prepare_box_target(box, cls_id, output_width, wh, ct_cls, ct_ind):
+        """Store the GT box/class fields consumed by the Route-B mainline."""
         ct_cls.append(cls_id)
         x_min, y_min, x_max, y_max = box
         center = np.asarray(
@@ -76,23 +71,8 @@ class ContourTargetMixin:
         )
         center = np.round(center).astype(np.int32)
         height, width = y_max - y_min, x_max - x_min
-        radius = max(
-            0,
-            int(
-                data_utils.gaussian_radius(
-                    (math.ceil(height), math.ceil(width))
-                )
-            ),
-        )
-        data_utils.draw_umich_gaussian(class_heatmap, center, radius)
         wh.append([width, height])
-        ct_ind.append(center[1] * class_heatmap.shape[1] + center[0])
-        return [
-            center[0] - width / 2,
-            center[1] - height / 2,
-            center[0] + width / 2,
-            center[1] + height / 2,
-        ]
+        ct_ind.append(center[1] * int(output_width) + center[0])
 
     @staticmethod
     def prepare_init(
@@ -137,7 +117,7 @@ class ContourTargetMixin:
         x_min, y_min = np.min(extreme_point[:, 0]), np.min(extreme_point[:, 1])
         x_max, y_max = np.max(extreme_point[:, 0]), np.max(extreme_point[:, 1])
         box = [x_min, y_min, x_max, y_max]
-        point_count = self.compute_adaptive_points(box)
+        point_count = snake_config.poly_num
         base_init = snake_voc_utils.get_evolution_init(extreme_point, box)
         image_init = snake_voc_utils.uniformsample(base_init, point_count)
         canonical_init = snake_voc_utils.img_poly_to_can_poly(
@@ -157,44 +137,3 @@ class ContourTargetMixin:
         canonical_init_polys.append(canonical_init)
         image_gt_polys.append(image_gt)
         canonical_gt_polys.append(canonical_gt)
-
-    @staticmethod
-    def compute_adaptive_points(box):
-        if not bool(getattr(snake_config, "adaptive_points_enabled", False)):
-            return int(snake_config.poly_num)
-        width = float(box[2] - box[0])
-        height = float(box[3] - box[1])
-        strategy = str(
-            getattr(snake_config, "point_strategy", "perimeter")
-        ).strip().lower()
-        if bool(getattr(snake_config, "adaptive_use_area_threshold", False)) or strategy in {
-            "area_threshold",
-            "threshold",
-        }:
-            threshold = float(
-                getattr(snake_config, "adaptive_area_threshold", 4096.0)
-            )
-            return int(
-                getattr(
-                    snake_config,
-                    "adaptive_small_points"
-                    if max(width, 0.0) * max(height, 0.0) < threshold
-                    else "adaptive_large_points",
-                    64 if max(width, 0.0) * max(height, 0.0) < threshold else 128,
-                )
-            )
-        density = max(float(getattr(snake_config, "target_density", 2.5)), 1e-6)
-        minimum = int(getattr(snake_config, "min_points", 32))
-        maximum = int(getattr(snake_config, "max_points", 512))
-        multiple = max(1, int(getattr(snake_config, "round_to_multiple", 8)))
-        perimeter = 2.0 * (width + height) / density
-        area = np.sqrt(max(width * height, 0.0)) * 1.5
-        if strategy == "area":
-            value = area
-        elif strategy == "mixed":
-            value = 0.6 * perimeter + 0.4 * area
-        else:
-            value = perimeter
-        point_count = int(np.clip(value, minimum, maximum))
-        point_count = ((point_count + multiple - 1) // multiple) * multiple
-        return int(min(max(point_count, minimum), maximum))
