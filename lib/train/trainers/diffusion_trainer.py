@@ -48,6 +48,8 @@ class DiffusionPretrainNetworkWrapper(nn.Module):
         for key, value in output.items():
             if isinstance(key, str) and key.startswith("diff_loss"):
                 scalar_stats[key] = value.detach() if torch.is_tensor(value) else value
+            if isinstance(key, str) and key.startswith("moe_"):
+                scalar_stats[key] = value.detach() if torch.is_tensor(value) else value
         for key in self._DIAGNOSTIC_KEYS:
             if key not in output:
                 continue

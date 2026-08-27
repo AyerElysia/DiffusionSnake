@@ -44,7 +44,7 @@ DEV8_CASES = (
 )
 LOCKED_CASES = {"sub-verse010", "sub-verse011", "sub-verse013"}
 EXPECTED_SLICES = 1123
-EXPECTED_PARAMETERS = 14373444
+EXPECTED_PARAMETERS = 17264208
 
 
 def parse_args(argv=None):
@@ -92,6 +92,15 @@ def parse_args(argv=None):
         type=int,
         required=True,
         help="physical GPU; it must pass two strict idle samples 15 seconds apart",
+    )
+    parser.add_argument(
+        "--max-idle-memory-mib",
+        type=int,
+        default=20,
+        help=(
+            "maximum driver-resident memory allowed by the two-sample GPU "
+            "idle gate; the resolved threshold is recorded in result provenance"
+        ),
     )
     parser.add_argument(
         "--smoke-slices",
@@ -418,7 +427,10 @@ def main(argv=None):
         raise FileNotFoundError("TEAMS upstream root missing: {}".format(teams_upstream_root))
     if result_dir.exists():
         raise FileExistsError("result directory must be fresh: {}".format(result_dir))
-    gpu_checks = require_idle_gpu(args.gpu)
+    gpu_checks = require_idle_gpu(
+        args.gpu,
+        max_memory_mib=int(args.max_idle_memory_mib),
+    )
     os.environ["CUDA_VISIBLE_DEVICES"] = str(int(args.gpu))
     result_dir.mkdir(parents=True)
 
@@ -661,6 +673,7 @@ def main(argv=None):
             ),
             "seed": int(args.seed),
             "physical_gpu": int(args.gpu),
+            "gpu_idle_max_memory_mib": int(args.max_idle_memory_mib),
             "gpu_idle_checks": gpu_checks,
             "cuda_visible_devices": os.environ.get("CUDA_VISIBLE_DEVICES"),
         },
@@ -675,6 +688,14 @@ def main(argv=None):
             "feature_output_resolution": [128, 128],
             "loaded_tensor_count": loaded_tensor_count,
             "strict_checkpoint_load": True,
+            "ha_smoe": {
+                "routing_unit": "whole_contour",
+                "routed_blocks": [2, 4, 6],
+                "experts": 4,
+                "top_k": 2,
+                "shared_dense_ffn": True,
+                "output_head": "dense",
+            },
         },
         "inference": {
             "box_source": "GT axis-aligned rectangle",

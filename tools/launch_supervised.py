@@ -20,10 +20,16 @@ from lib.runtime import require_idle_gpu
 
 
 EXPECTED_SOURCE_SHA256 = "641445aaed9a7ea3acfc8d50833d0ede9cc454bfe2cf34bea2ff0464d33e929b"
-EXPECTED_MODEL_PARAMETERS = 14_373_444
-EXPECTED_TRAINABLE_PARAMETERS = 14_373_444
-EXPECTED_FLOW_TRAINABLE_PARAMETERS = 11_127_108
+EXPECTED_MODEL_PARAMETERS = 17_264_208
+EXPECTED_TRAINABLE_PARAMETERS = 17_264_208
+EXPECTED_FLOW_TRAINABLE_PARAMETERS = 14_017_872
 EXPECTED_REPLACER_TRAINABLE_PARAMETERS = 3_246_336
+EXPECTED_HA_SMOE_MISSING_PREFIXES = [
+    "net.gcn.denoiser._global_moe_router.",
+    "net.gcn.denoiser.dit_layers.1.routed_moe.",
+    "net.gcn.denoiser.dit_layers.3.routed_moe.",
+    "net.gcn.denoiser.dit_layers.5.routed_moe.",
+]
 EXPECTED_BATCH_SIZE = 48
 EXPECTED_MAX_STEPS = 60_000
 EXPECTED_TRAIN_ROWS = 13_261
@@ -116,7 +122,12 @@ def compare_preflight_states(source_path: Path, final_path: Path, audit_path: Pa
     source_names = set(source_state)
     final_names = set(final_state)
     missing = sorted(source_names - final_names)
-    unexpected = sorted(final_names - source_names)
+    added = sorted(final_names - source_names)
+    disallowed_added = [
+        name
+        for name in added
+        if not any(name.startswith(prefix) for prefix in EXPECTED_HA_SMOE_MISSING_PREFIXES)
+    ]
     shape_mismatches = []
     stats = {
         name: {
@@ -152,10 +163,17 @@ def compare_preflight_states(source_path: Path, final_path: Path, audit_path: Pa
     for group_stats in stats.values():
         group_stats["update_l2"] = math.sqrt(group_stats.pop("update_l2_squared"))
 
+    added_finite = all(
+        not final_state[name].is_floating_point()
+        or bool(torch.isfinite(final_state[name]).all().item())
+        for name in added
+    )
     final_step = int(final_payload.get("step", final_payload.get("global_step", -1)))
     passed = (
         not missing
-        and not unexpected
+        and bool(added)
+        and not disallowed_added
+        and added_finite
         and not shape_mismatches
         and final_step == 2
         and stats["flow"]["changed_tensor_count"] > 0
@@ -164,7 +182,7 @@ def compare_preflight_states(source_path: Path, final_path: Path, audit_path: Pa
         and all(group["all_final_finite"] for group in stats.values())
     )
     audit = {
-        "schema": "diffusionsnake.moonvit_cached_flowtune_preflight_audit.v1",
+        "schema": "diffusionsnake.ha_smoe_supervised_preflight_audit.v1",
         "status": "PASS" if passed else "FAIL",
         "source_checkpoint": str(source_path),
         "final_checkpoint": str(final_path),
@@ -172,12 +190,14 @@ def compare_preflight_states(source_path: Path, final_path: Path, audit_path: Pa
         "final_state_key": final_key,
         "final_step": final_step,
         "missing_tensors": missing,
-        "unexpected_tensors": unexpected,
+        "new_ha_smoe_tensors": added,
+        "disallowed_new_tensors": disallowed_added,
+        "all_new_ha_smoe_tensors_finite": added_finite,
         "shape_mismatches": shape_mismatches,
         "groups": stats,
         "interpretation": {
             "moonvit_encoder": "frozen offline cache; zero encoder parameters in training graph",
-            "flow": "must update",
+            "flow": "shared Flow and new HA-SMoE parameters are trainable",
             "moonvit_replacer": "must update",
         },
     }
@@ -263,6 +283,11 @@ def main():
     assert_equal(bool(cfg.resume), True, "resume")
     assert_equal(bool(cfg.resume_weights_only), True, "weights-only migration")
     assert_equal(bool(cfg.resume_allow_partial_copy), False, "partial-copy policy")
+    assert_equal(
+        [str(value) for value in cfg.resume_allowed_missing_prefixes],
+        EXPECTED_HA_SMOE_MISSING_PREFIXES,
+        "dense-to-HA-SMoE migration prefixes",
+    )
     assert_equal(str(cfg.detector_backend), "flow_box_only", "detector backend")
     assert_equal(bool(cfg.use_gt_det_train_only), True, "GT train-only initialization")
     assert_equal(bool(cfg.locate_feat_inject), False, "Locate injection")
@@ -391,8 +416,13 @@ def main():
         "moonvit_feature_dim": 1152,
         "moonvit_fusion_mode": "center_only",
         "frozen_modules": ["offline_moonvit_encoder"],
-        "trainable_modules": ["inherited_flow", "moonvit_layer18_feature_replacer"],
-        "optimizer_transition": "fresh_adamw_weights_only_for_fair_feature_encoder_comparison",
+        "trainable_modules": [
+            "shared_flow",
+            "ha_smoe_contour_router",
+            "ha_smoe_routed_experts",
+            "moonvit_layer18_feature_replacer",
+        ],
+        "optimizer_transition": "fresh_adamw_dense_to_ha_smoe_weights_only_migration",
         "loss_role": "health_monitoring_only_no_plateau_early_stop",
     }
     manifest_path = output_root / "PURE2D_TRAINING_LAUNCH.json"

@@ -10,6 +10,7 @@ import json
 import math
 import os
 from pathlib import Path
+import re
 import subprocess
 import sys
 
@@ -25,19 +26,17 @@ TRAINER = REPO / 'tools/train_rl.py'
 CONFIG = REPO / 'configs/stage2_rl.yaml'
 SUPERVISED_CONFIG = REPO / 'configs/stage1.yaml'
 REWARD_MODULE = REPO / 'lib/train/rewards/region_reward.py'
-SOURCE = REPO / 'artifacts/checkpoints/moonvit_stage1_step19000.pt'
+SOURCE = REPO / 'artifacts/checkpoints/ha_smoe_stage1_best.pt'
 TUNE_MANIFEST = REPO / 'configs/manifests/volmem_fourier_validation37.csv'
 PREFLIGHT = REPO / 'data/outputs/stage2_rl_preflight'
 FORMAL = REPO / 'data/outputs/stage2_rl'
-EXPECTED_SOURCE_SHA256 = (
-    'a337ba1566fe423c10a82dc4c08f8d6936ce8fc49ff1d61c8f735435854a337f'
-)
+EXPECTED_SOURCE_SHA256 = ''
 EXPECTED_TUNE_MANIFEST_SHA256 = (
     '24a4f19651edb5d187029f0255e2b59f9dce40f320ee29c14b709e8e92e6e6ad'
 )
-EXPECTED_SOURCE_STEP = 19_000
-EXPECTED_MODEL_PARAMETERS = 14_373_444
-EXPECTED_FLOW_PARAMETERS = 11_127_108
+EXPECTED_SOURCE_STEP = -1
+EXPECTED_MODEL_PARAMETERS = 17_264_208
+EXPECTED_FLOW_PARAMETERS = 14_017_872
 EXPECTED_CONTEXT_PARAMETERS = 3_246_336
 FLOW_PREFIXES = ('net.gcn.', 'gcn.')
 
@@ -158,7 +157,7 @@ def audit_preflight(output: Path, launch_log: Path) -> dict:
     credit = hparams.get('credit_assignment', {})
     deployment = hparams.get('deployment_schedule', {})
     if (
-        hparams.get('schema') != 'diffusionsnake.mainline.stage2_rl.v2'
+        hparams.get('schema') != 'diffusionsnake.mainline.stage2_rl.v3'
         or fourier.get('profile')
         != 'five_stage_m8_sigma_080_070_060_050_040'
         or fourier.get('eval_dataset') != 'VolMemFourierVal37'
@@ -244,12 +243,24 @@ def audit_preflight(output: Path, launch_log: Path) -> dict:
 
 def main() -> int:
     global PYTHON, CONFIG, SOURCE, PREFLIGHT, FORMAL
+    global EXPECTED_SOURCE_SHA256, EXPECTED_SOURCE_STEP
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--mode', choices=('preflight', 'train'), required=True)
     parser.add_argument('--gpu', type=int, required=True)
     parser.add_argument('--python', type=Path, default=PYTHON)
     parser.add_argument('--config', type=Path, default=CONFIG)
     parser.add_argument('--source-checkpoint', type=Path, required=True)
+    parser.add_argument(
+        '--source-sha256',
+        required=True,
+        help='full SHA256 of the selected supervised HA-SMoE checkpoint',
+    )
+    parser.add_argument(
+        '--source-step',
+        type=int,
+        required=True,
+        help='effective supervised update stored in the source checkpoint',
+    )
     parser.add_argument('--data-root', type=Path, required=True)
     parser.add_argument('--slice-manifest', type=Path, required=True)
     parser.add_argument('--moonvit-cache', type=Path, required=True)
@@ -265,6 +276,12 @@ def main() -> int:
     PYTHON = args.python.expanduser().resolve()
     CONFIG = args.config.expanduser().resolve()
     SOURCE = args.source_checkpoint.expanduser().resolve()
+    EXPECTED_SOURCE_SHA256 = str(args.source_sha256).strip().lower()
+    EXPECTED_SOURCE_STEP = int(args.source_step)
+    if not re.fullmatch(r'[0-9a-f]{64}', EXPECTED_SOURCE_SHA256):
+        raise ValueError('--source-sha256 must contain exactly 64 hexadecimal characters')
+    if EXPECTED_SOURCE_STEP <= 0:
+        raise ValueError('--source-step must be positive')
     data_root = args.data_root.expanduser().resolve()
     slice_manifest = args.slice_manifest.expanduser().resolve()
     moonvit_cache = args.moonvit_cache.expanduser().resolve()
@@ -319,7 +336,7 @@ def main() -> int:
     manifest = {
         'status': 'STARTED',
         'mode': args.mode,
-        'pipeline': 'moonvit_flow_five_action_fourier_delta_nsd_grpo_2x4_deploy',
+        'pipeline': 'moonvit_ha_smoe_five_action_fourier_delta_nsd_grpo_2x4_deploy',
         'output': str(output),
         'gpu': args.gpu,
         'launcher_pid': os.getpid(),
@@ -338,6 +355,14 @@ def main() -> int:
         'model_parameters': EXPECTED_MODEL_PARAMETERS,
         'flow_trainable_parameters': EXPECTED_FLOW_PARAMETERS,
         'frozen_context_parameters': EXPECTED_CONTEXT_PARAMETERS,
+        'ha_smoe': {
+            'routing_unit': 'whole_contour',
+            'routed_blocks': [2, 4, 6],
+            'num_experts': 4,
+            'top_k': 2,
+            'shared_dense_ffn': True,
+            'output_head': 'dense',
+        },
         'training_contract': {
             'outer_fractions': [0.2, 0.25, 0.3333, 0.5, 1.0],
             'inner_steps_per_outer_stage': 4,
@@ -382,6 +407,8 @@ def main() -> int:
         'DIFFUSIONSNAKE_DATA_ROOT': str(data_root),
         'DIFFUSIONSNAKE_SLICE_MANIFEST': str(slice_manifest),
         'MOONVIT_CACHE_ROOT': str(moonvit_cache),
+        'DIFFUSIONSNAKE_SOURCE_SHA256': EXPECTED_SOURCE_SHA256,
+        'DIFFUSIONSNAKE_SOURCE_STEP': str(EXPECTED_SOURCE_STEP),
         'PYTHONPATH': (
             str(REPO) if not existing_pythonpath
             else f'{REPO}{os.pathsep}{existing_pythonpath}'

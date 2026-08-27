@@ -1,4 +1,4 @@
-"""Checkpoint-compatible Flow denoiser used by the official mainline.
+"""Checkpoint-compatible Flow + HA-SMoE denoiser used by the mainline.
 
 This module is the single supported denoiser implementation.  It preserves
 the parameter names and computations of the signed source configuration:
@@ -7,10 +7,12 @@ the parameter names and computations of the signed source configuration:
 * six self-attention -> cross-attention -> SwiGLU blocks;
 * alternating global Perceiver and local sampled-feature context;
 * diffusion-progress conditioning; and
-* the dense residual displacement head.
+* one contour-level route path for blocks 2/4/6;
+* an always-on shared FFN plus E4 Top-2 residual experts in those blocks; and
+* one dense residual displacement head.
 
-Legacy architecture switches, sparse experts, detail branches, latent loops
-and per-point auxiliary heads intentionally do not live in the mainline.
+There are no alternative MoE variants in this module.  In particular, the
+mainline has no point/token routing, per-block routers or output-head mixture.
 """
 
 from __future__ import annotations
@@ -188,7 +190,7 @@ class SeparatePointEmbedding(nn.Module):
 
 
 class MainlineDiTBlock(nn.Module):
-    """Self-attention -> image cross-attention -> dense SwiGLU."""
+    """Self-attention -> image cross-attention -> shared/routed FFN."""
 
     def __init__(
         self,
@@ -222,6 +224,9 @@ class MainlineDiTBlock(nn.Module):
         self.ca_out_proj = nn.Linear(self.dim, self.dim, bias=False)
 
         self.mlp = SwiGLU(dim=self.dim, dropout=dropout)
+        # ``mlp`` is always on.  Blocks 2/4/6 attach contour-level residual
+        # specialists here while preserving dense-checkpoint parameter names.
+        self.routed_moe: nn.Module | None = None
         self.adaLN_modulation = nn.Sequential(
             nn.SiLU(),
             nn.Linear(self.dim, 9 * self.dim, bias=True),
@@ -300,6 +305,7 @@ class MainlineDiTBlock(nn.Module):
         x: torch.Tensor,
         image_context: torch.Tensor,
         condition_embedding: torch.Tensor,
+        route_logits: torch.Tensor | None = None,
     ) -> torch.Tensor:
         modulation = self.adaLN_modulation(condition_embedding)
         (
@@ -322,10 +328,34 @@ class MainlineDiTBlock(nn.Module):
             image_context,
         )
         ffn_input = modulate(self.norm3(x), shift_ff, scale_ff)
-        return x + gate_ff.unsqueeze(1) * self.mlp(ffn_input)
+        ffn_output = self.mlp(ffn_input)
+        if self.routed_moe is not None:
+            if route_logits is None:
+                raise RuntimeError("HA-SMoE route logits are required")
+            ffn_output = ffn_output + self.routed_moe(ffn_input, route_logits)
+        elif route_logits is not None:
+            raise RuntimeError("route logits supplied to a dense DiT block")
+        return x + gate_ff.unsqueeze(1) * ffn_output
+
+    def enable_ha_smoe(self) -> None:
+        if self.routed_moe is not None:
+            raise RuntimeError("this DiT block already has routed experts")
+        from .ha_smoe import ContourSharedResidualExperts
+
+        self.routed_moe = ContourSharedResidualExperts(
+            dim=self.dim,
+            num_experts=4,
+            top_k=2,
+            expert_hidden_dim=256,
+            load_balance_weight=1e-2,
+            specialization_weight=5e-3,
+            expert_init_std=1e-4,
+        )
 
     def reg_loss(self) -> torch.Tensor:
-        return self.adaLN_modulation[-1].weight.new_zeros(())
+        if self.routed_moe is None:
+            return self.adaLN_modulation[-1].weight.new_zeros(())
+        return self.routed_moe.reg_loss()
 
 
 class DenseResidualFinalHead(nn.Module):
@@ -373,7 +403,7 @@ class DenseResidualFinalHead(nn.Module):
 
 
 class MainlineFlowDenoiser(nn.Module):
-    """The only Flow denoiser supported by the packaged training pipeline."""
+    """Six-layer Flow denoiser with the single released HA-SMoE design."""
 
     def __init__(
         self,
@@ -391,6 +421,8 @@ class MainlineFlowDenoiser(nn.Module):
         self.feature_dim = int(feature_dim)
         self.time_dim = self.state_dim
         self.num_points = int(num_points)
+        if int(num_layers) != 6:
+            raise ValueError("HA-SMoE mainline requires exactly six DiT blocks")
 
         self.time_emb_net = nn.Sequential(
             SinusoidalTimeEmbedding(dim=self.state_dim // 4),
@@ -423,6 +455,19 @@ class MainlineFlowDenoiser(nn.Module):
                 for _ in range(num_layers)
             ]
         )
+        from .ha_smoe import ContourRoutePath
+
+        # Human block numbers 2/4/6 map to zero-based Python indices 1/3/5.
+        self._ha_smoe_layer_indices = (1, 3, 5)
+        self._global_moe_router = ContourRoutePath(
+            dim=self.state_dim,
+            num_routed_blocks=len(self._ha_smoe_layer_indices),
+            num_experts=4,
+            hidden_dim=256,
+            temperature=1.0,
+        )
+        for index in self._ha_smoe_layer_indices:
+            self.dit_layers[index].enable_ha_smoe()
 
         if not use_s_conditioning:
             raise ValueError("the mainline requires diffusion-stage conditioning")
@@ -503,13 +548,40 @@ class MainlineFlowDenoiser(nn.Module):
 
         local_context = self.local_proj(sampled_feat.transpose(1, 2))
         x = self.point_embed(x_t, sampled_feat)
+        route_path = self._global_moe_router(
+            x,
+            local_context,
+            global_context,
+            condition_embedding,
+        )
+        route_positions = {
+            layer_index: route_index
+            for route_index, layer_index in enumerate(self._ha_smoe_layer_indices)
+        }
         for index, layer in enumerate(self.dit_layers):
             context = global_context if index % 2 == 0 else local_context
-            x = layer(x, context, condition_embedding)
+            route_logits = (
+                route_path[:, route_positions[index], :]
+                if index in route_positions
+                else None
+            )
+            x = layer(
+                x,
+                context,
+                condition_embedding,
+                route_logits=route_logits,
+            )
 
         prediction = self.final_layer(x, condition_embedding)
-        regularization = prediction.new_zeros(())
+        regularization = self.final_layer.reg_loss()
+        for layer in self.dit_layers:
+            regularization = regularization + layer.reg_loss()
         return prediction, regularization
+
+    def moe_diagnostics(self) -> dict[str, torch.Tensor]:
+        from .ha_smoe import collect_ha_smoe_diagnostics
+
+        return collect_ha_smoe_diagnostics(self)
 
 
 __all__ = (

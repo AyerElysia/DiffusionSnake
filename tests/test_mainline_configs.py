@@ -22,9 +22,37 @@ class MainlineConfigTest(unittest.TestCase):
             {"configs/stage1.yaml", "configs/stage2_rl.yaml"},
         )
 
+    def test_only_one_diffusion_architecture_path_is_released(self):
+        paths = {
+            path.relative_to(ROOT).as_posix()
+            for path in (ROOT / "lib" / "networks" / "diffusion").glob("*.py")
+        }
+        self.assertEqual(
+            paths,
+            {
+                "lib/networks/diffusion/__init__.py",
+                "lib/networks/diffusion/flow_matching_evolution.py",
+                "lib/networks/diffusion/ha_smoe.py",
+                "lib/networks/diffusion/mainline_denoiser.py",
+            },
+        )
+        inference_source = (ROOT / "tools" / "infer.py").read_text(
+            encoding="utf-8"
+        )
+        self.assertIn("EXPECTED_PARAMETERS = 17264208", inference_source)
+
     def test_stage1_contract(self):
         config = self.load("stage1.yaml")
-        self.assertEqual(config["pure2d_expected_parameter_count"], 14_373_444)
+        self.assertEqual(config["pure2d_expected_parameter_count"], 17_264_208)
+        self.assertEqual(
+            config["resume_allowed_missing_prefixes"],
+            [
+                "net.gcn.denoiser._global_moe_router.",
+                "net.gcn.denoiser.dit_layers.1.routed_moe.",
+                "net.gcn.denoiser.dit_layers.3.routed_moe.",
+                "net.gcn.denoiser.dit_layers.5.routed_moe.",
+            ],
+        )
         self.assertEqual(config["train"]["max_steps"], 60_000)
         self.assertEqual(config["locate_feat_keys"], ["layer_18"])
         self.assertEqual(config["iterative_fractions"], [0.6667, 1.0])
@@ -32,6 +60,7 @@ class MainlineConfigTest(unittest.TestCase):
 
     def test_stage2_fourier_delta_nsd_contract(self):
         config = self.load("stage2_rl.yaml")
+        self.assertEqual(config["pure2d_expected_parameter_count"], 17_264_208)
         self.assertEqual(config["rl_fractions"], [0.2, 0.25, 0.3333, 0.5, 1.0])
         self.assertEqual(config["rl_deployment_fractions"], [0.6667, 1.0])
         self.assertEqual(config["rl_deployment_ode_steps"], 4)

@@ -22,7 +22,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--moonvit-cache", required=True)
     parser.add_argument("--checkpoint", required=True)
     parser.add_argument("--checkpoint-sha256", default="")
-    parser.add_argument("--expected-step", type=int, default=19000)
+    parser.add_argument(
+        "--expected-step",
+        type=int,
+        required=True,
+        help="exact step stored in the selected HA-SMoE checkpoint",
+    )
     parser.add_argument("--max-scan", type=int, default=64)
     return parser.parse_args()
 

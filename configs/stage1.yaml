@@ -1,6 +1,6 @@
-# Stage 1: frozen offline MoonViT layer-18 features with jointly trainable
-# feature replacer and Flow. Initialization is the signed step-40000 source.
-model: 'moonvit_flow_stage1'
+# Stage 1: migrate the signed dense MoonViT+Flow source into the only released
+# HA-SMoE architecture, then jointly train the replacer and complete Flow.
+model: 'moonvit_flow_ha_smoe_stage1'
 task: 'snake'
 model_dir: 'data/outputs/stage1'
 gpus: [6]
@@ -8,12 +8,17 @@ resume: true
 resume_weights_only: true
 resume_path: 'artifacts/checkpoints/pure2d_step40000.pt'
 resume_allow_partial_copy: false
+resume_allowed_missing_prefixes:
+    - 'net.gcn.denoiser._global_moe_router.'
+    - 'net.gcn.denoiser.dit_layers.1.routed_moe.'
+    - 'net.gcn.denoiser.dit_layers.3.routed_moe.'
+    - 'net.gcn.denoiser.dit_layers.5.routed_moe.'
 resume_source_format: 'pure2d_robustbox_absolute_step40000_weights_only_moonvit_flowtune_v1'
 train_or_test: train
 
 pure2d_memory_free_required: true
 pure2d_internal_detector_free_required: true
-pure2d_expected_parameter_count: 14373444
+pure2d_expected_parameter_count: 17264208
 
 train:
     dataset: 'VolMemTrain'
@@ -93,6 +98,8 @@ diffusion_disp_stats: 'data/stats/volmem_sagittal_disp_stats.json'
 dit_num_layers: 6
 dit_num_heads: 8
 dit_state_dim: 256
+# HA-SMoE is architectural, not a switch: one contour router emits E4 Top-2
+# routes for DiT blocks 2/4/6; the shared FFNs and dense velocity head remain.
 iterative_fractions: [0.6667, 1.0]
 iterative_ode_steps: 4
 flow_ode_solver: 'ab2'

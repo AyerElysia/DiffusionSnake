@@ -1,8 +1,8 @@
-# DiffusionSnake：VerSe MoonViT + Flow 双阶段主线
+# FlowSnake：VerSe MoonViT + HA-SMoE Flow 双阶段主线
 
 本仓库只保留一条可复现的正式路线：
 
-> **离线 MoonViT layer-18 特征 → 监督训练特征替换器与 Flow → 冻结特征替换器、只对 Flow 做五阶段傅里叶 full-extrap GRPO → 固定 2×4 AB2（8 NFE）推理。**
+> **离线 MoonViT layer-18 特征 → 轮廓级 HA-SMoE Flow 监督训练 → 冻结特征替换器、只对完整 Flow 做五阶段傅里叶 full-extrap GRPO → 固定 2×4 AB2（8 NFE）推理。**
 
 这是一份可直接交接的运行手册。权重、数据集和约 84 GB 的 MoonViT 缓存不进入 Git；代码通过路径参数使用它们。
 
@@ -12,6 +12,8 @@
 - MoonViT 是唯一推荐的视觉特征来源。编码器不在训练图中，只读取提前生成并带元数据的 `layer_18` 缓存。
 - 训练与评估使用 GT bounding box 和 GT anatomical class，属于 `oracle_prompt` 口径。检测器框或预测类别必须另表报告。
 - Stage 1 同时训练 Flow 和 MoonViT 特征替换器；Stage 2 只训练继承的 Flow。
+- HA-SMoE 只有一种实现：一次轮廓级路由为 DiT 第 2/4/6 层分别产生 E4 Top-2 路由；原 Dense FFN 始终执行，专家只提供残差；速度输出头保持 Dense。
+- 整条 128 点轮廓共享每一层的专家选择。仓库没有点级/token 级路由、独立逐层 router、全层 MoE 或输出头 MoE/GMM。
 - Stage 2 的五阶段轨迹只是一种训练课程。所有可报告评估和部署始终使用两外阶段、每阶段 4 次 AB2 函数求值，共 8 NFE。
 - 数据管线只读取中心切片和该切片的 `layer_18` 缓存；仓库不再包含相邻切片或上一切片轮廓初始化分支。
 - Train72、Val37、Dev8 互相分工；`sub-verse010/011/013` 永远禁止访问。
@@ -27,7 +29,10 @@
 
 GT box + GT anatomical class
   └─ Route-B：矩形 → 12 点八边形 → 128 点初始轮廓
-       └─ 11.127M Flow
+       └─ 14.018M HA-SMoE Flow
+            ├─ 一次轮廓级路由：[N, 3 blocks, 4 experts]
+            ├─ DiT blocks 2/4/6：共享 Dense FFN + E4 Top-2 残差专家
+            ├─ 单一 Dense 速度头
             ├─ 外阶段 1：fraction=0.6667，s=0.0，AB2×4
             └─ 外阶段 2：fraction=1.0，s=0.6667，AB2×4
                  └─ 最终 128 点轮廓（总计 8 NFE）
@@ -37,11 +42,30 @@ GT box + GT anatomical class
 
 | 组成 | 参数量 | Stage 1 | Stage 2 |
 |---|---:|---|---|
-| Flow | 11,127,108 | 训练 | 训练 |
+| 继承的共享 Flow | 11,127,108 | 训练 | 训练 |
+| HA-SMoE router + 三组专家 | 2,890,764 | 训练 | 训练 |
+| 完整 HA-SMoE Flow | 14,017,872 | 训练 | 训练 |
 | MoonViT 特征替换器 | 3,246,336 | 训练 | 冻结 |
 | MoonViT 编码器 | 不进入训练图 | 冻结缓存 | 冻结缓存 |
-| 总模型 | 14,373,444 | 14,373,444 可训练 | 11,127,108 可训练 |
+| 总模型 | 17,264,208 | 17,264,208 可训练 | 14,017,872 可训练 |
 | Memory / 内部检测器 | 0 | 关闭 | 关闭 |
+
+### 2.1 轮廓级路由到底是什么
+
+router 不为 128 个点分别选择专家。它先对以下三组 token 分别做整条轮廓的 mean/std 汇聚：轮廓 token、当前轮廓位置采样的局部图像 token、MoonViT 全局 token，再拼接时间与外阶段进度条件。得到的单个轮廓描述经过一个共享 trunk，一次输出三组 logits：
+
+```text
+[contour mean/std, local mean/std, global mean/std, t+s]
+                         │
+                one contour router
+                         │
+             logits [N, 3, 4 experts]
+                    /       |       \
+              block 2   block 4   block 6
+                Top-2     Top-2     Top-2
+```
+
+对某个 block 而言，Top-2 权重只有 `[N, 2]`，没有点维度 `P`，因此同一条轮廓的全部点使用同一对专家。三个 block 可以选择不同专家，但三组 logits 来自同一次 router 前向。输出层不参与路由。
 
 ## 3. 仓库结构
 
@@ -54,6 +78,7 @@ lib/
   datasets/                           # VerSe 切片、目标构造、划分门
   networks/mainline.py                # MoonViT cache + Flow 唯一网络
   networks/diffusion/mainline_denoiser.py  # 唯一 6-layer/256-dim Flow 主干
+  networks/diffusion/ha_smoe.py       # 唯一轮廓级 E4 Top-2 专家实现
   networks/diffusion/flow_matching_evolution.py # 监督目标与固定 2×4 AB2
   rl/fourier.py                       # 傅里叶动作、log-prob、KL
   evaluation/                         # TEAMS 2D 与 VerSe 3D 指标
@@ -88,7 +113,9 @@ DATA_ROOT=/path/to/sagittal_2d_fixed
 SLICE_MANIFEST="$DATA_ROOT/manifests/slice_manifest.csv"
 MOONVIT_CACHE=/path/to/sagittal_moonvit_cache
 STAGE1_SOURCE=/path/to/pure2d_step40000.pt
-STAGE2_SOURCE=/path/to/moonvit_stage1_step19000.pt
+STAGE2_SOURCE=/path/to/ha_smoe_stage1_selected.pt
+STAGE2_SOURCE_SHA256=<64位完整SHA256>
+STAGE2_SOURCE_STEP=<checkpoint中的step>
 CASE_METADATA=/path/to/case_metadata.csv
 ```
 
@@ -160,15 +187,15 @@ Eagle/Embodied/work_dirs/1232_final_locany_full_more10000/checkpoint-3000
   --slice-manifest "$SLICE_MANIFEST" \
   --moonvit-cache "$MOONVIT_CACHE" \
   --checkpoint "$STAGE2_SOURCE" \
-  --checkpoint-sha256 a337ba1566fe423c10a82dc4c08f8d6936ce8fc49ff1d61c8f735435854a337f \
-  --expected-step 19000
+  --checkpoint-sha256 "$STAGE2_SOURCE_SHA256" \
+  --expected-step "$STAGE2_SOURCE_STEP"
 ```
 
-`status=PASS` 才能继续。它会读取真实 foreground 样本、核对 Train72 与锁定病例、严格加载全部 156 个 checkpoint 张量、检查参数量，并验证五阶段进度与傅里叶投影。
+`status=PASS` 才能继续。它会读取真实 foreground 样本、核对 Train72 与锁定病例、严格加载完整 HA-SMoE checkpoint、检查 17,264,208 参数，并验证五阶段进度与傅里叶投影。
 
 ## 6. Stage 1：监督训练
 
-唯一配置为 `configs/stage1.yaml`。它从兼容的 absolute step40000 权重做 weights-only 迁移，建立新的 AdamW；不会继承旧优化器状态。
+唯一配置为 `configs/stage1.yaml`。它从兼容的 absolute step40000 Dense 权重做一次受控 weights-only 迁移：所有原参数必须精确匹配，只允许新增全局轮廓 router 和第 2/4/6 层专家参数；不允许 shape 跳过、重叠拷贝或其他 missing/unexpected。随后建立新的 AdamW，不继承旧优化器状态。
 
 固定 source：
 
@@ -188,7 +215,7 @@ SHA256 = 641445aaed9a7ea3acfc8d50833d0ede9cc454bfe2cf34bea2ff0464d33e929b
 | local updates | 60,000 |
 | checkpoint | 每 1,000；保留 12 个 |
 | 里程碑 | 5k / 10k / 20k / 40k / 60k |
-| 可训练参数 | Flow + 特征替换器，共 14,373,444 |
+| 可训练参数 | HA-SMoE Flow + 特征替换器，共 17,264,208 |
 | 初始化 | GT Route-B box-octagon + jitter |
 
 ### 6.1 两步预检
@@ -215,7 +242,8 @@ STAGE1_PREFLIGHT=data/outputs/stage1_preflight_YYYYMMDD
 - source step/SHA、参数量、Train72/Dev8 身份通过；
 - step1/2 loss 与更新有限；
 - Flow 和特征替换器都至少有一个张量更新；
-- 不出现 missing/unexpected/shape mismatch。
+- Dense source 的全部旧张量都存在且 shape 一致；新增张量只能来自四个已登记的 HA-SMoE 前缀；
+- 新增 HA-SMoE 张量全部有限，不出现 partial copy、shape skip 或其他 missing/unexpected。
 
 ### 6.2 正式训练
 
@@ -235,14 +263,7 @@ STAGE1_RUN=data/outputs/stage1_60k_YYYYMMDD
   --output-root "$STAGE1_RUN"
 ```
 
-发布的 Stage 2 source 是一次正式 Stage 1 运行留下的最近完整锚点：
-
-```text
-step = 19000
-SHA256 = a337ba1566fe423c10a82dc4c08f8d6936ce8fc49ff1d61c8f735435854a337f
-```
-
-它是可严格加载的监督锚点，不代表 Stage 1 已完成 60k。不要覆盖原运行，也不要把不完整文件当作恢复源。
+Stage 2 source 必须是 Stage 1 产生的完整 HA-SMoE checkpoint。选择后记录文件的完整 SHA256 和 `step`，随后所有 RL 预检、正式训练与恢复都显式传入这两个值。不要使用旧 14.37M Dense checkpoint 直接进入 Stage 2，也不要把不完整文件当作恢复源。
 
 ## 7. 固定 2×4 部署推理
 
@@ -259,7 +280,7 @@ SHA256 = a337ba1566fe423c10a82dc4c08f8d6936ce8fc49ff1d61c8f735435854a337f
 
 ## 8. Stage 2：五阶段傅里叶 full-extrap GRPO
 
-唯一配置为 `configs/stage2_rl.yaml`，唯一 source 是上述 step19000。MoonViT 特征替换器逐 tensor 冻结，只更新 11,127,108 个 Flow 参数。
+唯一配置为 `configs/stage2_rl.yaml`。MoonViT 特征替换器逐 tensor 冻结，只更新完整的 14,017,872 个 HA-SMoE Flow 参数，其中包括共享 Flow、轮廓 router 和路由专家。
 
 ### 8.1 五阶段训练网格
 
@@ -335,6 +356,8 @@ STAGE2_PREFLIGHT=data/outputs/stage2_rl_preflight_YYYYMMDD
   --gpu 6 \
   --python "$PYTHON" \
   --source-checkpoint "$STAGE2_SOURCE" \
+  --source-sha256 "$STAGE2_SOURCE_SHA256" \
+  --source-step "$STAGE2_SOURCE_STEP" \
   --data-root "$DATA_ROOT" \
   --slice-manifest "$SLICE_MANIFEST" \
   --moonvit-cache "$MOONVIT_CACHE" \
@@ -354,6 +377,8 @@ STAGE2_RUN=data/outputs/stage2_rl_10k_YYYYMMDD
   --gpu 6 \
   --python "$PYTHON" \
   --source-checkpoint "$STAGE2_SOURCE" \
+  --source-sha256 "$STAGE2_SOURCE_SHA256" \
+  --source-step "$STAGE2_SOURCE_STEP" \
   --data-root "$DATA_ROOT" \
   --slice-manifest "$SLICE_MANIFEST" \
   --moonvit-cache "$MOONVIT_CACHE" \
@@ -371,6 +396,8 @@ STAGE2_RESUME=data/outputs/stage2_rl_resume_YYYYMMDD
   --gpu 6 \
   --python "$PYTHON" \
   --source-checkpoint "$STAGE2_SOURCE" \
+  --source-sha256 "$STAGE2_SOURCE_SHA256" \
+  --source-step "$STAGE2_SOURCE_STEP" \
   --resume-checkpoint /path/to/previous/checkpoints/latest.pt \
   --data-root "$DATA_ROOT" \
   --slice-manifest "$SLICE_MANIFEST" \
@@ -419,7 +446,7 @@ FULL_OUT=data/outputs/inference_dev8_YYYYMMDD
   --smoke-slices 0
 ```
 
-完整运行必须处理 1,123 张 Dev8 切片，严格加载 14,373,444 参数，并输出：
+完整运行必须处理 1,123 张 Dev8 切片，严格加载 17,264,208 参数，并输出：
 
 - foreground IoU、Dice、mBoundF、HD95；
 - PQ、SQ、RQ、TP/FP/FN；
@@ -434,7 +461,7 @@ RL 训练的五阶段轨迹从不用于这里；`tools/infer.py` 会强制关闭
 每个 checkpoint 至少核对：
 
 1. 文件大小稳定且可计算 SHA256；
-2. 156 个张量 key/shape 与 source 严格一致；
+2. Stage 1 迁移只新增登记的 HA-SMoE 张量；Stage 2/推理的 key/shape 与 HA-SMoE source 严格一致；
 3. 全部浮点张量有限；
 4. Stage 1 中 Flow 与替换器都更新；Stage 2 中只有 Flow 更新；
 5. 日志的 reward/loss/grad/ratio/approx-KL 有限；
@@ -450,13 +477,13 @@ RL 训练的五阶段轨迹从不用于这里；`tools/infer.py` 会强制关闭
 
 - [ ] 克隆仓库并安装 `requirements.txt`。
 - [ ] 准备 Train72/Val37/Dev8 数据、slice manifest、case metadata 和 MoonViT cache。
-- [ ] 核对 step40000 与 step19000 两个 source SHA。
+- [ ] 核对 Dense step40000 source SHA；Stage 1 完成后登记所选 HA-SMoE checkpoint 的 SHA 与 step。
 - [ ] 运行 `tools/verify_installation.py` 并得到 `PASS`。
 - [ ] 选择真正空闲 GPU；不终止、不抢占其他进程。
 - [ ] Stage 1：新目录做 2-step preflight，再启动唯一正式运行。
-- [ ] Stage 2：固定 step19000 source，新目录做 2-step preflight，再做 10k 有效更新。
+- [ ] Stage 2：使用完整 HA-SMoE source，新目录做 2-step preflight，再做 10k 有效更新。
 - [ ] 恢复训练时使用完整 checkpoint，并写入新目录。
 - [ ] 先跑非报告 smoke inference，再跑完整 Dev8。
 - [ ] 检查 manifest、SHA、冻结参数和可视化后再汇报结果。
 
-本仓库不包含历史对比模型、探索配置、旧 RL 分支或运行中状态记录；Git 中的两个配置和五个公开入口就是全部正式流程。
+本仓库不包含历史对比模型、探索配置、输出头 MoE、点级路由、旧 RL 分支或运行中状态记录；Git 中的两个配置、唯一 HA-SMoE 架构和五个公开入口就是全部正式流程。

@@ -63,12 +63,12 @@ from lib.train.rewards.region_reward import (
 from lib.utils.snake import snake_config, snake_gcn_utils
 
 
-EXPECTED_SOURCE_SHA256 = (
-    "a337ba1566fe423c10a82dc4c08f8d6936ce8fc49ff1d61c8f735435854a337f"
-)
-EXPECTED_SOURCE_STEP = 19_000
-EXPECTED_MODEL_PARAMETERS = 14_373_444
-EXPECTED_FLOW_PARAMETERS = 11_127_108
+EXPECTED_SOURCE_SHA256 = os.environ.get(
+    "DIFFUSIONSNAKE_SOURCE_SHA256", ""
+).strip().lower()
+EXPECTED_SOURCE_STEP = int(os.environ.get("DIFFUSIONSNAKE_SOURCE_STEP", "-1"))
+EXPECTED_MODEL_PARAMETERS = 17_264_208
+EXPECTED_FLOW_PARAMETERS = 14_017_872
 EXPECTED_CONTEXT_PARAMETERS = 3_246_336
 EXPECTED_BACKEND = "flow_box_only"
 EXPECTED_TRAIN_FRACTIONS = (0.2, 0.25, 0.3333, 0.5, 1.0)
@@ -419,6 +419,17 @@ def main() -> None:
 
     _set_seed(seed)
     source_path = _source_checkpoint()
+    if len(EXPECTED_SOURCE_SHA256) != 64 or any(
+        character not in "0123456789abcdef"
+        for character in EXPECTED_SOURCE_SHA256
+    ):
+        raise RuntimeError(
+            "launch through tools/launch_rl.py with an explicit source SHA256"
+        )
+    if EXPECTED_SOURCE_STEP <= 0:
+        raise RuntimeError(
+            "launch through tools/launch_rl.py with an explicit source step"
+        )
     if sha256_file(source_path) != EXPECTED_SOURCE_SHA256:
         raise RuntimeError("stage-1 checkpoint SHA256 drift")
     source_payload = torch.load(source_path, map_location="cpu", weights_only=False)
@@ -528,7 +539,7 @@ def main() -> None:
     eval_seed_base = 91_000_000 + seed
     expected_rms_px = [value * math.sqrt(modes / 128.0) for value in sigma_px]
     hparams = {
-        "schema": "diffusionsnake.mainline.stage2_rl.v2",
+        "schema": "diffusionsnake.mainline.stage2_rl.v3",
         "cfg_file": _cfg_file_used(),
         "base_checkpoint": str(source_path),
         "base_checkpoint_sha256": EXPECTED_SOURCE_SHA256,
@@ -596,6 +607,14 @@ def main() -> None:
             "total": EXPECTED_MODEL_PARAMETERS,
             "trainable_flow": EXPECTED_FLOW_PARAMETERS,
             "frozen_context": EXPECTED_CONTEXT_PARAMETERS,
+        },
+        "ha_smoe": {
+            "routing_unit": "whole_contour",
+            "routed_blocks": [2, 4, 6],
+            "num_experts": 4,
+            "top_k": 2,
+            "shared_dense_ffn": True,
+            "output_head": "dense",
         },
     }
     _atomic_json(log_dir / "hparams.json", hparams)

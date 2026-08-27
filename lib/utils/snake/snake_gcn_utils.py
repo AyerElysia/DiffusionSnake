@@ -408,7 +408,11 @@ def get_gcn_feature(
             padding_mode="border",
             align_corners=False,
         )[0].permute(1, 0, 2)
-        sampled[selected] = values
+        # CUDA autocast may promote ``grid_sample`` to float32 even when the
+        # feature tensor (and therefore the destination cache) is float16.
+        # Keep assignment explicit so mixed-precision inference follows the
+        # same numerical path without a dtype mismatch.
+        sampled[selected] = values.to(dtype=sampled.dtype)
     return sampled
 
 

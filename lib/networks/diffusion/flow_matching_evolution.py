@@ -3,7 +3,7 @@
 There is deliberately one implementation in this package:
 
 * Route-B bbox-octagon initialization;
-* a checkpoint-compatible six-layer dense Flow denoiser;
+* a six-layer Flow denoiser with one contour-level HA-SMoE route path;
 * continuous residual-progress sampling for supervised training;
 * Adams--Bashforth-2 with four evaluations per outer stage; and
 * a fixed two-stage deployment schedule.
@@ -171,8 +171,8 @@ class FlowMatchingEvolution(nn.Module):
 
         print(
             "[FlowMatchingEvolution] mainline "
-            "layers=6 dim=256 dense_residual=1024 "
-            "deployment=2x4-AB2",
+            "layers=6 dim=256 HA-SMoE=blocks2/4/6,E4K2 "
+            "output=dense deployment=2x4-AB2",
             flush=True,
         )
 
@@ -725,10 +725,10 @@ class FlowMatchingEvolution(nn.Module):
             contour_scale=contour_scale.view(-1),
             s=progress.view(-1),
         )
-        loss = (
-            F.mse_loss(predicted_velocity, target_velocity, reduction="mean")
-            + regularization
+        data_loss = F.mse_loss(
+            predicted_velocity, target_velocity, reduction="mean"
         )
+        loss = data_loss + regularization
 
         endpoint = x_t + (1.0 - t) * predicted_velocity
         predicted_displacement = self.denormalize_pred_disp(
@@ -739,6 +739,8 @@ class FlowMatchingEvolution(nn.Module):
         result.update(
             {
                 "diff_loss": loss,
+                "diff_loss_data": data_loss.detach(),
+                "diff_loss_moe_regularization": regularization.detach(),
                 "diff_lossA1": loss,
                 "diff_loss_total": loss,
                 "diff_loss1": loss,
@@ -753,6 +755,8 @@ class FlowMatchingEvolution(nn.Module):
                 "train_progress_mean": progress.mean().detach(),
             }
         )
+        for key, value in self.denoiser.moe_diagnostics().items():
+            result[f"moe_{key.replace('.', '_')}"] = value
         return result
 
     def _inference_forward(
