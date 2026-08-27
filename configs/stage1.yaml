@@ -1,19 +1,21 @@
 # Stage 1: migrate the signed dense MoonViT+Flow source into the only released
 # HA-SMoE architecture, then jointly train the replacer and complete Flow.
+# The signed source is the highest complete checkpoint from the canonical
+# MoonViT-cache dense run: local step19000 (absolute-equivalent step59000).
 model: 'moonvit_flow_ha_smoe_stage1'
 task: 'snake'
 model_dir: 'data/outputs/stage1'
 gpus: [6]
 resume: true
 resume_weights_only: true
-resume_path: 'artifacts/checkpoints/pure2d_step40000.pt'
+resume_path: 'artifacts/checkpoints/pure2d_moonvit_dense_step19000.pt'
 resume_allow_partial_copy: false
 resume_allowed_missing_prefixes:
     - 'net.gcn.denoiser._global_moe_router.'
     - 'net.gcn.denoiser.dit_layers.1.routed_moe.'
     - 'net.gcn.denoiser.dit_layers.3.routed_moe.'
     - 'net.gcn.denoiser.dit_layers.5.routed_moe.'
-resume_source_format: 'pure2d_robustbox_absolute_step40000_weights_only_moonvit_flowtune_v1'
+resume_source_format: 'pure2d_moonvit_cached_flowtune_local_step19000_weights_only_v1'
 train_or_test: train
 
 pure2d_memory_free_required: true

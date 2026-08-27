@@ -112,7 +112,7 @@ PYTHON=/path/to/python
 DATA_ROOT=/path/to/sagittal_2d_fixed
 SLICE_MANIFEST="$DATA_ROOT/manifests/slice_manifest.csv"
 MOONVIT_CACHE=/path/to/sagittal_moonvit_cache
-STAGE1_SOURCE=/path/to/pure2d_step40000.pt
+STAGE1_SOURCE=/path/to/pure2d_moonvit_dense_step19000.pt
 STAGE2_SOURCE=/path/to/ha_smoe_stage1_selected.pt
 STAGE2_SOURCE_SHA256=<64位完整SHA256>
 STAGE2_SOURCE_STEP=<checkpoint中的step>
@@ -195,13 +195,14 @@ Eagle/Embodied/work_dirs/1232_final_locany_full_more10000/checkpoint-3000
 
 ## 6. Stage 1：监督训练
 
-唯一配置为 `configs/stage1.yaml`。它从兼容的 absolute step40000 Dense 权重做一次受控 weights-only 迁移：所有原参数必须精确匹配，只允许新增全局轮廓 router 和第 2/4/6 层专家参数；不允许 shape 跳过、重叠拷贝或其他 missing/unexpected。随后建立新的 AdamW，不继承旧优化器状态。
+唯一配置为 `configs/stage1.yaml`。它从签名的 MoonViT-cache Dense 主线 local step19000（由 absolute step40000 起训，等效 absolute step59000）做一次受控 weights-only 迁移。该文件是原 Dense MoonViT 长训保留下来的最高完整检查点；旧 absolute step40000 文件已不再作为发布依赖。所有原参数必须精确匹配，只允许新增全局轮廓 router 和第 2/4/6 层专家参数；不允许 shape 跳过、重叠拷贝或其他 missing/unexpected。随后建立新的 AdamW，不继承旧优化器状态。
 
 固定 source：
 
 ```text
-step = 40000
-SHA256 = 641445aaed9a7ea3acfc8d50833d0ede9cc454bfe2cf34bea2ff0464d33e929b
+checkpoint step = 19000
+equivalent absolute step = 59000
+SHA256 = a337ba1566fe423c10a82dc4c08f8d6936ce8fc49ff1d61c8f735435854a337f
 ```
 
 固定训练合同：
@@ -239,7 +240,7 @@ STAGE1_PREFLIGHT=data/outputs/stage1_preflight_YYYYMMDD
 预检通过时：
 
 - `PURE2D_TRAINING_LAUNCH.json` 为 `COMPLETED`；
-- source step/SHA、参数量、Train72/Dev8 身份通过；
+- source local step19000/SHA、参数量、Train72/Dev8 身份通过；
 - step1/2 loss 与更新有限；
 - Flow 和特征替换器都至少有一个张量更新；
 - Dense source 的全部旧张量都存在且 shape 一致；新增张量只能来自四个已登记的 HA-SMoE 前缀；
@@ -477,7 +478,7 @@ RL 训练的五阶段轨迹从不用于这里；`tools/infer.py` 会强制关闭
 
 - [ ] 克隆仓库并安装 `requirements.txt`。
 - [ ] 准备 Train72/Val37/Dev8 数据、slice manifest、case metadata 和 MoonViT cache。
-- [ ] 核对 Dense step40000 source SHA；Stage 1 完成后登记所选 HA-SMoE checkpoint 的 SHA 与 step。
+- [ ] 核对 Dense MoonViT local step19000 source SHA；Stage 1 完成后登记所选 HA-SMoE checkpoint 的 SHA 与 step。
 - [ ] 运行 `tools/verify_installation.py` 并得到 `PASS`。
 - [ ] 选择真正空闲 GPU；不终止、不抢占其他进程。
 - [ ] Stage 1：新目录做 2-step preflight，再启动唯一正式运行。

@@ -45,6 +45,14 @@ class MainlineConfigTest(unittest.TestCase):
         config = self.load("stage1.yaml")
         self.assertEqual(config["pure2d_expected_parameter_count"], 17_264_208)
         self.assertEqual(
+            config["resume_path"],
+            "artifacts/checkpoints/pure2d_moonvit_dense_step19000.pt",
+        )
+        self.assertEqual(
+            config["resume_source_format"],
+            "pure2d_moonvit_cached_flowtune_local_step19000_weights_only_v1",
+        )
+        self.assertEqual(
             config["resume_allowed_missing_prefixes"],
             [
                 "net.gcn.denoiser._global_moe_router.",

@@ -19,7 +19,7 @@ if str(PROJECT_ROOT) not in sys.path:
 from lib.runtime import require_idle_gpu
 
 
-EXPECTED_SOURCE_SHA256 = "641445aaed9a7ea3acfc8d50833d0ede9cc454bfe2cf34bea2ff0464d33e929b"
+EXPECTED_SOURCE_SHA256 = "a337ba1566fe423c10a82dc4c08f8d6936ce8fc49ff1d61c8f735435854a337f"
 EXPECTED_MODEL_PARAMETERS = 17_264_208
 EXPECTED_TRAINABLE_PARAMETERS = 17_264_208
 EXPECTED_FLOW_TRAINABLE_PARAMETERS = 14_017_872
@@ -41,7 +41,8 @@ EXPECTED_JITTER_PROBABILITIES = [0.35, 0.40, 0.20, 0.05]
 EXPECTED_JITTER_SHIFT = [0.0, 0.05, 0.10, 0.15]
 EXPECTED_JITTER_SCALE = [0.0, 0.10, 0.20, 0.30]
 EXPECTED_JITTER_EDGE = [0.0, 0.03, 0.08, 0.15]
-SOURCE_ABSOLUTE_STEP = 40_000
+SOURCE_CHECKPOINT_STEP = 19_000
+SOURCE_EQUIVALENT_ABSOLUTE_STEP = 59_000
 
 
 def sha256_file(path: Path) -> str:
@@ -328,7 +329,7 @@ def main():
 
     source_payload = torch.load(str(source), map_location="cpu", weights_only=False)
     source_step = int(source_payload.get("step", source_payload.get("global_step", -1)))
-    assert_equal(source_step, SOURCE_ABSOLUTE_STEP, "source absolute step")
+    assert_equal(source_step, SOURCE_CHECKPOINT_STEP, "source checkpoint step")
     del source_payload
 
     network = make_network(cfg)
@@ -371,7 +372,7 @@ def main():
 
     output_root.mkdir(parents=True, exist_ok=False)
     manifest = {
-        "schema": "diffusionsnake.pure2d_moonvit_cached_flowtune60k_from40000.v1",
+        "schema": "flowsnake.ha_smoe_stage1_from_moonvit_step19000.v1",
         "status": "STARTED",
         "mode": args.mode,
         "started_at": datetime.now(timezone.utc).isoformat(),
@@ -381,7 +382,8 @@ def main():
         "config_sha256": config_sha,
         "source_checkpoint": str(source),
         "source_checkpoint_sha256": EXPECTED_SOURCE_SHA256,
-        "source_absolute_step": SOURCE_ABSOLUTE_STEP,
+        "source_checkpoint_step": SOURCE_CHECKPOINT_STEP,
+        "source_equivalent_absolute_step": SOURCE_EQUIVALENT_ABSOLUTE_STEP,
         "data_root": str(data_root),
         "slice_manifest": str(slice_manifest),
         "moonvit_cache": str(moonvit_cache),
@@ -401,7 +403,8 @@ def main():
         "formal_checkpoint_keep": formal_checkpoint_keep,
         "local_milestones": EXPECTED_LOCAL_MILESTONES,
         "baseline_equivalent_absolute_steps": {
-            str(step): SOURCE_ABSOLUTE_STEP + step for step in EXPECTED_LOCAL_MILESTONES
+            str(step): SOURCE_EQUIVALENT_ABSOLUTE_STEP + step
+            for step in EXPECTED_LOCAL_MILESTONES
         },
         "model_parameters": observed_total,
         "trainable_parameters": observed_trainable,
